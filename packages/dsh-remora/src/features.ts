@@ -14,28 +14,29 @@ export const SERVICE_REQUIREMENTS: Readonly<Record<OperationId, readonly string[
   'sessions.list': ['sessionController'],
   'session.get': ['sessionController'],
   'session.read': ['sessionController'],
-  'skills.list': ['sessionController'],
-  'task.start': ['sessionController'],
+  'skills.list': ['sessionController', 'sessionSkillCatalog'],
+  'task.start': ['sessionController', 'workspaceRegistry'],
   'task.get': ['sessionController'],
   'task.wait': ['sessionController'],
   'attention.list': ['sessionController'],
-  'attention.respond': ['sessionController'],
-  'changes.get': ['sessionController'],
-  'patch.get': ['sessionController'],
+  'attention.respond': ['sessionController', 'userQuestions'],
+  'changes.get': ['sessionController', 'workspaceChanges'],
+  'patch.get': ['sessionController', 'workspaceChanges'],
   'deliverable.read': ['sessionController'],
   'session.usage': ['sessionController'],
   'task.steer': ['sessionController'],
   'task.cancel': ['sessionController'],
   'task.resubmit': ['sessionController'],
-  'goal.manage': ['sessionController'],
-  'job.output': ['sessionController'],
+  'goal.manage': ['sessionController', 'goals'],
+  'job.output': ['sessionController', 'jobs'],
   'workspace.create': ['workspaceRegistry'],
   'model.select': ['sessionController'],
-  'command.run': ['commands'],
-  'approval.respond': ['sessionController'],
-  'terminal.run': ['sessionController'],
-  'job.stop': ['sessionController'],
-  'schedule.manage': ['sessionController'],
+  'command.run': ['sessionController', 'commands'],
+  // P2, not implemented: DSH 0.2.1 has no host API to answer an approval, and the rest stay off.
+  'approval.respond': ['approval'],
+  'terminal.run': ['terminals'],
+  'job.stop': ['jobs'],
+  'schedule.manage': ['schedule'],
 }
 
 /**
@@ -43,7 +44,16 @@ export const SERVICE_REQUIREMENTS: Readonly<Record<OperationId, readonly string[
  * phase; an operation outside this set is never advertised to the hub, even
  * when DSH could support it.
  */
-export const IMPLEMENTED: ReadonlySet<OperationId> = new Set<OperationId>(['status'])
+export const IMPLEMENTED: ReadonlySet<OperationId> = new Set<OperationId>([
+  'status',
+  // P0
+  'workspaces.list', 'sessions.list', 'session.get', 'session.read', 'skills.list',
+  'task.start', 'task.get', 'task.wait', 'attention.list',
+  // P1
+  'attention.respond', 'changes.get', 'patch.get', 'deliverable.read', 'session.usage',
+  'task.steer', 'task.cancel', 'task.resubmit', 'goal.manage', 'job.output',
+  'workspace.create', 'model.select', 'command.run',
+])
 
 export interface FeatureReport {
   available: OperationId[]
