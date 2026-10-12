@@ -170,8 +170,15 @@ export interface Owner {
   recoveryCodes: string[]
 }
 
-/** Complete first-run setup (or log in when it already happened in this storage). */
-export async function setupOwner(): Promise<Owner> {
+let shared: Promise<Owner> | null = null
+
+/** The owner for this test file: storage is shared by the tests of one file, and setup runs once. */
+export function setupOwner(): Promise<Owner> {
+  shared ??= freshOwner()
+  return shared
+}
+
+async function freshOwner(): Promise<Owner> {
   const browser = new Browser()
   const authenticator = new SoftAuthenticator()
   const options = await browser.postJson('/auth/setup/options', { setupToken: SETUP_TOKEN })
@@ -248,7 +255,9 @@ export class FakeHost {
     const socket = response.webSocket as WebSocket
     socket.accept()
     this.socket = socket
-    socket.addEventListener('close', event => this.closes.push({ code: event.code, reason: event.reason }))
+    socket.addEventListener('close', event => {
+      this.closes.push({ code: event.code, reason: event.reason })
+    })
     socket.addEventListener('message', event => {
       const frame = JSON.parse(String(event.data)) as HubFrame
       this.frames.push(frame)
