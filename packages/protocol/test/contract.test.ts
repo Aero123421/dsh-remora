@@ -51,6 +51,7 @@ test('confirmation challenges bind every field', async () => {
     assert.notEqual(await confirmationChallenge({ ...subject, ...change }), challenge)
   }
   assert.ok(REQUIRES_CONFIRMATION.has('terminal.run'))
+  assert.ok(REQUIRES_CONFIRMATION.has('approval.respond'))
   assert.ok(!REQUIRES_CONFIRMATION.has('task.start'))
 })
 

@@ -122,8 +122,19 @@ export interface AttentionItem {
   /** Longer text such as the full question or plan. Untrusted. Only returned with the dsh.content scope. */
   detail?: string
   options?: AttentionOption[]
-  /** Whether Remora can answer it remotely (questions in continued mode, plan reviews; approvals only in P2). */
+  /** Whether Remora can answer it remotely right now. */
   answerable: boolean
+  /**
+   * How it can be answered:
+   * - `remote`: `attention.respond` from any client allowed to request tasks;
+   * - `hub-passkey`: only on the hub's attention page with the owner's passkey (approvals);
+   * - `dsh-web`: only in DSH Web (e.g. Remora's remote answering is turned off).
+   */
+  answerVia?: 'remote' | 'hub-passkey' | 'dsh-web'
+  /** For `hub-passkey`: the hub page where the owner answers. Filled in by the hub. */
+  answerUrl?: string
+  /** Epoch ms after which Remora stops holding the request and DSH continues without an answer (questions) or rejects (approvals). */
+  expiresAt?: number | null
   createdAt: number | null
 }
 

@@ -57,6 +57,7 @@ export async function confirmationChallenge(subject: ConfirmationSubject): Promi
 }
 
 /** Operations that need a passkey confirmation in addition to an unexpired full grant. */
-export const REQUIRES_CONFIRMATION: ReadonlySet<string> = new Set(
-  (OPERATIONS as readonly { id: string; level: string }[]).filter(op => op.level === 'full').map(op => op.id),
-)
+export const REQUIRES_CONFIRMATION: ReadonlySet<string> = new Set([
+  'approval.respond',
+  ...(OPERATIONS as readonly { id: string; level: string }[]).filter(op => op.level === 'full').map(op => op.id),
+])

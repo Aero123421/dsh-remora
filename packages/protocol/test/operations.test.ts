@@ -24,6 +24,12 @@ test('read-only tools never need more than view, and destructive ones need full'
   }
 })
 
+test('approvals are answered with a passkey confirmation, never through an MCP tool', () => {
+  const approval = all.find(op => op.id === 'approval.respond')
+  assert.equal(approval?.tool, undefined)
+  assert.equal(approval?.level, 'request')
+})
+
 test('dangerous operations are not exposed as MCP tools yet', () => {
   for (const op of all.filter(op => op.level === 'full')) assert.equal(op.tool, undefined, op.id)
 })

@@ -78,9 +78,13 @@ export const OPERATIONS = [
   { id: 'command.run', tool: 'dsh_command_run', level: 'request', scope: 'dsh.tasks', phase: 'P1', readOnly: false, destructive: false,
     description: 'Run a slash command in a session. Each command is allowed separately on the DSH side.' },
 
+  // Approvals: any client that may request tasks can see them, but answering
+  // always needs the owner's passkey on the hub (see REQUIRES_CONFIRMATION).
+  // Not an MCP tool: AI clients get a link to the hub's approval page instead.
+  { id: 'approval.respond', level: 'request', scope: 'dsh.tasks', phase: 'P1', readOnly: false, destructive: false,
+    description: 'Answer a pending approval. Requires a passkey confirmation on the hub, verified by the DSH host.' },
+
   // --- P2: dangerous, off by default, full access only --------------------
-  { id: 'approval.respond', level: 'full', scope: 'dsh.admin', phase: 'P2', readOnly: false, destructive: true,
-    description: 'Answer a pending approval. Requires a passkey signature verified by the DSH host.' },
   { id: 'terminal.run', level: 'full', scope: 'dsh.admin', phase: 'P2', readOnly: false, destructive: true,
     description: 'Run a terminal command on the DSH host.' },
   { id: 'job.stop', level: 'full', scope: 'dsh.admin', phase: 'P2', readOnly: false, destructive: true,
