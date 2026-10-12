@@ -87,7 +87,7 @@ const DENIAL_HINT: Readonly<Record<DenialReason, string>> = {
   'level-too-low': '権限の段階が足りません。DSH の設定タブ「Remora」かハブの「接続」画面で引き上げてください。',
   'switched-off': 'この操作は個別にオフになっています。',
   'full-access-expired': 'リモート全権の期限（24 時間）が切れました。',
-  'missing-scope': 'トークンのスコープが足りません。remora login --content（または --scope）でログインし直してください。',
+  'missing-scope': 'トークンのスコープが足りません。remora login --content（ターミナルは --admin、または --scope）でログインし直してください。',
   'unknown-operation': 'このホストはこの操作を知りません。プラグインの版を確認してください。',
   'kill-switch': 'DSH 側で緊急停止がオンです。DSH の設定タブ「Remora」で解除するまで何もできません。',
   'confirmation-failed': 'パスキーによる確認が得られませんでした（危険な操作には DSH 側で検証される署名が必要です）。',
@@ -98,7 +98,9 @@ export function missingScope(scope: string): CliError {
   return new CliError(`この操作には ${scope} スコープが必要ですが、今のログインには含まれていません。`, EXIT.denied, {
     code: 'denied',
     denial: { layer: 'token', reason: 'missing-scope' },
-    hint: scope === 'dsh.content' ? 'remora login --content でログインし直してください（会話本文や差分を読めるようになります）。' : `remora login --scope "<今のスコープ> ${scope}" でログインし直してください。`,
+    hint: scope === 'dsh.content' ? 'remora login --content でログインし直してください（会話本文や差分を読めるようになります）。'
+      : scope === 'dsh.admin' ? 'remora login --admin でログインし直してください（--content も使っていたなら両方付けます）。'
+      : `remora login --scope "<今のスコープ> ${scope}" でログインし直してください。`,
   })
 }
 

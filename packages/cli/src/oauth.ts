@@ -19,6 +19,8 @@ import type { AccessToken, StoredTokens } from './tokens.ts'
  */
 export const DEFAULT_SCOPE = 'dsh.read dsh.tasks offline_access'
 export const CONTENT_SCOPE = 'dsh.content'
+/** Needed for remora terminal; every command is still confirmed with the owner's passkey on the hub. */
+export const ADMIN_SCOPE = 'dsh.admin'
 
 export interface AuthServerMetadata {
   issuer: string

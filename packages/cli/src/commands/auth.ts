@@ -5,14 +5,14 @@ import { loadProfile, normalizeHubUrl, saveProfile } from '../config.ts'
 import { EXIT, usageError } from '../errors.ts'
 import { parseDuration } from '../format.ts'
 import { resolveHubUrl } from '../hub.ts'
-import { CONTENT_SCOPE, DEFAULT_SCOPE, discover, discoverResources, loginWithBrowser, loginWithDevice, revoke, toAccess } from '../oauth.ts'
+import { ADMIN_SCOPE, CONTENT_SCOPE, DEFAULT_SCOPE, discover, discoverResources, loginWithBrowser, loginWithDevice, revoke, toAccess } from '../oauth.ts'
 import { BACKEND_LABEL, openTokenStore, type StoredTokens } from '../tokens.ts'
 
 export const login: CommandDef = {
   name: 'login',
   summary: 'ハブにログインする（--device で SSH 先からも）',
   usage: [
-    'remora login <ハブの URL> [--device] [--content] [--scope "<スコープ>"] [--no-browser] [--timeout 5m]',
+    'remora login <ハブの URL> [--device] [--content] [--admin] [--scope "<スコープ>"] [--no-browser] [--timeout 5m]',
     '',
     'ブラウザでハブのパスキー承認を行い、トークンを OS のキーチェーンに保存します。',
     'ブラウザが使えない環境（SSH 先など）では --device を付け、表示されたコードを別の端末で入力します。',
@@ -21,14 +21,15 @@ export const login: CommandDef = {
     '  一覧・タスクの投入と待機・そのタスク自身の最終返答の表示までできます。',
     `--content を付けると ${CONTENT_SCOPE} も求めます。sessions read（会話本文）、patch（差分）、`,
     '  要対応の質問の全文に必要です。会話や差分には秘密が紛れることがあるので、必要なときだけ付けてください。',
-    '--scope は求めるスコープをそのまま指定します（--content より優先）。',
+    `--admin を付けると ${ADMIN_SCOPE} も求めます。remora terminal（毎回ハブでパスキー確認）に必要です。`,
+    '--scope は求めるスコープをそのまま指定します（--content、--admin より優先）。',
   ],
-  flags: { device: 'bool', content: 'bool', scope: 'string', 'no-browser': 'bool', timeout: 'string' },
+  flags: { device: 'bool', content: 'bool', admin: 'bool', scope: 'string', 'no-browser': 'bool', timeout: 'string' },
   async run({ ctx, args, json }) {
     const given = args.positionals[0]
     const hubUrl = given ? normalizeHubUrl(given) : await resolveHubUrl(ctx, str(args, 'hub'))
     if (!hubUrl) throw usageError('ハブの URL を指定してください。', '例: remora login https://remora.example.workers.dev')
-    const requested = str(args, 'scope') ?? (bool(args, 'content') ? `${DEFAULT_SCOPE} ${CONTENT_SCOPE}` : DEFAULT_SCOPE)
+    const requested = str(args, 'scope') ?? [DEFAULT_SCOPE, bool(args, 'content') ? CONTENT_SCOPE : '', bool(args, 'admin') ? ADMIN_SCOPE : ''].filter(Boolean).join(' ')
     const scope = requested.trim().split(/\s+/).join(' ')
     const timeoutRaw = str(args, 'timeout')
     const timeoutMs = timeoutRaw ? parseDuration(timeoutRaw) : 5 * 60_000

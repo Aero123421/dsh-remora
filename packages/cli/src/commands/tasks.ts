@@ -48,7 +48,7 @@ function target(cmd: Cmd): TaskTarget {
   return chosen[0] as TaskTarget
 }
 
-async function promptOf(cmd: Cmd, index: number): Promise<string> {
+export async function promptOf(cmd: Cmd, index: number): Promise<string> {
   const words = cmd.args.positionals.slice(index)
   if (words.length > 0) return words.join(' ')
   if (cmd.ctx.stdinIsTTY) throw usageError('プロンプトを指定してください（引数か標準入力）。')
