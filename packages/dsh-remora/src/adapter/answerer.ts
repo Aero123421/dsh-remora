@@ -197,6 +197,7 @@ export class Answerer {
     if (typeof sessionId !== 'string') return null
     try {
       const row = await this.rt.row(sessionId, AbortSignal.timeout(5_000))
+      // Subagent sessions are reached through their parent; their requests pass through untouched.
       if (row.subagent || row.archived) return null
       this.rt.assertCanDriveTurns(row.workspace?.id ?? null)
     } catch {
@@ -250,7 +251,10 @@ export class Answerer {
         this.remove(entry)
         if (withdraw) handedDown.abort(new Error('answered from outside through Remora'))
         if (swapped) {
-          try { request.signal = original } catch { /* see above */ }
+          try {
+            if (original === undefined) delete request.signal
+            else request.signal = original
+          } catch { /* see above */ }
         }
         if (outcome === 'chain') fromChain.then(resolve, reject)
         else settle(outcome)
