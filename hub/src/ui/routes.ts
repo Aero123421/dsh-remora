@@ -3,6 +3,7 @@
  * attention, connections, audit log and settings. Server-rendered; the
  * only script is /js/webauthn.js for passkey ceremonies.
  */
+import { answerPath, answerRoute, countdownText, pushText } from '../attention.ts'
 import type { AuditRow } from '../audit.ts'
 import { verifyAuditChain } from '../audit.ts'
 import { getSession, rpIdOf, type OwnerSession } from '../auth.ts'
@@ -12,7 +13,8 @@ import { html, json, readForm, readJson, redirect, sameOrigin } from '../http.ts
 import { hostStub, hubStub } from '../meter.ts'
 import { oauthEnv, oauthFor, resourcesFor } from '../oauth.ts'
 import { finalParams, liveHosts, refreshParked, revokeHostEverywhere, runOperation, type Caller } from '../ops.ts'
-import type { ClientWithGrants, GrantLevel } from '../types.ts'
+import { PUSH_TYPES, type ClientWithGrants, type GrantLevel, type PushType } from '../types.ts'
+import { isPushEndpoint, isSubscriptionKey } from '../webpush.ts'
 import { safeNext } from '../next.ts'
 import { randomToken } from '../util.ts'
 import { HUB_VERSION } from '../version.ts'
@@ -38,6 +40,10 @@ const MESSAGES: Readonly<Record<string, [string, 'ok' | 'error']>> = {
   'settings-saved': ['設定を保存しました。', 'ok'],
   'sent': ['送信しました。', 'ok'],
   'paired': ['ホストを追加しました。DSH 側で接続が始まるまで少し待ってください。', 'ok'],
+  'push-removed': ['通知の登録を削除しました。', 'ok'],
+  'push-saved': ['通知の種類を保存しました。', 'ok'],
+  'push-test-sent': ['テスト通知を送りました。数秒で届かないときは、端末の通知設定を確かめてください。', 'ok'],
+  'push-test-none': ['テスト通知を送れませんでした。通知を受け取るデバイスが登録されていないか、送信に失敗しました。', 'error'],
 }
 
 function message(url: URL): Raw {
@@ -52,7 +58,7 @@ function errorFlash(error: RemoraError | undefined, prefix = '失敗しました
   return h`<p class="flash error" role="alert">${prefix}（${error.code}）: ${error.message}${fix}</p>`
 }
 
-function view(title: string, nav: NavKey, body: Raw, scripts: string[] = ['/js/webauthn.js']): Response {
+function view(title: string, nav: NavKey, body: Raw, scripts: string[] = ['/js/webauthn.js', '/js/live.js']): Response {
   return html(page({ title, nav, body, scripts }))
 }
 
@@ -152,8 +158,30 @@ function taskRow(task: TaskInfo, hostName: string): Raw {
   return h`<li><a href="/tasks/${task.taskId}"><span class="state ${task.state}">${STATE_LABEL[task.state] ?? task.state}</span> ${hostName} ・ <span class="muted">${relativeTime(task.updatedAt)}</span></a></li>`
 }
 
+function countdown(expiresAt: number | null | undefined): Raw {
+  if (typeof expiresAt !== 'number') return raw('')
+  return h`<span class="countdown${expiresAt <= Date.now() ? ' expired' : ''}" data-expires-at="${expiresAt}" data-testid="hub-countdown">${countdownText(expiresAt)}</span>`
+}
+
+/** Approvals first, then whatever expires soonest, then the oldest. */
+function byUrgency(a: AttentionItem, b: AttentionItem): number {
+  const rank = (item: AttentionItem) => (item.kind === 'approval' ? 0 : item.kind === 'question' || item.kind === 'plan-review' ? 1 : 2)
+  return rank(a) - rank(b) || (a.expiresAt ?? Number.MAX_SAFE_INTEGER) - (b.expiresAt ?? Number.MAX_SAFE_INTEGER) || (a.createdAt ?? 0) - (b.createdAt ?? 0)
+}
+
+/** One line in an inbox (home, host, task pages): what it is, where, how long is left, and a way in. */
 function attentionRow(item: AttentionItem, hostName: string): Raw {
-  return h`<li><a href="/attention#${item.hostId}-${item.attentionId}"><span class="badge warn">${ATTENTION_LABEL[item.kind] ?? item.kind}</span> <span class="untrusted">${item.title}</span> <span class="muted">${hostName}</span></a></li>`
+  const route = answerRoute(item)
+  const action = route === 'passkey' ? '確認して答える' : route === 'remote' ? '答える' : '開く'
+  return h`<li class="inbox-item kind-${item.kind}${route === 'expired' ? ' expired' : ''}"${raw(typeof item.expiresAt === 'number' ? ' data-expiring' : '')} data-testid="hub-inbox-item">
+  <div class="row"><span class="badge ${item.kind === 'approval' ? 'danger' : 'warn'}">${ATTENTION_LABEL[item.kind] ?? item.kind}</span> <a class="untrusted" href="${answerPath(item.hostId, item.attentionId)}">${item.title}</a></div>
+  <div class="row muted">${hostName ? h`<span>${hostName}</span>` : ''} ${countdown(item.expiresAt)} <span>${relativeTime(item.createdAt)}</span>
+  ${route === 'expired' ? '' : h`<a class="button small${route === 'dsh-web' ? '' : ' primary'}" href="${answerPath(item.hostId, item.attentionId)}">${action}</a>`}</div>
+</li>`
+}
+
+function inbox(items: AttentionItem[], names: Map<string, string>): Raw {
+  return h`<ul class="list inbox">${[...items].sort(byUrgency).map(item => attentionRow(item, names.get(item.hostId) ?? item.hostId))}</ul>`
 }
 
 async function homePage(env: Env, url: URL): Promise<Response> {
@@ -170,15 +198,18 @@ async function homePage(env: Env, url: URL): Promise<Response> {
     [data.clients.some(client => client.kind !== 'pat' && !client.revokedAt), 'AI クライアントをつなぐ', '/connections#setup'],
     [data.hosts.some(entry => entry.live.hadTasks), '最初のタスクを投げる', '/connections#setup'],
   ]
+  // Optional: does not keep the checklist open on its own.
+  const pushStep: [boolean, string, string] = [state.pushDevices > 0, 'スマホで通知を受け取る（任意。iPhone はホーム画面に追加してから）', '/settings#notifications']
   const meters: [string, number, number][] = [
     ['Worker のリクエスト', meter.workerRequests, FREE_TIER.workerRequests],
     ['Durable Objects のリクエスト', meter.durableObjectRequests, FREE_TIER.durableObjectRequests],
     ['KV の書き込み', meter.kvWrites, FREE_TIER.kvWrites],
   ]
   const body = h`${message(url)}
-${steps.every(([done]) => done) ? '' : h`<section class="card"><h2>はじめに</h2><ol class="checklist">${steps.map(([done, label, href]) => h`<li class="${done ? 'done' : ''}"><a href="${href}">${label}</a></li>`)}</ol></section>`}
-<section><h2>要対応 <span class="count">${attention.length}</span></h2>
-${attention.length === 0 ? h`<p class="muted">人の判断を待っているものはありません。</p>` : h`<ul class="list">${attention.map(item => attentionRow(item, names.get(item.hostId) ?? item.hostId))}</ul>`}</section>
+${steps.every(([done]) => done) ? '' : h`<section class="card"><h2>はじめに</h2><ol class="checklist">${[...steps, pushStep].map(([done, label, href]) => h`<li class="${done ? 'done' : ''}"><a href="${href}">${label}</a></li>`)}</ol>
+<p class="muted">iPhone・iPad で通知を受け取るには、Safari の共有ボタンから「ホーム画面に追加」し、ホーム画面の Remora から開いてください（iOS 16.4 以降）。</p></section>`}
+<section class="${attention.length > 0 ? 'card inbox-section urgent' : ''}" data-testid="hub-home-attention"><h2>要対応 <span class="count">${attention.length}</span></h2>
+${attention.length === 0 ? h`<p class="muted">人の判断を待っているものはありません。</p>` : inbox(attention, names)}</section>
 <section><h2>実行中 <span class="count">${running.length}</span></h2>
 ${running.length === 0 ? h`<p class="muted">実行中のタスクはありません。</p>` : h`<ul class="list">${running.map(task => taskRow(task, names.get(task.hostId) ?? task.hostId))}</ul>`}</section>
 <section><h2>最近の完了</h2>
@@ -228,6 +259,7 @@ async function hostPage(env: Env, url: URL, hostId: string): Promise<Response> {
 <p class="crumbs"><a href="/">ホーム</a> / ホスト</p>
 <h1><span class="dot ${live.online ? 'on' : 'off'}" aria-hidden="true"></span> ${name}${live.reportedName && live.reportedName !== name ? h` <span class="muted">（ホストの申告名: ${live.reportedName}）</span>` : ''}</h1>
 <p class="muted">${live.online ? '接続中' : `オフライン（最終 ${relativeTime(live.lastSeenAt)}）`} ・ プラグイン ${live.pluginVersion ?? '—'} ・ DSH ${live.dshVersion ?? '—'} ・ 上限 ${live.ceiling ? LEVEL_LABEL[live.ceiling.level] : '未報告'}${live.killSwitch ? ' ・ 緊急停止中' : ''}</p>
+${live.attention.length > 0 ? h`<section class="card inbox-section urgent" data-testid="hub-host-attention"><h2>要対応 <span class="count">${live.attention.length}</span></h2>${inbox(live.attention, new Map([[hostId, '']]))}</section>` : ''}
 ${content}
 <details class="card"><summary>使える操作（${live.operations.length}）</summary><p class="mono small">${live.operations.join(', ') || '—'}</p></details>
 <details class="card danger-zone"><summary>登録の解除</summary>
@@ -344,53 +376,115 @@ ${task.state === 'parked' ? h`<p class="muted">ホストがオフラインのた
 const NOT_ANSWERABLE: Readonly<Record<string, string>> = {
   question: 'DSH の質問ツール（tool-ask-user）が既定の legacy モードのため、外から答えられません。DSH Web で答えるか、DSH の設定で tool-ask-user を timed に切り替えると、次の質問からここで答えられます。',
   'plan-review': 'このプランの確認には外から答えられません。DSH Web で承認するか差し戻してください。',
-  approval: 'DSH 0.2.1 には承認に外から答える API がないため、DSH Web で承認・拒否してください。',
+  approval: 'この承認にはハブから答えられません（DSH の Remora タブで遠隔からの回答がオフになっているか、プラグインが古い版です）。DSH Web で承認・拒否してください。',
   'goal-stopped': 'ゴールが止まっています。DSH Web で再開するか解除してください。',
   'login-expired': 'プロバイダーへのログインが切れています。その PC の DSH で再ログインしてください。',
 }
+
+interface CardHost {
+  hostId: string
+  name: string
+  online: boolean
+  /** The plugin serves approval.respond. */
+  canApprove: boolean
+}
+
+/** One item with everything needed to answer it from the hub. */
+function attentionCard(item: AttentionItem, host: CardHost, single = false): Raw {
+  const route = answerRoute(item)
+  const expiring = typeof item.expiresAt === 'number'
+  const head = h`<div class="row"><span class="badge ${item.kind === 'approval' ? 'danger' : 'warn'}">${ATTENTION_LABEL[item.kind] ?? item.kind}</span> ${countdown(item.expiresAt)} <span class="muted">${relativeTime(item.createdAt)}</span>
+  ${single ? '' : h`<a class="small" href="${answerPath(item.hostId, item.attentionId)}">この項目だけを開く</a>`}</div>`
+  const what = item.kind === 'approval'
+    ? h`<dl class="facts">
+  <dt>求められている操作</dt><dd class="untrusted"><strong>${item.title}</strong></dd>
+  ${item.detail ? h`<dt>理由</dt><dd class="untrusted pre">${item.detail}</dd>` : ''}
+  <dt>セッション</dt><dd><a class="mono" href="/hosts/${host.hostId}/sessions/${encodeURIComponent(item.sessionId)}">${item.sessionId}</a></dd>
+  <dt>ホスト</dt><dd>${host.name} <span class="muted mono">${host.hostId}</span></dd>
+</dl>`
+    : h`<p class="untrusted"><strong>${item.title}</strong></p>
+  ${item.detail ? h`${item.kind === 'plan-review' ? h`<p class="who">プラン</p>` : ''}<div class="untrusted pre">${item.detail}</div>` : ''}`
+  let answer: Raw
+  if (route === 'expired') {
+    answer = h`<p class="flash error">期限が切れました。DSH は回答なしで続行しました（承認は拒否として扱われます）。</p>`
+  } else if (route === 'dsh-web') {
+    answer = h`<p class="muted not-answerable">${NOT_ANSWERABLE[item.kind] ?? 'この項目には外から答えられません。DSH Web で対応してください。'}</p>`
+  } else if (!host.online) {
+    answer = h`<p class="muted">ホストがオフラインのため、今は答えられません。</p>`
+  } else if (route === 'passkey') {
+    const params = { hostId: host.hostId, sessionId: item.sessionId, attentionId: item.attentionId }
+    answer = host.canApprove
+      ? h`<div class="confirm-preview"><p>パスキーで署名する内容（DSH ホストが検証します）:</p>
+  <dl class="facts"><dt>操作</dt><dd class="mono">approval.respond</dd><dt>ホスト</dt><dd class="mono">${host.hostId}</dd>
+  <dt>パラメータ</dt><dd><pre class="codes">${JSON.stringify({ ...params, answer: { approve: '許可なら true、拒否なら false' } }, null, 2)}</pre></dd></dl></div>
+<form data-confirm-op="approval.respond" data-host="${host.hostId}" data-params="${JSON.stringify(params)}" data-done="/attention?msg=sent" class="actions">
+  <button class="primary" type="submit" data-approve="true" data-testid="hub-approval-allow">パスキーで確認して今回だけ許可</button>
+  <button class="danger" type="submit" data-approve="false" data-testid="hub-approval-reject">パスキーで確認して拒否</button>
+  <p data-status hidden></p>
+</form>`
+      : h`<p class="muted not-answerable">このホストのプラグインは遠隔からの承認に対応していません。DSH Web で承認・拒否してください。</p>`
+  } else if (item.kind === 'plan-review') {
+    answer = h`<form method="post" action="/attention/respond" class="stack">
+  <input type="hidden" name="hostId" value="${host.hostId}"><input type="hidden" name="sessionId" value="${item.sessionId}"><input type="hidden" name="attentionId" value="${item.attentionId}">
+  <textarea name="text" rows="2" placeholder="差し戻す理由や追加の指示（任意）"></textarea>
+  <div class="actions"><button class="primary" type="submit" name="approve" value="true" data-testid="hub-plan-approve">プランを承認</button><button type="submit" name="approve" value="false" data-testid="hub-plan-reject">差し戻す</button></div>
+</form>`
+  } else {
+    answer = h`<form method="post" action="/attention/respond" class="stack">
+  <input type="hidden" name="hostId" value="${host.hostId}"><input type="hidden" name="sessionId" value="${item.sessionId}"><input type="hidden" name="attentionId" value="${item.attentionId}">
+  ${(item.options ?? []).map(option => h`<label class="check"><input type="radio" name="optionId" value="${option.id}"> <span class="untrusted">${option.label}</span></label>`)}
+  <textarea name="text" rows="2" placeholder="自由記述の回答（任意）"></textarea>
+  <button class="primary" type="submit" data-testid="hub-question-answer">回答する</button>
+</form>`
+  }
+  return h`<article class="card attention-item kind-${item.kind}${route === 'expired' ? ' expired' : ''}" id="${item.hostId}-${item.attentionId}"${raw(expiring ? ' data-expiring' : '')} data-testid="hub-attention-item">
+${head}
+${what}
+${answer}
+</article>`
+}
+
+/** The current items of one host: live from the host when online, else the last list it sent. */
+async function hostAttention(env: Env, summary: HostSummary, live: HostLive): Promise<{ items: AttentionItem[]; note: Raw }> {
+  if (!summary.online) {
+    return { items: live.attention, note: live.attention.length > 0 ? h`<p class="muted">ホストがオフラインのため、最後に届いた一覧です。回答はできません。</p>` : raw('') }
+  }
+  const listed = await runOperation(env, OWNER, 'attention.list', { hostId: summary.hostId })
+  if (listed.ok) return { items: (listed.result as { items?: AttentionItem[] }).items ?? [], note: raw('') }
+  return { items: live.attention, note: errorFlash(listed.error, '最新の一覧を読めませんでした') }
+}
+
+const cardHost = (summary: HostSummary): CardHost => ({ hostId: summary.hostId, name: summary.name, online: summary.online, canApprove: summary.operations.includes('approval.respond') })
 
 async function attentionPage(env: Env, url: URL): Promise<Response> {
   const data = await overview(env)
   const sections: Raw[] = []
   for (const { summary, live } of data.hosts) {
-    let items: AttentionItem[] = live.attention
-    let note: Raw = raw('')
-    if (summary.online) {
-      const listed = await runOperation(env, OWNER, 'attention.list', { hostId: summary.hostId })
-      if (listed.ok) items = (listed.result as { items: AttentionItem[] }).items
-      else note = errorFlash(listed.error, '最新の一覧を読めませんでした')
-    } else if (items.length > 0) {
-      note = h`<p class="muted">ホストがオフラインのため、最後に届いた一覧です。回答はできません。</p>`
-    }
+    const { items, note } = await hostAttention(env, summary, live)
     if (items.length === 0 && note.value === '') continue
-    const canApprove = summary.operations.includes('approval.respond')
     sections.push(h`<section><h2>${summary.name}</h2>${note}
-${items.map(item => h`<article class="card" id="${item.hostId}-${item.attentionId}">
-  <p><span class="badge warn">${ATTENTION_LABEL[item.kind] ?? item.kind}</span> <span class="muted">${relativeTime(item.createdAt)}</span></p>
-  <p class="untrusted"><strong>${item.title}</strong></p>
-  ${item.detail ? h`<div class="untrusted pre">${item.detail}</div>` : ''}
-  ${!summary.online
-    ? h`<p class="muted">ホストがオフラインのため、今は答えられません。</p>`
-    : item.answerable && item.kind === 'approval' && canApprove
-      ? h`<div class="confirm-preview"><p>パスキーで署名する内容（DSH ホストが検証します）:</p>
-          <dl class="facts"><dt>操作</dt><dd class="mono">approval.respond</dd><dt>ホスト</dt><dd class="mono">${summary.hostId}</dd>
-          <dt>パラメータ</dt><dd><pre class="codes">${JSON.stringify({ hostId: summary.hostId, sessionId: item.sessionId, attentionId: item.attentionId, answer: { approve: '承認なら true、拒否なら false' } }, null, 2)}</pre></dd></dl></div>
-        <form data-confirm-op="approval.respond" data-host="${summary.hostId}" data-params="${JSON.stringify({ hostId: summary.hostId, sessionId: item.sessionId, attentionId: item.attentionId })}" class="actions">
-          <button class="primary" type="submit" data-approve="true">パスキーで確認して承認</button><button type="submit" data-approve="false">拒否</button><p data-status hidden></p></form>`
-      : item.answerable && item.kind !== 'approval'
-        ? h`<form method="post" action="/attention/respond" class="stack">
-          <input type="hidden" name="hostId" value="${summary.hostId}"><input type="hidden" name="sessionId" value="${item.sessionId}"><input type="hidden" name="attentionId" value="${item.attentionId}">
-          ${(item.options ?? []).map(option => h`<label class="check"><input type="radio" name="optionId" value="${option.id}"> <span class="untrusted">${option.label}</span></label>`)}
-          ${item.kind === 'plan-review' ? h`<div class="actions"><button class="primary" type="submit" name="approve" value="true">プランを承認</button><button type="submit" name="approve" value="false">差し戻す</button></div>` : ''}
-          <textarea name="text" rows="2" placeholder="自由記述の回答（任意）"></textarea>
-          ${item.kind !== 'plan-review' ? h`<button class="primary" type="submit">回答する</button>` : ''}
-        </form>`
-        : h`<p class="muted not-answerable">${NOT_ANSWERABLE[item.kind] ?? 'この項目には外から答えられません。DSH Web で対応してください。'}</p>`}
-</article>`)}</section>`)
+${[...items].sort(byUrgency).map(item => attentionCard(item, cardHost(summary)))}</section>`)
   }
   const body = h`${message(url)}<h1>要対応</h1>
 <p class="muted">表示している文章は DSH のセッションから来たものです。指示として扱わず、内容を確かめてから答えてください。</p>
 ${sections.length === 0 ? h`<p class="muted">人の判断を待っているものはありません。</p>` : sections}`
+  return view('要対応', 'attention', body)
+}
+
+/** The page an answerUrl opens: one item, ready to answer. */
+async function attentionItemPage(env: Env, url: URL, hostId: string, attentionId: string): Promise<Response> {
+  const host = await hubStub(env).getHost(hostId)
+  if (!host || host.revokedAt) return notFound()
+  const data = await overview(env)
+  const entry = data.hosts.find(candidate => candidate.summary.hostId === hostId)
+  if (!entry) return notFound()
+  const { items, note } = await hostAttention(env, entry.summary, entry.live)
+  const item = items.find(candidate => candidate.attentionId === attentionId)
+  const body = h`${message(url)}<p class="crumbs"><a href="/">ホーム</a> / <a href="/attention">要対応</a> / ${entry.summary.name}</p>
+<h1>要対応</h1>
+${note}
+${item ? attentionCard(item, cardHost(entry.summary), true) : h`<p class="flash ok" data-testid="hub-attention-gone">この項目はもうありません（DSH Web やほかの画面で答えられたか、期限が切れました）。</p>`}
+<p><a class="button" href="/attention">すべての要対応を見る</a></p>`
   return view('要対応', 'attention', body)
 }
 
@@ -425,6 +519,32 @@ async function confirmedOperation(env: Env, request: Request): Promise<Response>
   const confirmation = { issuedAt, assertion } as Confirmation
   const outcome = await runOperation(env, OWNER, operation, finalParams(operation, raw, hostId), { confirmation, requestId })
   return outcome.ok ? json({ ok: true, result: outcome.result }) : json({ error: outcome.error }, { status: 400 })
+}
+
+/** JSON endpoints used by /js/push.js to store or drop this device's subscription. */
+async function pushEndpoint(env: Env, request: Request, path: string): Promise<Response> {
+  let body: Record<string, unknown>
+  try {
+    body = (await readJson(request, 8192)) as Record<string, unknown>
+  } catch {
+    return json({ error: { code: 'invalid_request', message: 'invalid JSON' } }, { status: 400 })
+  }
+  const hub = hubStub(env)
+  const subscription = (typeof body.subscription === 'object' && body.subscription !== null ? body.subscription : body) as Record<string, unknown>
+  const endpoint = subscription.endpoint
+  if (path === '/push/unsubscribe') {
+    if (typeof endpoint !== 'string') return json({ error: { code: 'invalid_request', message: 'endpoint is required' } }, { status: 400 })
+    return json({ ok: await hub.pushUnsubscribe({ endpoint }) })
+  }
+  const keys = (typeof subscription.keys === 'object' && subscription.keys !== null ? subscription.keys : {}) as Record<string, unknown>
+  const p256dh = typeof keys.p256dh === 'string' ? keys.p256dh.replace(/=+$/, '') : null
+  const auth = typeof keys.auth === 'string' ? keys.auth.replace(/=+$/, '') : null
+  if (!isPushEndpoint(endpoint)) return json({ error: { code: 'invalid_request', message: 'endpoint must be an https URL of a known push service' } }, { status: 400 })
+  if (!isSubscriptionKey(p256dh, 65) || !isSubscriptionKey(auth, 16)) return json({ error: { code: 'invalid_request', message: 'keys.p256dh and keys.auth are required' } }, { status: 400 })
+  const label = typeof body.label === 'string' && body.label.trim() ? pushText(body.label, 60) : 'このデバイス'
+  const stored = await hub.pushSubscribe({ endpoint, p256dh, auth, label })
+  if ('error' in stored) return json({ error: { code: 'conflict', message: 'Too many devices; remove one first.' } }, { status: 409 })
+  return json({ ok: true, id: stored.id })
 }
 
 // --- connections -------------------------------------------------------------------------------------
@@ -524,8 +644,26 @@ ${broken.length === 0 ? flash('表示中の範囲でハッシュ連鎖は正常�
 
 async function settingsPage(env: Env, url: URL, origin: string): Promise<Response> {
   const hub = hubStub(env)
-  const [state, passkeys, tokens] = await Promise.all([hub.state(), hub.listPasskeys(), hub.listPersonalTokens()])
+  const [state, passkeys, tokens, devices, vapidKey] = await Promise.all([hub.state(), hub.listPasskeys(), hub.listPersonalTokens(), hub.listPushDevices(), hub.vapidPublicKey()])
   const resources = resourcesFor(origin)
+  const typeLabel: Record<PushType, string> = { attention: '要対応（質問・プランの確認・承認）', tasks: 'タスクの完了・失敗', hosts: 'ホストの切断・再接続' }
+  const notifications = h`<section class="card" id="notifications" data-push data-vapid-key="${vapidKey}"><h2>通知（Web Push）</h2>
+<p>このデバイスに、要対応が出たとき、タスクが終わったとき、ホストが切れた・戻ったときに通知します。通知には会話の本文を入れません（種類、ホスト名、短く伏せ字にしたタイトル、開くページだけ）。</p>
+<p class="flash error" data-push-unsupported hidden>このブラウザでは Web Push を使えません。</p>
+<p class="muted">iPhone・iPad（iOS 16.4 以降）では、Safari の共有ボタンから「ホーム画面に追加」し、ホーム画面の Remora から開いたときだけ通知をオンにできます。Safari のタブのままでは使えません。</p>
+<div class="actions"><button class="primary" type="button" data-push-on hidden data-testid="hub-push-on">このデバイスで通知を受け取る</button><button type="button" data-push-off hidden data-testid="hub-push-off">このデバイスの通知を止める</button></div>
+<p data-push-status hidden></p>
+${devices.length === 0 ? h`<p class="muted">通知を受け取るデバイスはまだありません。</p>` : h`<ul class="list">${devices.map(device => h`<li data-push-endpoint="${device.endpoint}" data-testid="hub-push-device">
+  <div class="row"><strong>${device.label}</strong> <span class="muted" data-this-device hidden>（このデバイス）</span> <span class="muted">登録 ${dateTime(device.createdAt)} ・ 最終送信 ${relativeTime(device.lastSentAt)}</span>${device.lastError ? h` <span class="badge warn">${device.lastError}</span>` : ''}</div>
+  <form method="post" action="/settings/push/types" class="row">
+    <input type="hidden" name="id" value="${device.id}">
+    ${PUSH_TYPES.map(type => h`<label class="check"><input type="checkbox" name="type" value="${type}"${raw(device.types.includes(type) ? ' checked' : '')}> <span>${typeLabel[type]}</span></label>`)}
+    <button type="submit" class="small">保存</button>
+  </form>
+  <form method="post" action="/settings/push/remove" class="inline"><input type="hidden" name="id" value="${device.id}"><button class="danger small" type="submit">このデバイスを削除</button></form>
+</li>`)}</ul>
+<form method="post" action="/settings/push/test"><button type="submit" data-testid="hub-push-test">テスト通知を送る</button></form>`}
+</section>`
   const body = h`${message(url)}<h1>設定</h1>
 ${url.searchParams.get('recovered') ? flash('リカバリーコードでログインしました。新しいパスキーを登録し、必要ならリカバリーコードを作り直してください。', 'error') : ''}
 <section class="card" id="passkeys"><h2>パスキー（${passkeys.length} 本）</h2>
@@ -535,6 +673,7 @@ ${passkeys.length < 2 ? flash('パスキーは 2 本以上の登録をおすす�
 <p class="muted">パスキーを削除しても、ペアリング済みの DSH ホストは、各ホストの DSH 画面で変更を承認するまで、そのパスキーを危険な操作の確認用に信頼し続けます。なくした・盗まれたパスキーを削除したときは、すべてのホストで承認してください。</p>
 <form class="stack" data-add-passkey><label>新しいパスキーの名前<input name="label" maxlength="60" placeholder="例: MacBook"></label><button class="primary" type="submit">パスキーを追加</button><p data-status hidden></p></form>
 <p class="muted">パスキーを追加・削除すると、次に DSH ホストが接続したとき新しい一覧が届きます。ホスト側は変更を DSH の画面で確認してから使います。</p></section>
+${notifications}
 <section class="card" id="recovery"><h2>リカバリーコード</h2>
 <p>未使用: ${state.recoveryCodesLeft} / 10</p>
 ${reauthForm('/settings/recovery', {}, 'パスキーで確認して作り直す')}
@@ -559,7 +698,7 @@ ${reauthForm('/settings/allow-other-clients', { allow: state.allowOtherClients ?
 <dt>MCP</dt><dd class="mono">${resources.mcp}</dd><dt>HTTP API</dt><dd class="mono">${resources.api}/&lt;操作&gt;</dd><dt>OAuth 発行者</dt><dd class="mono">${origin}</dd><dt>CLI のクライアント ID</dt><dd class="mono">${CLI_CLIENT_ID}</dd></dl>
 <p class="muted">ドメインを変えるとパスキーと OAuth の発行者が変わります。リカバリーコードでログインしてパスキーを登録し直し、各クライアントも接続し直してください。</p>
 <form method="post" action="/auth/logout"><button type="submit">ログアウト</button></form></section>`
-  return view('設定', 'settings', body)
+  return view('設定', 'settings', body, ['/js/webauthn.js', '/js/live.js', '/js/push.js'])
 }
 
 function onceShown(title: string, lead: string, value: string, back: string): Response {
@@ -595,7 +734,7 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
       const state = await hub.state()
       return state.setupComplete ? redirect('/') : setupPage(env)
     }
-    const known = path === '/' || path === '/attention' || path === '/connections' || path === '/audit' || path === '/settings' || path.startsWith('/hosts/') || path.startsWith('/tasks/')
+    const known = path === '/' || path === '/attention' || path.startsWith('/attention/') || path === '/connections' || path === '/audit' || path === '/settings' || path.startsWith('/hosts/') || path.startsWith('/tasks/')
     if (!known) return null
     if (path === '/') {
       const state = await hub.state()
@@ -605,6 +744,16 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
     if (session instanceof Response) return session
     if (path === '/') return homePage(env, url)
     if (path === '/attention') return attentionPage(env, url)
+    const itemMatch = /^\/attention\/([a-z0-9]{8,64})\/([^/]+)$/.exec(path)
+    if (itemMatch) {
+      let attentionId: string
+      try {
+        attentionId = decodeURIComponent(itemMatch[2] as string)
+      } catch {
+        return notFound()
+      }
+      return attentionItemPage(env, url, itemMatch[1] as string, attentionId)
+    }
     if (path === '/connections') return connectionsPage(env, url, origin)
     if (path === '/audit') return auditPage(env, url)
     if (path === '/settings') return settingsPage(env, url, origin)
@@ -618,13 +767,14 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
   }
 
   if (request.method !== 'POST') return null
-  const handled = path === '/ops/confirmed' || path.startsWith('/hosts/') || path.startsWith('/attention/') || path.startsWith('/connections/') || path.startsWith('/settings/')
+  const handled = path === '/ops/confirmed' || path.startsWith('/push/') || path.startsWith('/hosts/') || path.startsWith('/attention/') || path.startsWith('/connections/') || path.startsWith('/settings/')
   if (!handled) return null
   if (!sameOrigin(request, origin)) return new Response('cross-origin request refused', { status: 403 })
   const session = await getSession(request, env)
-  if (!session) return path === '/ops/confirmed' ? json({ error: { code: 'denied', message: 'sign in first' } }, { status: 403 }) : redirect('/login')
+  if (!session) return path === '/ops/confirmed' || path.startsWith('/push/') ? json({ error: { code: 'denied', message: 'sign in first' } }, { status: 403 }) : redirect('/login')
 
   if (path === '/ops/confirmed') return confirmedOperation(env, request)
+  if (path === '/push/subscribe' || path === '/push/unsubscribe') return pushEndpoint(env, request, path)
   if (path === '/attention/respond') return attentionRespond(env, request)
 
   const sessionAct = /^\/hosts\/([a-z0-9]{8,64})\/sessions\/([^/]+)\/(prompt|steer|cancel|compact|model)$/.exec(path)
@@ -681,6 +831,16 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
       await hub.revokePersonalToken(form.get('id') ?? '')
       await refreshParked(env, `pat:${form.get('id') ?? ''}`)
       return redirect('/settings?msg=token-revoked#tokens')
+    case '/settings/push/remove':
+      await hub.pushUnsubscribe({ id: form.get('id') ?? '' })
+      return redirect('/settings?msg=push-removed#notifications')
+    case '/settings/push/types':
+      await hub.pushSetTypes(form.get('id') ?? '', form.getAll('type').filter((type): type is PushType => (PUSH_TYPES as readonly string[]).includes(type)))
+      return redirect('/settings?msg=push-saved#notifications')
+    case '/settings/push/test': {
+      const outcome = await hub.notify([{ type: 'test', kind: 'test', hostId: null, host: 'Remora', title: pushText('テスト通知です。届いていれば設定は完了です。'), url: '/settings#notifications' }], origin)
+      return redirect(`/settings?msg=${outcome.sent > 0 ? 'push-test-sent' : 'push-test-none'}#notifications`)
+    }
     case '/settings/allow-other-clients': {
       if (!session.fresh) return redirect('/settings?msg=reauth#clients')
       const allow = form.get('allow') === '1'

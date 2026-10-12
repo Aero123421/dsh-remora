@@ -8,7 +8,9 @@
  * The plugin is the final authority on permissions; `decide()` runs here
  * only to fail early and to explain denials.
  */
+import { answerPath, answerUrl, pushText } from './attention.ts'
 import { stampHostId } from './stamp.ts'
+import type { PushEvent } from './types.ts'
 import { DurableObject } from 'cloudflare:workers'
 import { AUDIT_SCHEMA, appendAudit, listAudit, type AuditRow } from './audit.ts'
 import { OWNER_CLIENT_ID, PARKED_TASK_TTL_MS, RELAY_TIMEOUT_MS } from './config.ts'
@@ -22,6 +24,10 @@ import {
 
 /** How long a host has to answer the challenge. */
 const AUTH_WINDOW_MS = 60_000
+/** A host must stay offline this long before "offline" is notified. */
+const OFFLINE_NOTIFY_AFTER_MS = 60_000
+/** Attention kinds that trigger a notification when they appear. */
+const PUSH_ATTENTION_KINDS = new Set(['question', 'plan-review', 'approval'])
 /** Tasks and attention entries older than this are pruned. */
 const RETENTION_MS = 7 * 24 * 60 * 60_000
 /** Operations that create a ledger entry with a hub-assigned task id. */
@@ -47,6 +53,8 @@ export interface ExecuteCall {
   /** Used as the request frame id; bound into passkey confirmations. */
   requestId?: string
   confirmation?: Confirmation
+  /** The hub origin, for links in errors (never sent to the host). */
+  origin?: string
 }
 
 export type ExecuteResult = { ok: true; result: unknown } | { ok: false; error: RemoraError }
@@ -167,6 +175,34 @@ export class HostDO extends DurableObject<Env> {
     return parseJson<string[] | null>(this.info('operations'), null)
   }
 
+  private displayName(): string {
+    return this.info('name') || this.hostId || 'DSH'
+  }
+
+  /** Hand a batch of notifications to the hub object; never blocks host traffic. */
+  private push(events: PushEvent[]): void {
+    if (events.length === 0) return
+    this.ctx.waitUntil(this.hub().notify(events, this.info('origin')).catch(() => undefined))
+  }
+
+  /**
+   * An approval the host refused for lack of the owner's passkey: say so and
+   * carry the hub page, so an AI client can hand the link to its user.
+   */
+  private explainRefusal(call: ExecuteCall, error: RemoraError): RemoraError {
+    if (call.op !== 'approval.respond' || error.denial?.reason !== 'confirmation-failed' || typeof call.params.attentionId !== 'string') return error
+    const link = call.origin ? answerUrl(call.origin, this.hostId ?? '', call.params.attentionId) : `hub:${answerPath(this.hostId ?? '', call.params.attentionId)}`
+    return {
+      ...error,
+      message: `${error.message} This DSH host only accepts approvals confirmed with the owner's passkey. Give the user this link to allow or reject it on the Remora hub: ${link}`,
+      fix: link,
+    }
+  }
+
+  private taskPush(taskId: string, state: 'completed' | 'failed'): PushEvent {
+    return { type: 'tasks', kind: state === 'completed' ? 'task-completed' : 'task-failed', hostId: this.hostId, host: this.displayName(), title: '', url: `/tasks/${taskId}` }
+  }
+
   private hub() {
     return this.env.HUB.get(this.env.HUB.idFromName(HUB_OBJECT_NAME))
   }
@@ -200,6 +236,7 @@ export class HostDO extends DurableObject<Env> {
   async revoke(): Promise<void> {
     this.ensureSchema()
     this.setInfo('revoked', '1')
+    this.setInfo('offline_since', null)
     this.setInfo('public_key', null)
     for (const ws of this.ctx.getWebSockets()) {
       send(ws, { t: 'close', reason: 'revoked' })
@@ -278,7 +315,12 @@ export class HostDO extends DurableObject<Env> {
       case 'event':
         if (attachment.stage !== 'ready') { ws.close(4001, 'not authenticated'); return }
         this.setInfo('last_seen_at', String(Date.now()))
-        for (const event of frame.events as HostEvent[]) await this.onEvent(event)
+        {
+          // One notification batch per frame.
+          const pushes: PushEvent[] = []
+          for (const event of frame.events as HostEvent[]) await this.onEvent(event, pushes)
+          this.push(pushes)
+        }
         return
     }
   }
@@ -303,6 +345,13 @@ export class HostDO extends DurableObject<Env> {
     this.setInfo('kill_switch', hello.killSwitch ? '1' : '0')
     this.setInfo('protocol', String(hello.protocol))
     this.setInfo('last_seen_at', String(now))
+    this.setInfo('origin', attachment.origin)
+    // Back online: notify only when "offline" was notified (short drops stay silent).
+    this.setInfo('offline_since', null)
+    if (this.info('offline_notified') === '1') {
+      this.setInfo('offline_notified', null)
+      this.push([{ type: 'hosts', kind: 'host-online', hostId: this.hostId, host: this.displayName(), title: '', url: `/hosts/${this.hostId ?? ''}` }])
+    }
     send(ws, { t: 'ready', connectionId: attachment.connectionId })
     try {
       send(ws, { t: 'owner-credentials', credentials: await this.hub().ownerCredentials() })
@@ -320,7 +369,15 @@ export class HostDO extends DurableObject<Env> {
     } catch {
       // already closed
     }
-    if (this.readySockets().filter(other => other !== ws).length === 0) this.setInfo('last_seen_at', String(Date.now()))
+    const wasReady = (ws.deserializeAttachment() as Attachment | null)?.stage === 'ready'
+    if (wasReady && this.readySockets().filter(other => other !== ws).length === 0) {
+      this.setInfo('last_seen_at', String(Date.now()))
+      if (this.info('revoked') !== '1' && this.info('offline_since') === null && this.info('offline_notified') !== '1') {
+        // Notify only if the host stays offline for a while (checked by the alarm).
+        this.setInfo('offline_since', String(Date.now()))
+        await this.scheduleAlarm()
+      }
+    }
   }
 
   override async webSocketError(ws: WebSocket): Promise<void> {
@@ -343,19 +400,39 @@ export class HostDO extends DurableObject<Env> {
 
   // --- events from the host ---------------------------------------------------------------
 
-  private async onEvent(event: HostEvent): Promise<void> {
+  private async onEvent(event: HostEvent, pushes: PushEvent[]): Promise<void> {
     switch (event.kind) {
       case 'task': {
         const now = Date.now()
+        const before = this.taskRow(event.taskId)
         const changed = this.sql.exec(
           'UPDATE tasks SET state = ?, session_id = COALESCE(?, session_id), updated_at = ?, error = ?, delivered = 1, params = NULL, frame = NULL, expires_at = NULL WHERE task_id = ?',
           event.state, event.sessionId ?? null, Math.min(event.updatedAt || now, now), event.error ? JSON.stringify(event.error) : null, event.taskId,
         ).rowsWritten
         if (changed > 0) this.notify(event.taskId)
+        if (changed > 0 && before && !TERMINAL_TASK_STATES.has(before.state as TaskState) && (event.state === 'completed' || event.state === 'failed')) {
+          pushes.push(this.taskPush(event.taskId, event.state))
+        }
         return
       }
       case 'attention': {
         const items = stampHostId(Array.isArray(event.items) ? event.items : [], this.hostId ?? '')
+        // Notify about items that were not in this session's list before.
+        const previous = new Set(this.attentionFor(event.sessionId).map(item => item.attentionId))
+        const now = Date.now()
+        for (const item of items) {
+          if (previous.has(item.attentionId) || !PUSH_ATTENTION_KINDS.has(item.kind)) continue
+          if (typeof item.expiresAt === 'number' && item.expiresAt <= now) continue
+          pushes.push({
+            type: 'attention',
+            kind: item.kind as PushEvent['kind'],
+            hostId: this.hostId,
+            host: this.displayName(),
+            title: pushText(String(item.title ?? '')),
+            url: answerPath(this.hostId ?? '', item.attentionId),
+            expiresAt: typeof item.expiresAt === 'number' ? item.expiresAt : null,
+          })
+        }
         if (items.length === 0) this.sql.exec('DELETE FROM attention WHERE session_id = ?', event.sessionId)
         else this.sql.exec('INSERT INTO attention (session_id, items, updated_at) VALUES (?, ?, ?) ON CONFLICT (session_id) DO UPDATE SET items = excluded.items, updated_at = excluded.updated_at', event.sessionId, JSON.stringify(items), Date.now())
         return
@@ -541,6 +618,15 @@ export class HostDO extends DurableObject<Env> {
       if (!owned || owned.client_id !== call.actor.clientId) return { ok: false, error: err('not_found', 'No task with this id is known to the hub for this client.') }
     }
     if (call.op === 'task.get' || call.op === 'task.wait') return this.taskQuery(call)
+    if (call.op === 'attention.respond') {
+      const sessionId = String(call.params.sessionId ?? '')
+      const attentionId = String(call.params.attentionId ?? '')
+      const cached = this.attentionFor(sessionId).find(item => item.attentionId === attentionId)
+      if (cached?.kind === 'approval' || (!cached && attentionId.startsWith('approval:'))) {
+        const link = call.origin ? answerUrl(call.origin, this.hostId ?? '', attentionId) : `hub:${answerPath(this.hostId ?? '', attentionId)}`
+        return { ok: false, error: err('invalid_request', `This item is an approval, which attention.respond does not answer. Use dsh_approval_respond (HTTP: approval.respond) with the same sessionId and attentionId; if the DSH host needs the owner's passkey, the owner answers at ${link}`, { fix: link }) }
+      }
+    }
     const operations = this.operations()
     if (operations && !operations.includes(call.op)) {
       return { ok: false, error: err('unavailable', `This DSH host cannot serve ${call.op} (not supported by its DSH or plugin version).`, { fix: 'dsh:settings/remora#compatibility' }) }
@@ -550,7 +636,8 @@ export class HostDO extends DurableObject<Env> {
     if (!ws) return { ok: false, error: err('host_offline', 'The DSH host is offline. Start DSH Web on that machine and try again.') }
     const frame = await this.relay(ws, call.requestId ?? `r_${randomToken(12)}`, call, RELAY_TIMEOUT_MS)
     if (!frame) return { ok: false, error: err('unavailable', 'The DSH host did not answer in time.') }
-    return frame.ok ? { ok: true, result: stampHostId(frame.result ?? null, this.hostId ?? "") } : { ok: false, error: frame.error ?? err('internal', 'The host returned an error without details.') }
+    if (frame.ok) return { ok: true, result: stampHostId(frame.result ?? null, this.hostId ?? '') }
+    return { ok: false, error: this.explainRefusal(call, frame.error ?? err('internal', 'The host returned an error without details.')) }
   }
 
   // --- task ledger ------------------------------------------------------------------------------
@@ -663,7 +750,9 @@ export class HostDO extends DurableObject<Env> {
 
   private async scheduleAlarm(retryInMs?: number): Promise<void> {
     const next = this.sql.exec<{ at: number | null }>("SELECT MIN(expires_at) AS at FROM tasks WHERE state = 'parked' AND expires_at IS NOT NULL").one().at
-    const candidates = [next, retryInMs !== undefined ? Date.now() + retryInMs : null, Date.now() + 24 * 60 * 60_000].filter((value): value is number => value !== null)
+    const offlineSince = Number(this.info('offline_since') ?? '0') || null
+    const offlineCheck = offlineSince === null ? null : offlineSince + OFFLINE_NOTIFY_AFTER_MS
+    const candidates = [next, offlineCheck, retryInMs !== undefined ? Date.now() + retryInMs : null, Date.now() + 24 * 60 * 60_000].filter((value): value is number => value !== null)
     const at = Math.min(...candidates)
     const current = await this.ctx.storage.getAlarm()
     if (current === null || current > at) await this.ctx.storage.setAlarm(at)
@@ -680,7 +769,17 @@ export class HostDO extends DurableObject<Env> {
       )
       this.notify(task_id)
     }
+    const pushes = expired.map(({ task_id }) => this.taskPush(task_id, 'failed'))
+    const offlineSince = Number(this.info('offline_since') ?? '0') || null
     const ws = this.readySockets()[0]
+    if (offlineSince !== null && !ws && this.info('revoked') !== '1' && now - offlineSince >= OFFLINE_NOTIFY_AFTER_MS) {
+      this.setInfo('offline_since', null)
+      this.setInfo('offline_notified', '1')
+      pushes.push({ type: 'hosts', kind: 'host-offline', hostId: this.hostId, host: this.displayName(), title: '', url: `/hosts/${this.hostId ?? ''}` })
+    } else if (offlineSince !== null && ws) {
+      this.setInfo('offline_since', null)
+    }
+    this.push(pushes)
     if (ws) await this.deliverUndelivered(ws)
     this.sql.exec('DELETE FROM tasks WHERE updated_at < ? AND state IN (\'completed\', \'failed\', \'cancelled\')', now - RETENTION_MS)
     this.sql.exec('DELETE FROM attention WHERE updated_at < ?', now - RETENTION_MS)

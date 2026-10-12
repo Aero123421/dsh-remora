@@ -108,6 +108,43 @@ export interface HubState {
   hosts: number
   allowOtherClients: boolean
   recoveryCodesLeft: number
+  /** Devices that receive Web Push notifications. */
+  pushDevices: number
+}
+
+/** Notification groups a device can switch on or off separately. */
+export type PushType = 'attention' | 'tasks' | 'hosts'
+export const PUSH_TYPES: readonly PushType[] = ['attention', 'tasks', 'hosts']
+
+/** One thing worth a notification. No conversation content: kind, host name, a short redacted title, a hub path. */
+export interface PushEvent {
+  type: PushType | 'test'
+  kind: 'question' | 'plan-review' | 'approval' | 'task-completed' | 'task-failed' | 'host-offline' | 'host-online' | 'test'
+  hostId: string | null
+  /** The host's approved display name. */
+  host: string
+  /** At most 80 characters, already passed through pushText(). */
+  title: string
+  /** A path on the hub, opened when the notification is tapped. */
+  url: string
+  expiresAt?: number | null
+}
+
+export interface PushDevice {
+  id: string
+  endpoint: string
+  label: string
+  types: PushType[]
+  createdAt: number
+  lastSentAt: number | null
+  lastError: string | null
+}
+
+export interface PushOutcome {
+  sent: number
+  dropped: number
+  removed: number
+  failed: number
 }
 
 export type { OwnerCredential }

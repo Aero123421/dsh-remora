@@ -3,6 +3,7 @@
  * body and a bearer token (an OAuth token for the API audience, or a
  * personal token issued on the hub). Errors use `HttpErrorBody`.
  */
+import { hubOrigin } from './config.ts'
 import { errorResponse, json, readJson } from './http.ts'
 import type { ApiCaller } from './oauth.ts'
 import { runOperation } from './ops.ts'
@@ -31,6 +32,6 @@ export async function handleApi(request: Request, env: Env, _ctx: ExecutionConte
     return errorResponse({ code: 'invalid_request', message: 'The body must be a JSON object of operation parameters.' })
   }
   if (typeof params !== 'object' || params === null || Array.isArray(params)) return errorResponse({ code: 'invalid_request', message: 'The body must be a JSON object of operation parameters.' })
-  const outcome = await runOperation(env, { clientId: caller.props.clientId, clientName: caller.props.clientName, scopes: caller.auth.scope, kind: 'client' }, op, params)
+  const outcome = await runOperation(env, { clientId: caller.props.clientId, clientName: caller.props.clientName, scopes: caller.auth.scope, kind: 'client' }, op, params, { origin: hubOrigin(request, env) })
   return outcome.ok ? json(outcome.result ?? {}) : errorResponse(outcome.error)
 }
