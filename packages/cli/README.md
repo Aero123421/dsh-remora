@@ -1,6 +1,6 @@
 # remora（CLI）
 
-Remora のハブ経由で DSH Web のセッションを操作するコマンドです。GitHub Releases の単体実行ファイルとして配ります（npm には公開しません）。
+Remora のハブ経由で DSH Web のセッションを操作するコマンドです。GitHub Releases で配ります（npm には公開しません）。
 
 ## 入れ方
 
@@ -11,7 +11,17 @@ curl -fsSL https://raw.githubusercontent.com/Aero123421/dsh-remora/main/scripts/
 irm https://raw.githubusercontent.com/Aero123421/dsh-remora/main/scripts/install.ps1 | iex
 ```
 
-どちらも `SHA256SUMS` を検証してから置きます。更新は `remora self-update`（同じく検証してから、実行ファイルを原子的に入れ替え。Windows では動いている `remora.exe` を `remora.exe.old` に退避してから置き換え、次回起動時に消します）。
+形は 2 つあり、インストーラーが自動で選びます。どちらも `SHA256SUMS` を検証してから置きます。
+
+| 形 | 中身 | 大きさ | 選ばれる条件 |
+| --- | --- | --- | --- |
+| Node.js 版（主） | `remora.mjs` ＋ 小さな起動スクリプト（`remora`／`remora.cmd`） | 約 130 KB | Node.js 22.19 以上がある |
+| 単体実行ファイル | `remora-<os>-<arch>[.exe]`（Node.js を内蔵） | 約 100 MB（Linux は strip 済み） | Node.js が無いか古い、または `--form binary`／`-Form binary` |
+
+- 起動スクリプトは `$REMORA_NODE` → インストール時に見つけた node → `PATH` の node の順に使います。`remora.mjs` の先頭で版を確かめ、22.19 未満なら案内を出して終わります。
+- `REMORA_FORM=auto|node|binary`（PowerShell は `-Form`）で形を選べます。Node.js 版のリリースより前の版（`remora.mjs` が無い）を指定すると単体実行ファイルになります。
+- 更新は `remora self-update`。動いている形のまま（`remora.mjs` か実行ファイルを）検証してから原子的に入れ替えます。Windows では動いているファイルを `.old` に退避してから置き換え、次回起動時に消します。
+- Windows の Node.js 版は `remora.cmd` なので、シェルを通さずにコマンドを起動する MCP クライアントでは `cmd /c remora mcp` と書きます。
 
 ## コマンド
 
@@ -38,6 +48,7 @@ irm https://raw.githubusercontent.com/Aero123421/dsh-remora/main/scripts/install
 
 ```sh
 claude mcp add remora -- remora mcp        # Claude Code
+claude mcp add remora -- cmd /c remora mcp # Windows の Node.js 版
 ```
 
 `remora mcp` は標準入力の JSON-RPC を 1 行ずつハブの `/mcp`（ステートレスな Streamable HTTP）へ CLI のトークン付きで POST し、JSON でも SSE でも応答を 1 行ずつ標準出力へ返します。`initialize` で決まったプロトコル版は以降 `MCP-Protocol-Version` ヘッダーで送ります。2026-07-28 の要求（`_meta` に版がある）には `MCP-Protocol-Version`／`Mcp-Method`／`Mcp-Name` ヘッダーを本文から付けます。`mcp probe` は 2026-07-28（`server/discover`）を先に試し、断られたら 2025-06-18 の `initialize` に戻ります。401 なら一度だけトークンを更新して再送し、ハブに届かないときは要求ごとに JSON-RPC エラーを返します。
@@ -77,13 +88,13 @@ claude mcp add remora -- remora mcp        # Claude Code
 
 ```sh
 pnpm build
-node packages/cli/scripts/build-binaries.mjs [--out-dir artifacts/cli] [--node <node の実行ファイル>] [--skip-smoke]
+node packages/cli/scripts/build-binaries.mjs [--out-dir artifacts/cli] [--node <node の実行ファイル>] [--skip-smoke] [--no-strip]
 # → artifacts/cli/remora-<process.platform>-<process.arch>[.exe]
 ```
 
 1. `dist/remora.mjs` を CommonJS に変換（Node 22 の SEA は CJS のみ）
 2. `node --experimental-sea-config`（`useSnapshot`／`useCodeCache` は false）で blob を作る。埋め込む node と同じ node で作る
-3. node をコピーし、`postject@1.0.0-alpha.6`（devDependency に固定）で `NODE_SEA_BLOB` を注入。macOS は事前に `codesign --remove-signature`、事後に `codesign --sign -`（ad-hoc）
+3. node をコピーし（Linux はここで `strip --strip-all`。macOS は署名、Windows はウイルス対策の誤検知を避けるため縮めない）、`postject@1.0.0-alpha.6`（devDependency に固定）で `NODE_SEA_BLOB` を注入。macOS は事前に `codesign --remove-signature`、事後に `codesign --sign -`（ad-hoc）
 4. `--version` が package.json の版と一致するかを確かめる
 
 標準出力の最後の 2 行は `<sha256>  <ファイル名>` と出力先のパスです。クロスビルドはしません（各 OS のランナーで実行）。
@@ -92,13 +103,14 @@ node packages/cli/scripts/build-binaries.mjs [--out-dir artifacts/cli] [--node <
 
 | 出力 | ランナー |
 | --- | --- |
-| `remora-linux-x64` | `ubuntu-latest` |
+| `remora.mjs` | `ubuntu-24.04`（`pnpm --filter @dsh-remora/cli build` の `dist/remora.mjs`） |
+| `remora-linux-x64` | `ubuntu-24.04` |
 | `remora-linux-arm64` | `ubuntu-24.04-arm` |
 | `remora-darwin-x64` | `macos-15-intel`（Intel。`macos-13` は廃止済み） |
-| `remora-darwin-arm64` | `macos-latest`（Apple Silicon） |
-| `remora-win32-x64.exe` | `windows-latest` |
+| `remora-darwin-arm64` | `macos-15`（Apple Silicon） |
+| `remora-win32-x64.exe` | `windows-2025` |
 
-各ジョブ: `actions/setup-node`（Node 22 の固定版。nodejs.org の公式ビルドを使う。ディストリの node は SEA のヒューズが無いことがある）→ `pnpm install --frozen-lockfile` → `pnpm build` → `node packages/cli/scripts/build-binaries.mjs` → `artifacts/cli/*` をアップロード。最後のジョブで全ファイルを集めて `sha256sum remora-* > SHA256SUMS`（ファイル名だけの行）を作り、`install.sh`／`install.ps1` と一緒にリリースへ添付します。
+各ジョブ: `actions/setup-node`（Node 22 の固定版。nodejs.org の公式ビルドを使う。ディストリの node は SEA のヒューズが無いことがある）→ `pnpm install --frozen-lockfile` → `pnpm build` → `node packages/cli/scripts/build-binaries.mjs` → `artifacts/cli/*` をアップロード。最後のジョブで全ファイルを集めて `remora.mjs` も含めた `SHA256SUMS`（ファイル名だけの行）を作り、`install.sh`／`install.ps1` と一緒にリリースへ添付します。
 
 ### macOS の署名
 
@@ -106,4 +118,11 @@ node packages/cli/scripts/build-binaries.mjs [--out-dir artifacts/cli] [--node <
 - 正式に配るなら Developer ID で `codesign --sign "Developer ID Application: …" --options runtime --entitlements` し（JIT のため `com.apple.security.cs.allow-jit` と `allow-unsigned-executable-memory` が要る）、`notarytool` で公証します。生の実行ファイルはステープルできないため、公証は zip で行います。
 - Windows も未署名です（SmartScreen の警告が出る場合があります）。
 
-大きさは 1 本あたり約 110〜120 MB（Node 本体を含むため）です。
+### 大きさ（v0.1.0 → この版、linux-x64 で計測）
+
+| もの | 以前 | 今 |
+| --- | --- | --- |
+| `remora.mjs`（Node.js 版） | — | 127 KB（gzip 36 KB）。日本語を `\u` エスケープしない UTF-8 出力で 142 KB から縮小 |
+| `remora-linux-x64` | 117.9 MiB | 101.1 MiB（`strip --strip-all`） |
+
+単体実行ファイルは Node.js 本体がほとんどを占めます。gzip すると約 39 MB（xz なら約 26 MB）になりますが、既存の `remora self-update` が生の実行ファイル名を探すため、圧縮版は配っていません。

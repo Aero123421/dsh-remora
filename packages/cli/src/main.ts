@@ -12,7 +12,7 @@ import { login, logout } from './commands/auth.ts'
 import { attention, hosts, sessions, workspaces } from './commands/read.ts'
 import { answer, patch, run, tasks } from './commands/tasks.ts'
 import { doctor, mcp, NOT_YET, open, selfUpdateCommand } from './commands/misc.ts'
-import { cleanupOldBinary } from './selfupdate.ts'
+import { cleanupOldBinary, installOf } from './selfupdate.ts'
 import { CLI_VERSION } from './version.ts'
 
 export { CLI_VERSION } from './version.ts'
@@ -66,7 +66,10 @@ function report(ctx: Ctx, json: boolean, error: CliError): void {
 
 export async function main(argv: readonly string[], ctx: Ctx): Promise<number> {
   const [name, ...rest] = argv
-  if (ctx.isSea && ctx.platform === 'win32') await cleanupOldBinary(ctx.execPath)
+  if (ctx.platform === 'win32') {
+    const installed = installOf(ctx).path
+    if (installed) await cleanupOldBinary(installed)
+  }
   if (name === undefined || name === 'help' || name === '--help' || name === '-h') {
     const topic = name === 'help' ? COMMANDS.find(c => c.name === rest[0]) : undefined
     if (topic) commandHelp(ctx, topic)

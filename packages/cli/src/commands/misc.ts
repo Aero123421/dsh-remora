@@ -8,7 +8,7 @@ import { clean, table } from '../format.ts'
 import { openHub, resolveHubUrl } from '../hub.ts'
 import { probe, runMcpBridge } from '../mcp.ts'
 import { discover } from '../oauth.ts'
-import { assetName, selfUpdate } from '../selfupdate.ts'
+import { installOf, selfUpdate } from '../selfupdate.ts'
 import { BACKEND_LABEL, openTokenStore } from '../tokens.ts'
 import { hostRows } from './read.ts'
 import { CLI_VERSION } from '../version.ts'
@@ -39,7 +39,9 @@ export const doctor: CommandDef = {
   async run({ ctx, args, json }) {
     const checks: Check[] = []
     let hosts: HostSummary[] | null = null
-    checks.push({ name: 'remora', ok: true, detail: `${CLI_VERSION}（protocol ${PROTOCOL_VERSION}、${ctx.isSea ? '単体実行ファイル' : 'Node で実行'}、${ctx.platform}-${ctx.arch}）` })
+    const install = installOf(ctx)
+    const form = install.form === 'binary' ? '単体実行ファイル' : install.path ? `Node.js 版（${install.path}）` : 'ソースから実行'
+    checks.push({ name: 'remora', ok: true, detail: `${CLI_VERSION}（protocol ${PROTOCOL_VERSION}、${form}、${ctx.platform}-${ctx.arch}）` })
     if (!ctx.isSea) checks.push({ name: 'Node.js', ok: nodeOk(ctx.nodeVersion), detail: nodeOk(ctx.nodeVersion) ? ctx.nodeVersion : `${ctx.nodeVersion} — 22.19 以上が必要です` })
     checks.push({ name: '設定フォルダー', ok: true, detail: configDir(ctx.env, ctx.platform) })
     let hubUrl: string | null = null
@@ -139,6 +141,7 @@ export const selfUpdateCommand: CommandDef = {
     'remora self-update [--check] [--version <版>] [--force]',
     '',
     '--check は新しい版があるかだけを確認します。GITHUB_TOKEN があれば API の回数制限を避けるのに使います。',
+    'Node.js で動く remora.mjs 版はその .mjs を、単体実行ファイル版は実行ファイルを入れ替えます（どちらも SHA256SUMS を検証）。',
   ],
   flags: { check: 'bool', version: 'string', force: 'bool', target: 'string' },
   async run({ ctx, args, json }) {
@@ -153,7 +156,7 @@ export const selfUpdateCommand: CommandDef = {
     })
     if (json) { printJson(ctx, outcome); return EXIT.ok }
     if (bool(args, 'check')) {
-      ctx.out(outcome.latest === outcome.current ? `最新です（${outcome.current}）。` : `新しい版があります: ${outcome.current} → ${outcome.latest}（${assetName(ctx.platform, ctx.arch)}）。remora self-update で更新します。`)
+      ctx.out(outcome.latest === outcome.current ? `最新です（${outcome.current}）。` : `新しい版があります: ${outcome.current} → ${outcome.latest}（${outcome.asset}）。remora self-update で更新します。`)
     } else if (outcome.updated) {
       ctx.out(`更新しました: ${outcome.current} → ${outcome.latest}`)
       ctx.out(`SHA-256 ${outcome.sha256} を確認済み（${outcome.target}）`)

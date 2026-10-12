@@ -2,7 +2,8 @@
 # packages/cli and hub/) and this workflow
 #   1. checks versions, types, tests and the hub bundle,
 #   2. runs the E2E browser check against the pinned DSH,
-#   3. packs the plugin tarball and builds the CLI on native runners,
+#   3. packs the plugin tarball, bundles the CLI as remora.mjs (the primary,
+#      Node.js form) and builds the standalone binaries on native runners,
 #   4. publishes one GitHub Release with every asset, a single SHA256SUMS
 #      and build provenance attestations.
 # Nothing is published to npm and nothing is deployed to Cloudflare.
@@ -102,6 +103,40 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  cli-script:
+    name: CLI remora.mjs (Node.js form)
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @dsh-remora/cli build
+      - name: Script reports the release version
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          out="$(node packages/cli/dist/remora.mjs --version)"
+          echo "$out"
+          case "$out" in *"$VERSION"*) ;; *) echo "::error::remora.mjs --version printed '$out', expected $VERSION"; exit 1 ;; esac
+          mkdir -p release
+          cp packages/cli/dist/remora.mjs release/remora.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-cli-script
+          path: release/remora.mjs
+          if-no-files-found: error
+          retention-days: 7
+
   cli:
     name: CLI ${{ matrix.target }}
     needs: verify
@@ -167,7 +202,7 @@ jobs:
 
   publish:
     name: GitHub Release
-    needs: [verify, e2e, plugin, cli]
+    needs: [verify, e2e, plugin, cli-script, cli]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -195,7 +230,7 @@ jobs:
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          expected="dsh-remora-${VERSION}.tgz install.ps1 install.sh remora-darwin-arm64 remora-darwin-x64 remora-linux-arm64 remora-linux-x64 remora-win32-x64.exe"
+          expected="dsh-remora-${VERSION}.tgz install.ps1 install.sh remora.mjs remora-darwin-arm64 remora-darwin-x64 remora-linux-arm64 remora-linux-x64 remora-win32-x64.exe"
           for asset in $expected; do test -f "$asset" || { echo "::error::missing release asset $asset"; ls -la; exit 1; }; done
           rm -f SHA256SUMS
           sha256sum $expected > SHA256SUMS
@@ -206,6 +241,7 @@ jobs:
         with:
           subject-path: |
             dist/dsh-remora-*.tgz
+            dist/remora.mjs
             dist/remora-*
             dist/install.sh
             dist/install.ps1
@@ -227,7 +263,8 @@ jobs:
             echo "\`https://github.com/${REPO}/releases/download/${tag}/dsh-remora-${VERSION}.tgz\`,"
             echo "or run \`dsh plugin --profile web add https://github.com/${REPO}/releases/download/${tag}/dsh-remora-${VERSION}.tgz\`."
             echo
-            echo "**CLI**:"
+            echo "**CLI**: the installers verify SHA256SUMS and pick the small \`remora.mjs\` (Node.js 22.19+) when Node.js is"
+            echo "available, else the standalone \`remora-<os>-<arch>\` binary (\`--form binary\` / \`-Form binary\` forces it)."
             echo
             echo '```sh'
             echo "curl -fsSL https://github.com/${REPO}/releases/download/${tag}/install.sh | sh -s -- --version ${tag}"

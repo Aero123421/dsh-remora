@@ -36,6 +36,7 @@ export async function testCtx(overrides: Partial<Ctx> & { stdinText?: string; en
     cwd: dir,
     execPath: process.execPath,
     isSea: false,
+    scriptPath: null,
     stdin: Readable.from(stdinText === undefined ? [] : [stdinText]),
     stdinIsTTY: stdinText === undefined,
     stderrIsTTY: false,
