@@ -1,0 +1,3 @@
+# One-time secret for registering the first passkey. Pick a long random value;
+# it stops working as soon as the first passkey is registered.
+SETUP_TOKEN=

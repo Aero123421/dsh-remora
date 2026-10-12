@@ -1,0 +1,25 @@
+// Remora hub. Everything a user sets lives in secrets and variables, never in
+// this file, so the upstream-sync pull request never conflicts with it.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "remora-hub",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  // CIMD client metadata may only be fetched from public addresses.
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  // Static files (icons) are served without invoking the Worker, which keeps
+  // them out of the free-tier request count.
+  "assets": { "directory": "public", "binding": "ASSETS" },
+  "durable_objects": {
+    "bindings": [
+      // One instance for the whole hub: owner, passkeys, hosts, clients and grants.
+      { "name": "HUB", "class_name": "HubDO" },
+      // One instance per DSH host: its WebSocket, task ledger and audit log.
+      { "name": "HOST", "class_name": "HostDO" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HubDO", "HostDO"] }],
+  // Used only by the OAuth provider for tokens and grants.
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  "observability": { "enabled": true }
+}

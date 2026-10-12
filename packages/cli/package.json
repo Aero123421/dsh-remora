@@ -1,0 +1,21 @@
+{
+  "name": "@dsh-remora/cli",
+  "version": "0.0.1",
+  "private": true,
+  "description": "remora: the Remora command line. Distributed as standalone binaries on GitHub Releases, not on npm.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "remora": "./dist/remora.mjs"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test --test-reporter=spec --disable-warning=ExperimentalWarning \"test/*.test.ts\""
+  },
+  "devDependencies": {
+    "@dsh-remora/protocol": "workspace:*"
+  }
+}

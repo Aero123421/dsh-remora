@@ -1,0 +1,8 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/protocol" },
+    { "path": "packages/dsh-remora" },
+    { "path": "packages/cli" }
+  ]
+}

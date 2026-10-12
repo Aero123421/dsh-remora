@@ -1,0 +1,11 @@
+# hub/ is intentionally NOT part of this workspace: the Deploy to Cloudflare
+# button builds it from that subdirectory alone, so it keeps its own lockfile.
+packages:
+  - packages/*
+
+# The plugin declares the DSH runtime as an optional peer only so DSH can
+# check compatibility; never install DSH itself into this workspace.
+autoInstallPeers: false
+# esbuild's install script only verifies its platform binary.
+allowBuilds:
+  esbuild: true

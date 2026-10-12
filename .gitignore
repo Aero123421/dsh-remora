@@ -1,0 +1,10 @@
+node_modules/
+dist/
+artifacts/
+.cache/
+*.tgz
+*.tsbuildinfo
+types/
+.wrangler/
+.dev.vars
+.DS_Store

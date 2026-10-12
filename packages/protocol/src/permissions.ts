@@ -1,0 +1,104 @@
+/**
+ * Remora permission levels and the decision function.
+ *
+ * Effective permission = DSH ceiling ∩ hub grant ∩ token scope. The DSH
+ * plugin runs `decide` on every request and is the final authority; the hub
+ * runs the same function only to fail early and to explain denials.
+ */
+import { OPERATIONS, type OperationId, type OperationSpec } from './operations.ts'
+
+/** 見るだけ / 依頼できる / リモート全権. `custom` starts from a base level and applies per-operation switches. */
+export type PermissionLevel = 'view' | 'request' | 'full'
+
+export const LEVEL_RANK: Readonly<Record<PermissionLevel, number>> = { view: 0, request: 1, full: 2 }
+
+/** OAuth scopes issued by the hub. Host and operation grants live inside the grant, not in scopes. */
+export type Scope = 'dsh.read' | 'dsh.content' | 'dsh.tasks' | 'dsh.admin'
+
+export const SCOPES: readonly Scope[] = ['dsh.read', 'dsh.content', 'dsh.tasks', 'dsh.admin']
+
+export interface Grant {
+  level: PermissionLevel
+  /** Per-operation switches (the "custom" mode). `true` allows, `false` denies, absent follows `level`. */
+  overrides?: Partial<Record<OperationId, boolean>>
+  /** Epoch milliseconds. A `full` grant past this instant behaves as `request`. */
+  fullAccessExpiresAt?: number
+}
+
+/** Which layer refused: the DSH-side ceiling, the hub-side grant, or the OAuth token's scope. */
+export type DenialLayer = 'dsh' | 'hub' | 'token'
+
+export type Decision =
+  | { allowed: true }
+  | { allowed: false; layer: DenialLayer; reason: DenialReason }
+
+export type DenialReason =
+  | 'forbidden-remotely'
+  | 'level-too-low'
+  | 'switched-off'
+  | 'full-access-expired'
+  | 'missing-scope'
+  | 'unknown-operation'
+
+export interface DecideInput {
+  operation: OperationId | string
+  /** Set on the DSH screen only. */
+  ceiling: Grant
+  /** Set on the hub, per client and host. Can only narrow the ceiling. */
+  hubGrant: Grant
+  tokenScopes: readonly string[]
+  now: number
+}
+
+/**
+ * Operations that are never allowed from outside, even with full access.
+ * Raising the DSH permission preset, plugin management, credentials,
+ * `/feedback`, `/export` and Remora's own settings stay local.
+ */
+export const FORBIDDEN_REMOTELY: ReadonlySet<string> = new Set([
+  'permission.raise',
+  'plugin.manage',
+  'credentials.read',
+  'credentials.write',
+  'remora.configure',
+])
+
+/** Slash commands that `command.run` must reject regardless of grants. */
+export const FORBIDDEN_COMMANDS: ReadonlySet<string> = new Set(['/feedback', '/export'])
+
+function effectiveLevel(grant: Grant, now: number): { level: PermissionLevel; expired: boolean } {
+  if (grant.level === 'full' && grant.fullAccessExpiresAt !== undefined && grant.fullAccessExpiresAt <= now) {
+    return { level: 'request', expired: true }
+  }
+  return { level: grant.level, expired: false }
+}
+
+/**
+ * A switch can turn any operation off. It can turn on operations up to the
+ * `request` level from a lower base; `full`-level (dangerous) operations
+ * always need an unexpired full grant, so the 24-hour expiry cannot be
+ * bypassed with a switch.
+ */
+function allows(grant: Grant, spec: OperationSpec, now: number): { ok: true } | { ok: false; reason: DenialReason } {
+  const overrides: Readonly<Record<string, boolean | undefined>> | undefined = grant.overrides
+  const override = overrides?.[spec.id]
+  if (override === false) return { ok: false, reason: 'switched-off' }
+  const { level, expired } = effectiveLevel(grant, now)
+  if (spec.level === 'full') {
+    return level === 'full' ? { ok: true } : { ok: false, reason: expired ? 'full-access-expired' : 'level-too-low' }
+  }
+  if (override === true || LEVEL_RANK[spec.level] <= LEVEL_RANK[level]) return { ok: true }
+  return { ok: false, reason: 'level-too-low' }
+}
+
+export function decide(input: DecideInput): Decision {
+  if (FORBIDDEN_REMOTELY.has(input.operation)) return { allowed: false, layer: 'dsh', reason: 'forbidden-remotely' }
+  const spec = OPERATIONS.find(op => op.id === input.operation)
+  if (!spec) return { allowed: false, layer: 'dsh', reason: 'unknown-operation' }
+  const ceiling = allows(input.ceiling, spec, input.now)
+  if (!ceiling.ok) return { allowed: false, layer: 'dsh', reason: ceiling.reason }
+  const hub = allows(input.hubGrant, spec, input.now)
+  if (!hub.ok) return { allowed: false, layer: 'hub', reason: hub.reason }
+  if (!input.tokenScopes.includes(spec.scope)) return { allowed: false, layer: 'token', reason: 'missing-scope' }
+  return { allowed: true }
+}

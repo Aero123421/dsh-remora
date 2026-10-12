@@ -1,0 +1,69 @@
+{
+  "name": "dsh-remora",
+  "version": "0.0.1",
+  "description": "Remora: drive your DSH sessions from ChatGPT, Claude, a CLI or an HTTP API through your own Cloudflare hub. Unofficial.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aero123421/dsh-remora.git",
+    "directory": "packages/dsh-remora"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./client": "./dist/client.js",
+    "./icon": "./assets/remora-mark.svg"
+  },
+  "files": [
+    "dist",
+    "assets",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "external": [
+        "react",
+        "react/jsx-runtime",
+        "react-dom"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.1-alpha.2 <0.2.2-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "mcp",
+    "remote"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test --test-reporter=spec --disable-warning=ExperimentalWarning \"test/*.test.ts\"",
+    "pack:plugin": "node scripts/build.mjs && node scripts/pack.mjs"
+  },
+  "devDependencies": {
+    "@dsh-remora/protocol": "workspace:*",
+    "@types/react": "18.3.31"
+  }
+}
