@@ -40,12 +40,17 @@ irm https://raw.githubusercontent.com/Aero123421/dsh-remora/main/scripts/install
 | `workspaces ls｜create` | `create <名前> [--placement] [--git <https URL>]` |
 | `jobs ls <セッション>｜output <ジョブ>｜stop <ジョブ>` | エージェントがバックグラウンドで動かしているコマンド（開発サーバーなど）の一覧・出力・停止 |
 | `schedules ls｜add｜rm` | 決まった時間にセッションへ依頼を送る（DSH の自動タスク）。`add <セッション> --title <名前>` に `--after 15m`、`--at <日時>`、`--every 2h`、`--daily 09:00`、`--weekly mon,fri@18:30`、`--cron "<式>"` のどれか 1 つ。時刻は `--tz`（既定はこの PC のタイムゾーン） |
+| `audit verify [--file <JSON>] [--out <保存先>]` | ハブとすべてのホストの監査ログを受け取り、この PC でハッシュ連鎖を計算し直す。前回の確認位置（各ログの最後の行）を設定フォルダの `audit-anchors.json` に保存し、次回その行が変わっていないことも確かめる。`--file` はハブの画面で書き出したファイルをハブに問い合わせずに検査。連鎖が途切れているか前回と食い違えば終了コード 1 |
+| `hub export [--out <保存先>]` | ハブの設定（ホストと鍵の指紋、クライアントと付与範囲、トークン・パスキー・通知デバイスの一覧）を JSON で。秘密は含まない |
+| `hosts rotate-key [<ホスト>]`、`rotate-key [<ホスト>]` | ホスト鍵の更新。ホストが新しい鍵を作り、古い鍵と新しい鍵の両方で署名して、新しい鍵でつなぎ直す |
 | `terminal run --workspace <ID> -- <コマンド>`、`terminal status <確認 ID>` | ワークスペースのフォルダでコマンドを 1 回実行する。ハブが出す URL でオーナーがパスキーで確認するまで動かず、確認後に出力を表示する（確認の期限 10 分、`--timeout` はコマンドの制限時間で既定 60 秒・最長 10 分、`--no-wait` で URL だけ表示）。リモート全権と `dsh.admin` が必要。コマンドが 0 以外で終われば終了コード 1、拒否は 5、期限切れは 8 |
 | `doctor` | ハブ・メタデータ・トークン・ホストの診断 |
 | `mcp`、`mcp probe` | stdio MCP ブリッジと疎通確認 |
 | `self-update [--check] [--version]` | GitHub Releases から更新 |
 
-`open <セッション ID>` はハブのセッション画面（`/hosts/<ホスト>/sessions/<セッション>`）を開き、URL を表示します。`audit verify`、`hub export`、`hosts rotate-key` はハブ側のエンドポイントが契約にまだ無いため「まだ使えません」と表示します（終了コード 2）。
+`open <セッション ID>` はハブのセッション画面（`/hosts/<ホスト>/sessions/<セッション>`）を開き、URL を表示します。
+
+`audit verify`、`hub export`、`rotate-key` は、呼ぶたびにハブでオーナーの承認（パスキー）が要ります。ハブが出す URL をオーナーが開いて承認すると結果を受け取ります（承認の期限は 10 分、承認後 1 時間は `--resume <確認 ID>` で受け取り直せます）。`dsh.admin` スコープが必要なので、`remora login --admin` でログインしてください。
 
 全コマンドに `--json` があります。エラー時の `--json` は標準出力に `{"error":{"code","message","hint?","fix?","exitCode"}}` を出します。人向けの出力では、DSH から来た文字列の制御文字（エスケープシーケンス、bidi 制御）を取り除きます。
 

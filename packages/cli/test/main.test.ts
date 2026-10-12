@@ -34,11 +34,10 @@ test('unknown commands and flags are usage errors; JSON errors go to stdout', as
   assert.equal(JSON.parse(j.stdout()).error.code, 'not_logged_in')
 })
 
-test('commands without hub endpoints say so', async () => {
+test('hub maintenance commands need a login (except checking a saved audit file)', async () => {
   for (const argv of [['audit', 'verify'], ['hub', 'export'], ['hosts', 'rotate-key'], ['rotate-key']]) {
     const t = await testCtx()
-    assert.equal(await main(argv, t.ctx), EXIT.notAvailable, argv.join(' '))
-    assert.match(t.stderr(), /まだ使えません/)
+    assert.equal(await main(argv, t.ctx), EXIT.auth, argv.join(' '))
   }
 })
 

@@ -3,7 +3,7 @@ import { bool, str } from '../args.ts'
 import { hubOf, printJson, type CommandDef } from '../command.ts'
 import type { Ctx } from '../ctx.ts'
 import { configDir } from '../config.ts'
-import { CliError, EXIT, notAvailable, usageError } from '../errors.ts'
+import { CliError, EXIT, usageError } from '../errors.ts'
 import { clean, table } from '../format.ts'
 import { openHub, resolveHubUrl } from '../hub.ts'
 import { probe, runMcpBridge } from '../mcp.ts'
@@ -215,20 +215,3 @@ export const open: CommandDef = {
     return EXIT.ok
   },
 }
-
-/** Commands whose hub endpoints are not in the contract yet. */
-function unavailable(name: string, summary: string, label: (positionals: string[]) => string): CommandDef {
-  return {
-    name,
-    summary: `${summary}（未対応）`,
-    usage: [`remora ${name}`, '', 'ハブ側のエンドポイントがまだ無いため使えません。'],
-    flags: {},
-    async run({ args }) { throw notAvailable(label(args.positionals)) },
-  }
-}
-
-export const NOT_YET: readonly CommandDef[] = [
-  unavailable('audit', '監査ログの改ざん検査（audit verify）', p => `remora audit ${p[0] ?? 'verify'}`),
-  unavailable('hub', 'ハブ設定の書き出し（hub export）', p => `remora hub ${p[0] ?? 'export'}`),
-  unavailable('rotate-key', 'ホスト鍵の更新', () => 'remora rotate-key'),
-]

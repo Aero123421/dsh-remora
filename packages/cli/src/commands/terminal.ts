@@ -3,50 +3,19 @@
  * It never runs at once: the hub parks it, the owner reviews it on the hub
  * and confirms it with a passkey, then this command collects the output.
  */
-import { TASK_WAIT_MAX_MS, type ConfirmationInfo, type TerminalRunOutput } from '@dsh-remora/protocol'
+import type { ConfirmationInfo, TerminalRunOutput } from '@dsh-remora/protocol'
 import { bool, str } from '../args.ts'
 import { hubLink } from '../attention.ts'
 import { hostParam, hubOf, printJson, type Cmd, type CommandDef } from '../command.ts'
-import { CliError, EXIT, exitCodeForError, usageError } from '../errors.ts'
+import { CONFIRMATION_STATE_LABEL as STATE_LABEL, asConfirmation, settled, waitForConfirmation, waitLimit } from '../confirm.ts'
+import { EXIT, exitCodeForError, usageError } from '../errors.ts'
 import { clean, fmtElapsed, parseDuration } from '../format.ts'
 import type { Hub } from '../hub.ts'
 
-const STATE_LABEL: Readonly<Record<string, string>> = {
-  pending: 'ハブでのパスキー確認待ち', running: 'ホストで実行中', done: '完了', failed: '失敗', denied: 'オーナーが拒否', expired: '確認されないまま期限切れ',
-}
+const resume = (id: string) => `remora terminal status ${id} --wait`
 
-const settled = (info: ConfirmationInfo) => info.state !== 'pending' && info.state !== 'running'
-
-/** Poll confirmation.get until it settles, the wait runs out, or Ctrl-C. */
-async function waitFor(cmd: Cmd, hub: Hub, first: ConfirmationInfo, limitMs: number | null): Promise<{ info: ConfirmationInfo; timedOut: boolean }> {
-  const { ctx } = cmd
-  const started = ctx.now()
-  let info = first
-  let last = ''
-  const report = () => {
-    if (!cmd.json && info.state !== last) ctx.err(`${STATE_LABEL[info.state] ?? info.state}…`)
-    last = info.state
-  }
-  report()
-  const onInterrupt = () => {
-    ctx.err(`待機をやめました。確認と実行はハブ側で続きます: remora terminal status ${info.confirmationId}`)
-    process.exit(130)
-  }
-  process.once('SIGINT', onInterrupt)
-  try {
-    for (;;) {
-      if (settled(info)) return { info, timedOut: false }
-      const elapsed = ctx.now() - started
-      if (limitMs !== null && elapsed >= limitMs) return { info, timedOut: true }
-      const step = Math.min(TASK_WAIT_MAX_MS, limitMs === null ? TASK_WAIT_MAX_MS : limitMs - elapsed)
-      const callStarted = ctx.now()
-      info = await hub.op('confirmation.get', { confirmationId: info.confirmationId, timeoutMs: Math.max(0, Math.round(step)) }, step + 20_000)
-      report()
-      if (!settled(info) && ctx.now() - callStarted < 1000) await ctx.sleep(2000)
-    }
-  } finally {
-    process.off('SIGINT', onInterrupt)
-  }
+function waitFor(cmd: Cmd, hub: Hub, first: ConfirmationInfo, limitMs: number | null) {
+  return waitForConfirmation(cmd, hub, first, limitMs, resume(first.confirmationId))
 }
 
 /** Print the outcome and pick the exit code. */
@@ -80,14 +49,6 @@ function finish(cmd: Cmd, info: ConfirmationInfo, timedOut: boolean): number {
   }
 }
 
-function waitLimit(cmd: Cmd): number | null {
-  const raw = str(cmd.args, 'wait-timeout')
-  if (raw === undefined) return null
-  const ms = parseDuration(raw)
-  if (ms === null) throw usageError('--wait-timeout は 90s、10m のように指定してください。')
-  return ms
-}
-
 export const terminal: CommandDef = {
   name: 'terminal',
   summary: 'ワークスペースのフォルダでコマンドを 1 回実行する（ハブでパスキー確認）',
@@ -109,7 +70,7 @@ export const terminal: CommandDef = {
       const confirmationId = cmd.args.positionals[1]
       if (!confirmationId) throw usageError('確認 ID を指定してください: remora terminal status <確認 ID>')
       const hub = await hubOf(cmd)
-      const info = await hub.op('confirmation.get', { confirmationId })
+      const info = asConfirmation(await hub.op('confirmation.get', { confirmationId }))
       if (!bool(cmd.args, 'wait')) {
         if (cmd.json) { printJson(cmd.ctx, info); return EXIT.ok }
         if (!settled(info)) {
@@ -137,8 +98,7 @@ export const terminal: CommandDef = {
     }
     const hub = await hubOf(cmd)
     // Through the hub the result is always the parked request, never the output itself.
-    const parked = (await hub.op('terminal.run', { ...hostParam(cmd), command, cwdWorkspaceId, ...(timeoutMs !== undefined ? { timeoutMs } : {}) })) as unknown as ConfirmationInfo
-    if (typeof parked?.confirmationId !== 'string') throw new CliError('ハブの応答に確認 ID がありません。ハブを更新してください。', EXIT.failure, { code: 'bad_response' })
+    const parked = asConfirmation(await hub.op('terminal.run', { ...hostParam(cmd), command, cwdWorkspaceId, ...(timeoutMs !== undefined ? { timeoutMs } : {}) }))
     const url = hubLink(hub.url, parked.confirmUrl)
     if (bool(cmd.args, 'no-wait')) {
       if (cmd.json) { printJson(cmd.ctx, parked); return EXIT.ok }

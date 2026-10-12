@@ -2,7 +2,8 @@ import type { HostSummary, SessionReadParams, SessionSummary } from '@dsh-remora
 import { attentionLines, nextSteps } from '../attention.ts'
 import { bool, int, str } from '../args.ts'
 import { hostParam, hubOf, printJson, type Cmd, type CommandDef } from '../command.ts'
-import { EXIT, notAvailable, usageError } from '../errors.ts'
+import { EXIT, usageError } from '../errors.ts'
+import { rotateKey } from './maintenance.ts'
 import { ATTENTION_KIND_LABEL, clean, fmtTime, table, truncate } from '../format.ts'
 import { sessionsFork } from './work.ts'
 
@@ -27,11 +28,16 @@ export function hostRows(hosts: readonly HostSummary[]): string[] {
 export const hosts: CommandDef = {
   name: 'hosts',
   summary: 'つながっている DSH ホストを表示する',
-  usage: ['remora hosts', '', '鍵の更新（remora hosts rotate-key）はまだ使えません。'],
-  flags: {},
+  usage: [
+    'remora hosts',
+    'remora hosts rotate-key [<ホスト ID>] [--wait-timeout 15m] [--resume <確認 ID>]',
+    '',
+    'rotate-key はホスト鍵を更新します（ハブでオーナーの承認が要ります。remora rotate-key と同じ）。',
+  ],
+  flags: { 'wait-timeout': 'string', resume: 'string' },
   async run(cmd) {
     const sub = cmd.args.positionals[0]
-    if (sub === 'rotate-key') throw notAvailable('remora hosts rotate-key')
+    if (sub === 'rotate-key') return rotateKey(cmd, cmd.args.positionals[1])
     if (sub !== undefined && sub !== 'ls' && sub !== 'list') throw usageError(`不明なサブコマンドです: hosts ${sub}`)
     const hub = await hubOf(cmd)
     const result = await hub.op('hosts.list', {})
