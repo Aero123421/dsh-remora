@@ -104,7 +104,12 @@ export class Hub {
     const text = await response.text()
     let body: unknown = null
     try { body = text ? JSON.parse(text) : null } catch { /* not JSON */ }
-    if (!response.ok) throw fromHttpError(response.status, body)
+    if (!response.ok) {
+      const error = fromHttpError(response.status, body)
+      // `hub:/connections` → a link the user can open.
+      if (error.detail.fix?.startsWith('hub:/')) error.detail.fix = this.url + error.detail.fix.slice(4)
+      throw error
+    }
     if (body === null || typeof body !== 'object') throw new CliError('ハブの応答が JSON ではありません。', EXIT.failure, { code: 'bad_response' })
     return body as OperationResults[K]
   }

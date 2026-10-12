@@ -33,7 +33,8 @@ irm https://raw.githubusercontent.com/Aero123421/dsh-remora/main/scripts/install
 | `sessions ls｜show｜read` | `read --depth summary｜turns｜page`、`--cursor`、`--all` |
 | `tasks start｜status｜wait｜watch｜steer｜cancel` | `start` の宛先は `--session｜--latest｜--title｜--alias｜--new <ワークスペース>`、`--skill` は繰り返し可、プロンプトは引数か標準入力、冪等キーは自動 |
 | `run --wait` | 投入して 25 秒刻みで待ち、最後の返答を標準出力へ |
-| `attention`、`answer <ID>` | 要対応の一覧と回答 |
+| `attention`、`answer <ID>` | 要対応の一覧（回答方法、期限までの残り時間、パスキーが要る承認はハブの URL）と、質問・プラン確認への回答 |
+| `approve <ID>`、`reject <ID>` | DSH の承認待ちを 1 回だけ許可・拒否（`approval.respond`）。確認してから送る（`--yes` で省略）。DSH の設定タブで「MCP と CLI からの承認を許可」がオフ（既定）なら、ハブでパスキーを使う URL を表示して終了コード 5 |
 | `patch [--apply]` | 差分を表示。`--apply` は `git apply --check` の後、確認して `git apply` |
 | `workspaces ls｜create` | `create <名前> [--placement] [--git <https URL>]` |
 | `doctor` | ハブ・メタデータ・トークン・ホストの診断 |
@@ -60,9 +61,9 @@ claude mcp add remora -- cmd /c remora mcp # Windows の Node.js 版
 | 0 | 成功 |
 | 1 | 失敗（タスクの失敗・取り消し、ハブの内部エラーなど） |
 | 2 | 未対応の機能 |
-| 3 | 人の判断待ちで停止（`run --wait`、`tasks wait`） |
+| 3 | 人の判断待ちで停止（`run --wait`、`tasks wait`。承認待ちも同じく、回答方法と URL を表示） |
 | 4 | 未ログイン・ログイン切れ・取り消し |
-| 5 | 権限で拒否（DSH 側の上限／ハブでの付与／トークンのスコープ） |
+| 5 | 権限で拒否（DSH 側の上限／ハブでの付与／トークンのスコープ）。パスキーが要る承認もここ |
 | 6 | 見つからない |
 | 7 | ハブやホストに届かない、回数制限 |
 | 8 | 待機の打ち切り（`--timeout`） |

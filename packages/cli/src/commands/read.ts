@@ -1,4 +1,5 @@
-import type { AttentionItem, HostSummary, SessionReadParams, SessionSummary } from '@dsh-remora/protocol'
+import type { HostSummary, SessionReadParams, SessionSummary } from '@dsh-remora/protocol'
+import { attentionLines, nextSteps } from '../attention.ts'
 import { bool, int, str } from '../args.ts'
 import { hostParam, hubOf, printJson, type Cmd, type CommandDef } from '../command.ts'
 import { EXIT, notAvailable, usageError } from '../errors.ts'
@@ -112,7 +113,7 @@ async function sessionsShow(cmd: Cmd): Promise<number> {
   if (r.attention.length > 0) {
     out('')
     out('要対応:')
-    for (const line of attentionRows(r.attention)) out(`  ${line}`)
+    for (const line of attentionLines(r.attention, hub.url, cmd.ctx.now())) out(`  ${line}`)
   }
   if (r.recentTurns.length > 0) {
     out('')
@@ -186,20 +187,15 @@ export const sessions: CommandDef = {
   },
 }
 
-export function attentionRows(items: readonly AttentionItem[]): string[] {
-  return table(['ID', '種類', 'セッション', '内容', '回答'], items.map(a => [
-    a.attentionId,
-    ATTENTION_KIND_LABEL[a.kind] ?? a.kind,
-    a.sessionId,
-    clean(a.title),
-    a.answerable ? 'remora answer で可' : 'DSH で対応',
-  ]), 60)
-}
-
 export const attention: CommandDef = {
   name: 'attention',
   summary: '人の判断待ち（承認・質問・プラン確認など）を表示する',
-  usage: ['remora attention [--host <ID>] [--session <ID>]'],
+  usage: [
+    'remora attention [--host <ID>] [--session <ID>]',
+    '',
+    '回答方法: remora approve / reject（承認）、remora answer（質問・プラン確認）、ハブでパスキー（URL を表示）、DSH Web で。',
+    '期限を過ぎると、質問は答えなしで続き、承認は拒否されます。',
+  ],
   flags: { host: 'string', session: 'string' },
   async run(cmd) {
     const hub = await hubOf(cmd)
@@ -207,11 +203,9 @@ export const attention: CommandDef = {
     const result = await hub.op('attention.list', { ...hostParam(cmd), ...(sessionId ? { sessionId } : {}) })
     if (cmd.json) { printJson(cmd.ctx, result); return EXIT.ok }
     if (result.items.length === 0) { cmd.ctx.out('要対応はありません。'); return EXIT.ok }
-    for (const line of attentionRows(result.items)) cmd.ctx.out(line)
-    for (const item of result.items) {
-      if (!item.options?.length) continue
-      cmd.ctx.out(`  ${item.attentionId} の選択肢: ${item.options.map(o => `${o.id}=${clean(o.label)}`).join('、')}`)
-    }
+    for (const line of attentionLines(result.items, hub.url, cmd.ctx.now())) cmd.ctx.out(line)
+    const steps = nextSteps(result.items)
+    if (steps.length > 0) { cmd.ctx.out(''); for (const step of steps) cmd.ctx.out(step) }
     return EXIT.ok
   },
 }
