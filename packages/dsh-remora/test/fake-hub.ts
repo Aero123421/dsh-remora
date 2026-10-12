@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type Server } from 'node:http'
 import { createPublicKey, verify, type KeyObject } from 'node:crypto'
 import { WebSocketServer, type WebSocket } from 'ws'
 import {
-  KEEPALIVE_PING, KEEPALIVE_PONG, hostAuthMessage, pairPollMessage, parseHostFrame, toBase64Url,
+  KEEPALIVE_PING, KEEPALIVE_PONG, hostAuthMessage, pairPollMessage, parseHostFrame,
   type HostFrame, type HubFrame, type OwnerCredential,
 } from '@dsh-remora/protocol'
 
@@ -134,5 +134,3 @@ export class FakeHub {
     return this.received.flatMap(frame => (frame.t === 'event' ? frame.events : []))
   }
 }
-
-export const ownerKeyId = (raw: Uint8Array) => toBase64Url(raw)

@@ -3,7 +3,7 @@
  * dispatch, the event queue and the settings the tab edits. `index.ts`
  * creates one per plugin load and disposes it on unload.
  */
-import { hostname } from 'node:os'
+import { homedir, hostname } from 'node:os'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import {
@@ -33,11 +33,16 @@ import { JsonDocument, remoraDataDir, resolveDshHome } from './storage.ts'
 import { FileTaskStore } from './tasks.ts'
 import { checkForUpdate, downloadVerified, type UpdateCheck } from './updates.ts'
 
+type GetFetch = (input: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => Promise<Response>
+
 export interface RemoraOptions {
   dataDir?: string
   createAdapter: CreateAdapter
   createSocket?: (url: string) => SocketLike
+  /** Hub requests during pairing. */
   fetch?: FetchLike
+  /** GitHub Releases requests (update check and download). */
+  githubFetch?: GetFetch
   clock?: Clock
   forbiddenRoots?: ForbiddenRoots
   /** Retry interval while another process holds the hub lock. */
@@ -270,7 +275,7 @@ export class RemoraCore {
     if (this.options.forbiddenRoots) return this.options.forbiddenRoots
     const homePath = this.ctx.get('dshHomePath')
     const dshHome = typeof homePath === 'function' ? (homePath as () => string)() : resolveDshHome()
-    return { home: process.env.HOME ?? process.env.USERPROFILE ?? '/', dshHome }
+    return { home: homedir(), dshHome }
   }
 
   // --- hub link -----------------------------------------------------------------
@@ -595,8 +600,13 @@ export class RemoraCore {
   async checkUpdate(force: boolean): Promise<UpdateCheck> {
     const now = this.clock.now()
     if (!force && this.updateCheck && now - this.updateCheck.checkedAt < 60 * 60_000) return this.updateCheck
-    this.updateCheck = await checkForUpdate(PLUGIN_VERSION, this.options.fetch as never ?? fetch, now)
+    this.updateCheck = await checkForUpdate(PLUGIN_VERSION, this.httpFetch(), now)
     return this.updateCheck
+  }
+
+  /** The fetch used for GitHub requests (tests inject one). */
+  private httpFetch(): GetFetch {
+    return this.options.githubFetch ?? ((input, init) => fetch(input, init))
   }
 
   private pluginManager(): { installBundle(spec: string): Promise<unknown> } | null {
@@ -610,7 +620,7 @@ export class RemoraCore {
     if (!check?.latest || !check.newer) throw new RpcError('no-update')
     const manager = this.pluginManager()
     if (!manager) throw new RpcError('install-unavailable')
-    const path = await downloadVerified(check.latest, this.dataDir, this.options.fetch as never ?? fetch)
+    const path = await downloadVerified(check.latest, this.dataDir, this.httpFetch())
     this.audit({ kind: 'settings', action: `update:${check.latest.version}`, outcome: 'ok', local })
     // DSH reloads the plugin after installing; this instance is disposed during or after the call.
     void manager.installBundle(path).catch(error => this.ctx.logger.warn('Remora: plugin update failed', error))
