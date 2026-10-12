@@ -75,16 +75,16 @@ function setupPage(env: Env): Response {
 ${configured ? '' : flash('SETUP_TOKEN が設定されていません（16 文字以上）。Cloudflare のダッシュボードでシークレットを追加してから、このページを開き直してください。', 'error')}
 <p class="flash error" data-needs-webauthn hidden>このブラウザはパスキーに対応していません。</p>
 <form class="stack" data-setup>
-  <label>デプロイ時に決めた SETUP_TOKEN<input name="setupToken" type="password" autocomplete="off" required></label>
-  <label>このパスキーの名前（例: iPhone）<input name="label" maxlength="60" placeholder="パスキー"></label>
-  <button class="primary" type="submit">パスキーを登録</button>
+  <label>デプロイ時に決めた SETUP_TOKEN<input name="setupToken" type="password" autocomplete="off" required data-testid="hub-setup-token"></label>
+  <label>このパスキーの名前（例: iPhone）<input name="label" maxlength="60" placeholder="パスキー" data-testid="hub-setup-label"></label>
+  <button class="primary" type="submit" data-testid="hub-register-passkey">パスキーを登録</button>
   <p data-status hidden></p>
 </form>
 <section data-after-setup hidden>
   <h2>リカバリーコード</h2>
   <p class="lead">パスキーをなくしたときに 1 回ずつ使えるコードです。<strong>今だけ表示します。</strong>安全な場所に保管してください。</p>
-  <pre class="codes" id="recovery" data-recovery-codes></pre>
-  <div class="actions"><button type="button" data-copy="#recovery">コピー</button><a class="button primary" href="/">保管したので次へ</a></div>
+  <pre class="codes" id="recovery" data-recovery-codes data-testid="hub-recovery-codes"></pre>
+  <div class="actions"><button type="button" data-copy="#recovery">コピー</button><a class="button primary" href="/" data-testid="hub-recovery-ack">保管したので次へ</a></div>
   <p class="muted">初期設定は完了し、SETUP_TOKEN はもう使えません。続けて 2 本目のパスキーを登録しておくと安心です。</p>
 </section>`,
   }))
@@ -432,7 +432,7 @@ async function connectionsPage(env: Env, url: URL, origin: string): Promise<Resp
     return h`<tr><th>${summary.name}</th><td>
       <form method="post" action="/connections/grant"${raw(' data-reauth')}>
         <input type="hidden" name="clientId" value="${client.clientId}"><input type="hidden" name="hostId" value="${summary.hostId}">
-        <select name="level" data-autosubmit aria-label="付与範囲">${levelsFor(summary).map(level => h`<option value="${level}"${raw(level === current ? ' selected' : '')}>${LEVEL_LABEL[level]}</option>`)}</select>
+        <select name="level" data-autosubmit aria-label="付与範囲" data-testid="hub-grant-level">${levelsFor(summary).map(level => h`<option value="${level}"${raw(level === current ? ' selected' : '')}>${LEVEL_LABEL[level]}</option>`)}</select>
         <noscript><button type="submit" class="small">保存</button></noscript>
       </form>
       ${current === 'full' ? h`<span class="badge danger">${expired ? '全権は失効（依頼できる扱い）' : `全権 ${relativeTime(setting?.fullAccessExpiresAt)}に失効`}</span>` : ''}
@@ -525,10 +525,10 @@ ${reauthForm('/settings/recovery', {}, 'パスキーで確認して作り直す'
 <p class="muted">作り直すと古いコードはすべて無効になります。</p></section>
 <section class="card" id="tokens"><h2>個人トークン（HTTP API 用）</h2>
 <form method="post" action="/settings/tokens" class="stack" data-reauth>
-  <label>名前<input name="name" maxlength="60" required placeholder="例: 自宅のスクリプト"></label>
+  <label>名前<input name="name" maxlength="60" required placeholder="例: 自宅のスクリプト" data-testid="hub-token-name"></label>
   <fieldset class="scopes"><legend>スコープ</legend>${SCOPES.map(scope => h`<label class="check"><input type="checkbox" name="scope" value="${scope}"${raw(scope === 'dsh.read' ? ' checked' : '')}> <code>${scope}</code></label>`)}</fieldset>
   <label>有効期限<select name="days"><option value="7">7 日</option><option value="30" selected>30 日</option><option value="90">90 日</option><option value="365">1 年</option></select></label>
-  <button class="primary" type="submit">パスキーで確認して発行</button>
+  <button class="primary" type="submit" data-testid="hub-token-create">パスキーで確認して発行</button>
 </form>
 <ul class="list">${tokens.map(token => h`<li><div class="row"><strong>${token.name}</strong> <code>${token.scopes.join(' ')}</code>
   <span class="muted">${token.revokedAt ? '取り消し済み' : token.expiresAt < Date.now() ? '期限切れ' : `${relativeTime(token.expiresAt)}まで`} ・ 最終使用 ${relativeTime(token.lastUsedAt)}</span></div>
@@ -547,7 +547,7 @@ ${reauthForm('/settings/allow-other-clients', { allow: state.allowOtherClients ?
 }
 
 function onceShown(title: string, lead: string, value: string, back: string): Response {
-  return view(title, 'settings', h`<h1>${title}</h1><p class="lead">${lead}</p><pre class="codes" id="secret">${value}</pre>
+  return view(title, 'settings', h`<h1>${title}</h1><p class="lead">${lead}</p><pre class="codes" id="secret" data-testid="hub-secret">${value}</pre>
 <div class="actions"><button type="button" data-copy="#secret">コピー</button><a class="button primary" href="${back}">保管したので戻る</a></div>`)
 }
 

@@ -33,7 +33,7 @@ export function ConnectionSection({ snapshot, t, run, busy }: SectionProps) {
       <div className="rmr-row">
         <div className="rmr-row-text">
           <span>{t('conn.status')}</span>
-          <span className="rmr-inline"><StateDot state={STATE_DOT[link.state]} size={8} /><span>{stateText}</span></span>
+          <span className="rmr-inline" data-testid="remora-hub-status" data-state={link.state}><StateDot state={STATE_DOT[link.state]} size={8} /><span>{stateText}</span></span>
           {link.lastError && link.state !== 'connected' ? <span className="rmr-faint">{t('conn.lastError', { error: link.lastError })}</span> : null}
         </div>
         <div className="rmr-row-actions">
@@ -84,10 +84,10 @@ export function ConnectionSection({ snapshot, t, run, busy }: SectionProps) {
         <span>{t('conn.hubUrl')}</span>
         <span className="rmr-muted">{repairing ? t('conn.repairHint') : t('conn.hubUrlHint')}</span>
         <div className="rmr-inline">
-          <Input className="rmr-grow" value={hubUrl} placeholder="https://remora-hub.example.workers.dev" aria-label={t('conn.hubUrl')} disabled={waiting} onChange={event => setHubUrl(event.target.value)} />
+          <Input className="rmr-grow" data-testid="remora-hub-url" value={hubUrl} placeholder="https://remora-hub.example.workers.dev" aria-label={t('conn.hubUrl')} disabled={waiting} onChange={event => setHubUrl(event.target.value)} />
           {waiting
             ? <Button variant="outline" size="sm" onClick={() => { void run('pairing-cancel') }}>{t('cancel')}</Button>
-            : <Button variant="primary" size="sm" disabled={busy || hubUrl.trim() === '' || !snapshot.local} title={snapshot.local ? undefined : t('err.local-only')}
+            : <Button variant="primary" size="sm" data-testid="remora-pair-start" disabled={busy || hubUrl.trim() === '' || !snapshot.local} title={snapshot.local ? undefined : t('err.local-only')}
               onClick={() => { void run('pairing-start', { hubUrl }).then(ok => { if (ok) setRepairing(false) }) }}>{hub.paired ? t('conn.repair') : t('conn.pair')}</Button>}
         </div>
       </div>
@@ -97,7 +97,7 @@ export function ConnectionSection({ snapshot, t, run, busy }: SectionProps) {
       <QrCode value={pairing.verifyUrl} label={t('conn.openApproval')} />
       <div className="rmr-stack">
         <span className="rmr-muted">{t('conn.code')}</span>
-        <span className="rmr-code">{pairing.userCode}</span>
+        <span className="rmr-code" data-testid="remora-pair-code">{pairing.userCode}</span>
         <span className="rmr-muted">{t('conn.codeHint')}</span>
         <a href={pairing.verifyUrl} target="_blank" rel="noopener noreferrer">{t('conn.openApproval')}</a>
         {pairing.expiresAt ? <span className="rmr-faint">{t('conn.expires', { min: Math.max(0, Math.ceil((pairing.expiresAt - snapshot.now) / 60_000)) })}</span> : null}

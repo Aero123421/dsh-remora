@@ -56,7 +56,7 @@ export function PermissionsSection({ snapshot, t, run, busy }: SectionProps) {
       <span className="rmr-muted">{t('perm.hint')}</span>
     </div>
     <div className="rmr-levels" role="radiogroup" aria-label={t('perm.title')}>
-      {levels.map(item => <button key={item} type="button" role="radio" className="rmr-level" data-level={item} aria-checked={selected === item} disabled={busy}
+      {levels.map(item => <button key={item} type="button" role="radio" className="rmr-level" data-level={item} data-testid={`remora-ceiling-${item}`} aria-checked={selected === item} disabled={busy}
         onClick={() => choose(item)}>
         <span className="rmr-level-name">{t(`perm.level.${item}`)}</span>
         <span className="rmr-muted">{t(`perm.desc.${item}`)}</span>

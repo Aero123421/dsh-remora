@@ -61,7 +61,7 @@ const NAV: [Exclude<NavKey, null>, string, string][] = [
 export function page(options: PageOptions): string {
   const nav = options.nav === false || options.nav === undefined && options.narrow
     ? ''
-    : h`<nav class="nav" aria-label="メニュー">
+    : h`<nav class="nav" aria-label="メニュー" data-testid="hub-signed-in">
   <a class="brand" href="/"><img src="/remora-mark-light.svg" alt="" width="24" height="24"><span>Remora</span></a>
   <div class="links">${NAV.map(([key, href, label]) => h`<a href="${href}"${raw(options.nav === key ? ' aria-current="page"' : '')}>${label}</a>`)}</div>
 </nav>`.value
