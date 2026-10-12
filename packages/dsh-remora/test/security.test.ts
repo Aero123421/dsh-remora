@@ -98,7 +98,7 @@ test('no remote path drives agent turns in an untrusted or cloning workspace', a
   u.values.userQuestions = { active: [{ callId: 'call-1', state: 'continued', questions: [{ id: 'q', question: 'Ok?', options: [{ label: 'Yes' }] }] }], settled: [] }
   const h = harness(dsh, { workspaces: ['ws-u', 'ws-c'], untrusted: ['ws-u'], commands: ['/compact', '/goal'] })
   const creations = [{ key: 'c\u0000k', workspaceId: 'ws-c', path: '/work/c', name: 'c', state: 'cloning' as const, createdAt: 1, updatedAt: 1 }]
-  const adapter = build(dsh.ctx(), { ...h.deps, workspaceCreations: { list: () => creations, put: async () => {} } })
+  const adapter = build(dsh.ctx(), { ...h.deps, workspaceCreations: { list: () => creations, put: async () => {} } }, { deferRecovery: true })
   const handlers = adapter.handlers as Required<typeof adapter.handlers>
   const code = (promise: Promise<unknown>) => promise.then(() => 'ok', (error: { code?: string }) => error.code)
   for (const [sessionId, expected] of [['su', 'denied'], ['sc', 'conflict']] as const) {

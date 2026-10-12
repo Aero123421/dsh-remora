@@ -65,6 +65,7 @@ export interface ExecuteCall {
 }
 
 export type ExecuteResult = { ok: true; result: unknown } | { ok: false; error: RemoraError }
+type TaskQueryResult = { ok: true; result: TaskInfo } | { ok: false; error: RemoraError }
 
 export interface HostLive {
   hostId: string
@@ -485,6 +486,8 @@ export class HostDO extends DurableObject<Env> {
       case 'task': {
         const now = Date.now()
         const before = this.taskRow(event.taskId)
+        // A delayed event from before reconnect cannot reopen a finished task.
+        if (before && TERMINAL_TASK_STATES.has(before.state as TaskState) && !TERMINAL_TASK_STATES.has(event.state)) return
         const changed = this.sql.exec(
           'UPDATE tasks SET state = ?, session_id = COALESCE(?, session_id), updated_at = ?, error = ?, delivered = 1, params = NULL, frame = NULL, expires_at = NULL WHERE task_id = ?',
           event.state, event.sessionId ?? null, Math.min(event.updatedAt || now, now), event.error ? JSON.stringify(event.error) : null, event.taskId,
@@ -1047,45 +1050,65 @@ export class HostDO extends DurableObject<Env> {
     return this.sql.exec<TaskRow>('SELECT * FROM tasks WHERE task_id = ?', taskId).toArray()[0]
   }
 
-  private async taskQuery(call: ExecuteCall): Promise<ExecuteResult> {
+  /** Reconcile the ledger with the host's durable record; task content stays on the host. */
+  private async readTask(call: ExecuteCall, row: TaskRow): Promise<TaskQueryResult> {
+    const ws = this.readySockets()[0]
+    if (!ws || row.delivered !== 1) return { ok: true, result: this.taskFromRow(row) }
+    const frame = await this.relay(ws, `r_${randomToken(12)}`, { ...call, op: 'task.get', params: { taskId: row.task_id } }, RELAY_TIMEOUT_MS, row.task_id)
+    if (!frame) return { ok: false, error: err('unavailable', 'The DSH host did not answer in time.') }
+    if (!frame.ok) {
+      const error = frame.error ?? err('internal', 'The host returned an error without details.')
+      const current = this.taskRow(row.task_id)
+      if (error.code === 'gone' && current && !TERMINAL_TASK_STATES.has(current.state as TaskState)) {
+        const pushes: PushEvent[] = []
+        await this.onEvent({ kind: 'task', taskId: row.task_id, state: 'failed', updatedAt: Date.now(), error }, pushes)
+        this.push(pushes)
+      }
+      return { ok: false, error: this.explainRefusal(call, error) }
+    }
+    const fromHost = frame.result as Partial<TaskInfo> | null | undefined
+    if (!fromHost || typeof fromHost !== 'object' || fromHost.taskId !== row.task_id || !isTaskState(fromHost.state)) {
+      return { ok: false, error: err('internal', 'The host returned an invalid task record.') }
+    }
+    let current = this.taskRow(row.task_id)
+    if (!current) return { ok: false, error: err('not_found', 'The task was removed while querying the host.') }
+    const sessionId = typeof fromHost.sessionId === 'string' ? fromHost.sessionId : current.session_id
+    const error = fromHost.error ? JSON.stringify(fromHost.error) : null
+    if (current.state !== fromHost.state || current.session_id !== sessionId || current.error !== error) {
+      const pushes: PushEvent[] = []
+      await this.onEvent({
+        kind: 'task', taskId: row.task_id, state: fromHost.state, ...(sessionId ? { sessionId } : {}),
+        updatedAt: typeof fromHost.updatedAt === 'number' && Number.isFinite(fromHost.updatedAt) ? fromHost.updatedAt : current.updated_at,
+        ...(fromHost.error ? { error: fromHost.error } : {}),
+      }, pushes)
+      this.push(pushes)
+      current = this.taskRow(row.task_id) ?? current
+    }
+    const info = this.taskFromRow(current)
+    if (fromHost.result) info.result = fromHost.result
+    // Online queries use the current, scoped list from the host instead of its older cache.
+    if (info.state === 'needs_attention') info.attention = stampHostId(fromHost.attention ?? [], this.hostId ?? '')
+    if (typeof fromHost.hasLiveClient === 'boolean') info.hasLiveClient = fromHost.hasLiveClient
+    return { ok: true, result: info }
+  }
+
+  private async taskQuery(call: ExecuteCall): Promise<TaskQueryResult> {
     const taskId = String(call.params.taskId ?? '')
     let row = this.taskRow(taskId)
     if (!row) return { ok: false, error: err('not_found', 'No task with this id is known to the hub.') }
+    const initial = await this.readTask(call, row)
+    if (!initial.ok) return initial
     if (call.op === 'task.wait') {
       const requested = typeof call.params.timeoutMs === 'number' ? call.params.timeoutMs : TASK_WAIT_MAX_MS
       const timeout = Math.max(0, Math.min(TASK_WAIT_MAX_MS, requested))
-      if (!settled(row.state as TaskState) && timeout > 0) {
-        await new Promise<void>(resolve => {
-          const timer = setTimeout(() => {
-            this.waiters.get(taskId)?.delete(wake)
-            resolve()
-          }, timeout)
-          const wake = () => {
-            clearTimeout(timer)
-            resolve()
-          }
-          const set = this.waiters.get(taskId) ?? new Set()
-          set.add(wake)
-          this.waiters.set(taskId, set)
-        })
+      if (!settled(initial.result.state) && timeout > 0) {
+        await this.waitFor(taskId, timeout)
         row = this.taskRow(taskId)
         if (!row) return { ok: false, error: err('not_found', 'The task was removed while waiting.') }
+        return this.readTask(call, row)
       }
     }
-    const info = this.taskFromRow(row)
-    const ws = this.readySockets()[0]
-    if (ws && row.delivered === 1 && settled(info.state)) {
-      // The hub keeps no content; the final reply and changes come from the host.
-      const frame = await this.relay(ws, `r_${randomToken(12)}`, { ...call, op: 'task.get', params: { taskId } }, RELAY_TIMEOUT_MS, taskId)
-      if (frame?.ok && frame.result && typeof frame.result === 'object') {
-        const fromHost = frame.result as Partial<TaskInfo>
-        if (fromHost.result) info.result = fromHost.result
-        if (fromHost.attention) info.attention = stampHostId(fromHost.attention, this.hostId ?? '')
-        if (fromHost.hasLiveClient !== undefined) info.hasLiveClient = fromHost.hasLiveClient
-        if (fromHost.error && !info.error) info.error = fromHost.error
-      }
-    }
-    return { ok: true, result: info }
+    return initial
   }
 
   // --- alarms -------------------------------------------------------------------------------------
@@ -1192,6 +1215,10 @@ export class HostDO extends DurableObject<Env> {
 
 function settled(state: TaskState): boolean {
   return TERMINAL_TASK_STATES.has(state) || state === 'needs_attention'
+}
+
+function isTaskState(state: unknown): state is TaskState {
+  return state === 'accepted' || state === 'running' || state === 'needs_attention' || state === 'parked' || state === 'completed' || state === 'failed' || state === 'cancelled'
 }
 
 const DENIAL_TEXT: Record<string, string> = {

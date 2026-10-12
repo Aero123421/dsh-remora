@@ -25,6 +25,8 @@ import { createWorkspaceCreate, DEFAULT_CLONE_LIMITS, type CloneLimits } from '.
 
 export interface AdapterOptions {
   clone?: Partial<CloneLimits>
+  /** Native hosts acquire the exclusive lock before invoking recovery. */
+  deferRecovery?: boolean
 }
 
 export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: AdapterOptions = {}) {
@@ -36,11 +38,13 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
   const reads = createReads(rt)
   const actions = createActions(rt, answerer)
   const workspaces = createWorkspaceCreate(rt, { ...DEFAULT_CLONE_LIMITS, ...options.clone })
-  const { removeRemote, ...schedules } = createSchedules(rt)
+  const { removeRemote, dispose: disposeSchedules, ...schedules } = createSchedules(rt)
   // The core builds the adapter while it initialises, before (and whether or not)
   // the hub link comes up: clones interrupted by a crash or restart are cleaned up
   // here, so their folders do not linger and their records do not stay `cloning`.
-  const recovered = workspaces.recover().catch((error: unknown) => deps.logger.warn('Remora: clone recovery failed', error))
+  let recovery: Promise<void> | undefined
+  const prepare = (): Promise<void> => recovery ??= workspaces.recover().catch((error: unknown) => deps.logger.warn('Remora: clone recovery failed', error))
+  const recovered = options.deferRecovery ? Promise.resolve() : prepare()
 
   const handlers: OperationHandlers = {
     ...reads,
@@ -61,16 +65,23 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
   return {
     handlers,
     has: (service: string) => ctx.get(service) !== undefined,
+    prepare,
+    stopClones: workspaces.stop,
     start: () => {
       watcher.start()
       answerer.start()
     },
-    settingsChanged: () => answerer.settingsChanged(),
+    settingsChanged: () => {
+      answerer.settingsChanged()
+      tasks.settingsChanged()
+      watcher.settingsChanged()
+    },
     removeRemoteSchedules: removeRemote,
-    dispose: () => {
+    dispose: async () => {
       answerer.dispose()
       watcher.dispose()
       workspaces.dispose()
+      await Promise.all([disposeSchedules(), workspaces.stop(), watcher.idle()])
     },
     /** Internals for tests. */
     recovered,
@@ -82,6 +93,6 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
 }
 
 export const createAdapter: CreateAdapter = (ctx, deps) => {
-  const { handlers, has, start, settingsChanged, removeRemoteSchedules, dispose } = buildAdapter(ctx, deps)
-  return { handlers, has, start, settingsChanged, removeRemoteSchedules, dispose }
+  const { handlers, has, prepare, stopClones, start, settingsChanged, removeRemoteSchedules, dispose } = buildAdapter(ctx, deps, { deferRecovery: true })
+  return { handlers, has, prepare, stopClones, start, settingsChanged, removeRemoteSchedules, dispose }
 }

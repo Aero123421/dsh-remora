@@ -1,9 +1,9 @@
 /**
  * The small slice of the DSH (Cordis) host context this plugin touches.
- * DSH packages are not installed as dependencies; these local types keep the
- * plugin compiling on its own and make every DSH touch point visible in one
- * file. Only the adapter layer may grow this list.
+ * DSH packages are not installed as dependencies. Lifecycle and authenticated
+ * settings-route APIs live here; operation services live in adapter/dsh-types.ts.
  */
+import type { IncomingMessage, ServerResponse } from 'node:http'
 
 export interface FetchRoute {
   path: string
@@ -17,7 +17,8 @@ export interface HostContext {
   connection: { fetch: { register(route: FetchRoute): unknown } }
   /** Look up an optional service without requiring it. */
   get(name: string): unknown
-  effect(setup: () => () => void, label?: string): void
+  on(event: 'connection/request', listener: (request: IncomingMessage, response: ServerResponse, next: () => Promise<void>) => Promise<void>, options?: { prepend?: boolean; global?: boolean }): () => void
+  effect(setup: () => () => void | Promise<void>, label?: string): void
   logger: { info(...args: unknown[]): void; warn(...args: unknown[]): void }
 }
 

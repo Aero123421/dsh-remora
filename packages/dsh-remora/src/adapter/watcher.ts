@@ -6,7 +6,8 @@
  * sessions cannot change.
  */
 import { TERMINAL_TASK_STATES, type AttentionEvent } from '@dsh-remora/protocol'
-import type { Disposer, DshWorkspace } from './dsh-types.ts'
+import type { Disposer } from './dsh-types.ts'
+import { OperationError } from '../ops/types.ts'
 import { isLoginFailure } from './events.ts'
 import { withoutDetail } from './reads.ts'
 import type { Runtime } from './runtime.ts'
@@ -80,6 +81,14 @@ export class Watcher {
     this.started = false
   }
 
+  settingsChanged(): void {
+    if (!this.started) return
+    for (const sessionId of new Set([
+      ...this.sent.keys(),
+      ...this.tasks.active().flatMap(record => record.sessionId ? [record.sessionId] : []),
+    ])) this.schedule(sessionId, 0)
+  }
+
   /** Re-evaluate one session soon (coalesces bursts of events). */
   schedule(sessionId: string, delay = DEBOUNCE_MS): void {
     if (this.abort.signal.aborted) return
@@ -103,7 +112,7 @@ export class Watcher {
     this.timers.set(sessionId, timer)
   }
 
-  /** Wait for pending refreshes (tests). */
+  /** Await pending refreshes during teardown or in tests. */
   async idle(): Promise<void> {
     while (this.timers.size > 0 || this.running.size > 0) {
       await Promise.all([...this.running.values()])
@@ -111,27 +120,31 @@ export class Watcher {
     }
   }
 
-  private scopeAllows(sessionId: string, meta: { cwd?: string; origin?: string; parentSession?: string } | undefined): boolean {
-    const registry = this.rt.workspaces
-    const workspaces: readonly DshWorkspace[] = registry?.list() ?? []
-    const owner = (id: string): DshWorkspace | undefined => workspaces.find(workspace => workspace.sessionIds.includes(id))
-    const workspace = owner(sessionId) ?? (meta?.origin === 'subagent' && meta.parentSession ? owner(meta.parentSession) : undefined)
-    try {
-      return this.rt.deps.scope.canAccessSession({ sessionId, workspaceId: workspace?.id ?? null, workspacePath: workspace?.path ?? meta?.cwd ?? null })
-    } catch {
-      return false
-    }
+  private clearAttention(sessionId: string): void {
+    if (this.sent.get(sessionId) === '[]') return
+    this.sent.set(sessionId, '[]')
+    this.rt.deps.emit({ kind: 'attention', sessionId, items: [] })
   }
 
   private async refresh(sessionId: string): Promise<void> {
     const signal = this.abort.signal
     let inspection
     try {
+      await this.rt.row(sessionId, signal)
       inspection = await this.rt.sessions.inspect(sessionId, signal)
-    } catch {
+    } catch (error) {
+      if (error instanceof OperationError && error.code === 'gone') await this.tasks.sessionGone(sessionId, error.message)
+      this.clearAttention(sessionId)
       return
     }
     const values = await this.rt.projections(sessionId, signal).catch(() => null)
+    try {
+      await this.rt.row(sessionId, signal)
+    } catch (error) {
+      if (error instanceof OperationError && error.code === 'gone') await this.tasks.sessionGone(sessionId, error.message)
+      this.clearAttention(sessionId)
+      return
+    }
     const events = inspection.events
     for (const record of this.tasks.active(sessionId)) {
       if (TERMINAL_TASK_STATES.has(record.state)) continue
@@ -139,7 +152,14 @@ export class Watcher {
         this.rt.deps.logger.warn(`Remora: evaluating task ${record.taskId} failed`, error)
       })
     }
-    if (!this.scopeAllows(sessionId, inspection.meta)) return
+    // Task evaluation can await DSH activity hooks; scope may narrow during them.
+    try {
+      await this.rt.row(sessionId, signal)
+    } catch (error) {
+      if (error instanceof OperationError && error.code === 'gone') await this.tasks.sessionGone(sessionId, error.message)
+      this.clearAttention(sessionId)
+      return
+    }
     const items = this.rt.attention(sessionId, events, values).map(withoutDetail)
     const key = JSON.stringify(items)
     if (this.sent.get(sessionId) === key) return

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { buildAdapter } from '../src/adapter/index.ts'
@@ -134,8 +134,12 @@ test('workspace.create idempotency and clone recovery survive a restart', async 
   const first = await f.handlers['workspace.create']({ placementId: 'p1', name: 'kept', idempotencyKey: 'k' }, context())
   // A clone that was running when DSH stopped.
   await (await import('node:fs/promises')).mkdir(join(f.placement, 'half'))
+  const identity = await lstat(join(f.placement, 'half'), { bigint: true })
   f.dsh.addWorkspace('ws-half', join(f.placement, 'half'))
-  f.creations.set('client-1\u0000k2', { key: 'client-1\u0000k2', workspaceId: 'ws-half', path: join(f.placement, 'half'), name: 'half', state: 'cloning', createdAt: 1, updatedAt: 1 })
+  f.creations.set('client-1\u0000k2', {
+    key: 'client-1\u0000k2', workspaceId: 'ws-half', path: join(f.placement, 'half'), name: 'half', state: 'cloning', createdAt: 1, updatedAt: 1,
+    directory: { placementId: 'p1', placementPath: f.placement, dev: identity.dev.toString(), ino: identity.ino.toString() },
+  })
   // Recovery runs when the adapter is built (core init), without start() / a hub link.
   const restarted = buildAdapter(f.dsh.ctx(), f.deps, { clone: { git: f.git, timeoutMs: 5000, maxBytes: 1000 } })
   await restarted.recovered

@@ -11,6 +11,7 @@
  * allowed commands …) are accepted only from a browser on this PC; see
  * `isLocalRequest`. Narrowing changes are accepted from anywhere.
  */
+import { AsyncLocalStorage } from 'node:async_hooks'
 import type { HostContext } from './dsh.ts'
 import type { RemoraCore } from './core/remora.ts'
 import { RpcError } from './core/rpc-error.ts'
@@ -28,6 +29,13 @@ export interface CallInfo {
 
 type Method = (payload: unknown, info: CallInfo) => unknown | Promise<unknown>
 
+const peerAddress = new AsyncLocalStorage<string | undefined>()
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (address === undefined) return false
+  return isLoopbackHostname(address.startsWith('::ffff:') ? address.slice(7) : address)
+}
+
 function isLoopbackHostname(hostname: string): boolean {
   const host = hostname.toLowerCase()
   if (host === 'localhost' || host === '[::1]' || host === '::1') return true
@@ -42,12 +50,13 @@ function hostnameOf(authority: string): string | null {
 /**
  * Whether a settings request comes from a browser on this PC. DSH's own
  * fence already rejected Hosts other than loopback, the bind address and
- * configured `trustedHosts`; here only a loopback Host (and loopback Origin,
+ * configured `trustedHosts`; here only a loopback socket peer, Host (and loopback Origin,
  * when sent) without any reverse-proxy forwarding header counts as local.
  * An SSH port forward to the loopback port also counts: whoever holds that
  * tunnel already has a shell on this PC.
  */
-export function isLocalRequest(request: Request): boolean {
+export function isLocalRequest(request: Request, address = peerAddress.getStore()): boolean {
+  if (!isLoopbackAddress(address)) return false
   const headers = request.headers
   for (const name of ['forwarded', 'x-forwarded-for', 'x-forwarded-host', 'x-real-ip', 'cf-connecting-ip', 'true-client-ip']) {
     if (headers.get(name) !== null) return false
@@ -79,6 +88,7 @@ function bool(payload: unknown, key: string): boolean {
 export function createMethods(core: RemoraCore): Record<string, Method> {
   const withReady = (method: Method): Method => async (payload, info) => {
     await core.ready
+    await core.syncState()
     return method(payload, info)
   }
   const methods: Record<string, Method> = {
@@ -141,8 +151,8 @@ export function createMethods(core: RemoraCore): Record<string, Method> {
       await core.switchQuestionMode(local)
       return core.snapshot(local)
     },
-    reconnect: (_, { local }) => {
-      core.reconnect()
+    reconnect: async (_, { local }) => {
+      await core.reconnect()
       return core.snapshot(local)
     },
     'update-check': async payload => core.checkUpdate(field(payload, 'force') === true),
@@ -185,6 +195,9 @@ export function createHandler(method: string, impl: Method, log?: (message: stri
 }
 
 export function registerRoutes(ctx: HostContext, core: RemoraCore): void {
+  // The Fetch bridge drops socket metadata. Carry it through DSH's authenticated
+  // HTTP waterfall without trusting any client-supplied header.
+  ctx.on('connection/request', (request, _response, next) => peerAddress.run(request.socket.remoteAddress, next), { prepend: true, global: true })
   for (const [method, impl] of Object.entries(createMethods(core))) {
     ctx.connection.fetch.register({
       path: `/api/${RPC_NAMESPACE}/${method}`,

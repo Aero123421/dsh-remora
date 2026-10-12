@@ -283,7 +283,9 @@ export class FakeDsh {
     async delete(request: { sessionId: string; id: string }) {
       const before = self.scheduleRows.length
       self.scheduleRows = self.scheduleRows.filter(row => !(row.id === request.id && row.sessionId === request.sessionId))
-      return self.scheduleRows.length < before ? { id: request.id, deleted: true as const } : { id: request.id, deleted: false as const, code: 'schedule_not_found' }
+      if (self.scheduleRows.length === before) return { id: request.id, deleted: false as const, code: 'schedule_not_found' }
+      self.fire('domain/changed', { domain: 'schedule', table: 'tasks', operation: 'deleted', key: request.id })
+      return { id: request.id, deleted: true as const }
     },
   }))(this)
 

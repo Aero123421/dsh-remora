@@ -42,6 +42,7 @@ export interface SecretBackend {
 }
 
 const SERVICE = 'remora-cli'
+const CLEARED = 'null'
 
 export const BACKEND_LABEL: Readonly<Record<BackendName, string>> = {
   'macos-keychain': 'macOS のキーチェーン',
@@ -176,21 +177,26 @@ export class LayeredTokenStore implements TokenStore {
   }
 
   async load(hubUrl: string): Promise<StoredTokens | null> {
+    // A fallback file is the last successful save. The keychain may still
+    // contain an older refresh token after a failed write or read-back.
+    const value = await this.file.get(hubUrl)
+    if (value === CLEARED) { this.location = null; return null }
+    const fallback = value ? decode(value) : null
+    if (fallback) { this.location = 'file'; return fallback }
     if (this.keychain) {
       const value = await this.keychain.get(hubUrl).catch(() => null)
       const tokens = value ? decode(value) : null
       if (tokens) { this.location = this.keychain.name; return tokens }
     }
-    const value = await this.file.get(hubUrl)
-    const tokens = value ? decode(value) : null
-    if (tokens) this.location = 'file'
-    return tokens
+    this.location = null
+    return null
   }
 
   async save(tokens: StoredTokens): Promise<BackendName> {
     const value = encode(tokens)
     // Warn when tokens first land in the file, not on every refresh afterwards.
-    if (await this.file.get(tokens.hubUrl) !== null) this.warned = true
+    const previousFile = await this.file.get(tokens.hubUrl)
+    if (previousFile !== null && previousFile !== CLEARED) this.warned = true
     if (this.keychain) {
       try {
         await this.keychain.set(tokens.hubUrl, value)
@@ -212,7 +218,10 @@ export class LayeredTokenStore implements TokenStore {
 
   async clear(hubUrl: string): Promise<void> {
     if (this.keychain) await this.keychain.delete(hubUrl).catch(() => {})
-    await this.file.delete(hubUrl)
+    // A locked keychain can refuse deletion. Keep a nonsecret tombstone so
+    // an old entry cannot log the user back in when it becomes readable again.
+    await this.file.set(hubUrl, CLEARED)
+    this.location = null
   }
 
   private fallbackWarning(reason: string): void {

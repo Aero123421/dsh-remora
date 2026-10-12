@@ -33,6 +33,8 @@ export interface ScopePolicy {
   canAccessSession(session: SessionScopeInput): boolean
   /** Allowed parent folders for new workspaces (realpath-checked by the core when configured). */
   placements(): PlacementInfo[]
+  /** Revalidate one approved placement immediately before creating a folder. */
+  resolvePlacement?(placementId: string): Promise<PlacementInfo>
   isAllowedSkill(name: string, workspaceId: string | null): boolean
   isAllowedAgentPreset(name: string): boolean
   /** Explicit allow-list only (full access does not widen it); always false for FORBIDDEN_COMMANDS. */
@@ -105,6 +107,8 @@ export interface WorkspaceCreationRecord {
   message?: string
   createdAt: number
   updatedAt: number
+  /** Filesystem identity captured for the directory Remora created; older records omit it. */
+  directory?: { placementId: string; placementPath: string; dev: string; ino: string }
 }
 
 export interface WorkspaceCreationStore {
@@ -135,6 +139,10 @@ export interface RemoteScheduleRecord {
   clientId: string
   clientName: string
   createdAt: number
+  /** Retry identity, retained with the schedule for 24 hours; absent on older records. */
+  idempotencyKey?: string
+  /** Hash of the requested session, title, prompt and rule; never holds prompt text. */
+  requestHash?: string
 }
 
 export interface RemoteScheduleStore {
@@ -161,13 +169,17 @@ export interface Adapter {
   handlers: OperationHandlers
   /** Whether a DSH service is present (feeds the compatibility report). */
   has(service: string): boolean
+  /** Recover interrupted workspace clones after acquiring the exclusive host lock. */
+  prepare?(): Promise<void>
+  /** Stop and await background clones before transferring the host lock. */
+  stopClones?(): Promise<void>
   /** Begin watching sessions for task progress and attention. Called once the host is paired and connected. */
   start(): void
   /** The settings tab changed something the adapter reads through its deps (answer policy, kill switch). */
   settingsChanged?(): void
   /** Delete every schedule created through Remora (kill switch, unpairing). Resolves with how many went. */
   removeRemoteSchedules?(): Promise<number>
-  dispose(): void
+  dispose(): void | Promise<void>
 }
 
 export type CreateAdapter = (ctx: HostContext, deps: AdapterDeps) => Adapter

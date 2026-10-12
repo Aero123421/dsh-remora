@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { TaskInfo } from '@dsh-remora/protocol'
 import { main } from '../src/main.ts'
@@ -110,6 +110,7 @@ test('run --wait stops for a human with exit 3, fails with exit 1, times out wit
   hub.ops['task.wait'] = () => task('needs_attention', { attention: [{ attentionId: 'q-1', hostId: 'h-1', sessionId: 's-1', kind: 'question', title: 'どちらにしますか', options: [{ id: 'a', label: 'A 案' }], answerable: true, createdAt: null }] })
   const a = await loggedIn()
   assert.equal(await main(['run', '--session', 's-1', 'x'], a.ctx), EXIT.attention)
+  assert.deepEqual(a.slept, [], 'wait stops at attention without a polling delay')
   assert.match(a.stdout(), /q-1/)
   assert.match(a.stdout(), /remora answer q-1/)
 
@@ -135,6 +136,26 @@ test('tasks watch continues through attention until the end', async () => {
   assert.equal(await main(['tasks', 'watch', 't-1'], t.ctx), EXIT.failure)
   assert.match(t.stderr(), /要対応/)
   assert.match(t.stderr(), /取り消し/)
+})
+
+test('tasks watch backs off for repeated attention and respects its timeout', async t => {
+  const attention = task('needs_attention', { attention: [{ attentionId: 'q-watch', hostId: 'h-1', sessionId: 's-1', kind: 'question', title: 'continue?', answerable: true, createdAt: null }] })
+  hub.ops['task.get'] = () => attention
+  hub.ops['task.wait'] = (_params, call) => call <= 3 ? attention : { status: 429, body: { error: { code: 'rate_limited', message: 'polling quota exhausted' } } }
+  let now = 1_000_000
+  const sleeps: number[] = []
+  const fixture = await loggedIn({ now: () => now, sleep: async ms => { sleeps.push(ms); now += ms } })
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+  assert.equal(await main(['tasks', 'watch', 't-1', '--timeout', '5s', '--json'], fixture.ctx), EXIT.timeout)
+  assert.equal(hub.calls.filter(call => call.op === 'task.wait').length, 3)
+  assert.deepEqual(sleeps, [2000, 2000, 1000])
+  assert.equal(JSON.parse(fixture.stdout()).state, 'needs_attention')
+
+  const waiting = await loggedIn({ now: () => now })
+  t.after(() => rm(waiting.dir, { recursive: true, force: true }))
+  assert.equal(await main(['tasks', 'wait', 't-1'], waiting.ctx), EXIT.attention)
+  assert.equal(hub.calls.filter(call => call.op === 'task.wait').length, 0)
+  assert.deepEqual(waiting.slept, [])
 })
 
 test('answer finds the session through attention.list', async () => {

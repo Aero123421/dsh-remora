@@ -66,15 +66,67 @@ test('requests with the wrong media type or method name are refused', async () =
   } finally { await p.close() }
 })
 
-test('a request is local only with a loopback Host and Origin and no proxy headers', () => {
+test('a request is local only with a loopback peer, Host and Origin and no proxy headers', () => {
   const request = (headers: Record<string, string>) => new Request('http://dsh.internal/api/remora/state', { method: 'POST', headers })
-  assert.equal(isLocalRequest(request({ host: '127.0.0.1:5173' })), true)
-  assert.equal(isLocalRequest(request({ host: 'localhost:5173', origin: 'http://localhost:5173' })), true)
-  assert.equal(isLocalRequest(request({ host: '[::1]:5173' })), true)
-  assert.equal(isLocalRequest(request({ host: '192.168.1.10:5173' })), false)
-  assert.equal(isLocalRequest(request({ host: '127.0.0.1:5173', origin: 'https://evil.example' })), false)
-  assert.equal(isLocalRequest(request({ host: '127.0.0.1:5173', 'x-forwarded-for': '203.0.113.9' })), false)
-  assert.equal(isLocalRequest(request({})), false)
+  assert.equal(isLocalRequest(request({ host: '127.0.0.1:5173' }), '127.0.0.1'), true)
+  assert.equal(isLocalRequest(request({ host: 'localhost:5173', origin: 'http://localhost:5173' }), '127.0.0.1'), true)
+  assert.equal(isLocalRequest(request({ host: '[::1]:5173' }), '127.0.0.1'), true)
+  assert.equal(isLocalRequest(request({ host: '192.168.1.10:5173' }), '127.0.0.1'), false)
+  assert.equal(isLocalRequest(request({ host: '127.0.0.1:5173', origin: 'https://evil.example' }), '127.0.0.1'), false)
+  assert.equal(isLocalRequest(request({ host: '127.0.0.1:5173', 'x-forwarded-for': '203.0.113.9' }), '127.0.0.1'), false)
+  assert.equal(isLocalRequest(request({}), '127.0.0.1'), false)
+  assert.equal(isLocalRequest(request({ host: 'localhost' }), '203.0.113.9'), false)
+  assert.equal(isLocalRequest(request({ host: 'localhost' })), false)
+  assert.equal(isLocalRequest(request({ host: 'localhost' }), '::ffff:127.0.0.1'), true)
+})
+
+test('spoofed loopback headers cannot widen settings through a remote socket', async () => {
+  const p = await plugin()
+  try {
+    const forged = { peer: '203.0.113.9', host: 'localhost:5173', origin: 'http://localhost:5173' }
+    const state = await rpc<RemoraSnapshot>(p.routes, 'state', {}, forged)
+    assert.ok(state.ok && !state.value.local)
+    const widened = await rpc(p.routes, 'permission', { level: 'request' }, forged)
+    assert.equal(widened.ok ? null : widened.error.code, 'remora/local-only')
+    assert.ok((await rpc(p.routes, 'kill-switch', { on: true }, forged)).ok)
+    const resumed = await rpc(p.routes, 'kill-switch', { on: false }, forged)
+    assert.equal(resumed.ok ? null : resumed.error.code, 'remora/local-only')
+    assert.ok((await rpc(p.routes, 'kill-switch', { on: false }, { peer: '::1' })).ok)
+    assert.ok((await rpc(p.routes, 'permission', { level: 'request' })).ok)
+  } finally { await p.close() }
+})
+
+test('simultaneous narrowing and neutral edits preserve the current permission and scope', async () => {
+  const p = await plugin()
+  try {
+    await p.core.setPermission({ level: 'full', confirmFull: true }, true)
+    await p.core.updateSettings({ scope: { workspaces: ['w1'] } }, true)
+    await Promise.all([
+      p.core.setPermission({ level: 'view' }, false),
+      p.core.updateSettings({ hostName: 'Renamed' }, false),
+      p.core.updateSettings({ scope: { workspaces: [] } }, false),
+      p.core.setAnswers({ waitMinutes: 0 }, false),
+    ])
+    const state = p.core.snapshot(true)
+    assert.equal(state.settings.hostName, 'Renamed')
+    assert.equal(state.settings.ceiling.level, 'view')
+    assert.deepEqual(state.settings.scope.workspaces, [])
+    assert.equal(state.settings.remoteAnswerWaitMs, 0)
+  } finally { await p.close() }
+})
+
+test('each widening check uses the value committed by the preceding update', async () => {
+  const p = await plugin()
+  try {
+    await p.core.setPermission({ level: 'full', confirmFull: true }, true)
+    const results = await Promise.allSettled([
+      p.core.setPermission({ level: 'view' }, false),
+      p.core.setPermission({ level: 'full', confirmFull: true }, false),
+    ])
+    assert.equal(results[0]?.status, 'fulfilled')
+    assert.equal(results[1]?.status, 'rejected')
+    assert.equal(p.core.snapshot(true).settings.ceiling.level, 'view')
+  } finally { await p.close() }
 })
 
 test('scope settings: widening needs this PC, validation, and placements', async () => {

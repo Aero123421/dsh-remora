@@ -167,7 +167,10 @@ async function waitFor(cmd: Cmd, hub: Hub, first: TaskInfo, options: WaitOptions
       info = await hub.op('task.wait', { taskId: info.taskId, timeoutMs: Math.max(0, Math.round(step)) }, step + 20_000)
       report()
       // A hub that answers instantly must not turn this into a busy loop.
-      if (!done(info) && info.state !== 'needs_attention' && ctx.now() - callStarted < 1000) await ctx.sleep(2000)
+      if (!done(info) && !(options.stopAtAttention && info.state === 'needs_attention') && ctx.now() - callStarted < 1000) {
+        const remaining = options.timeoutMs === null ? 2000 : Math.max(0, options.timeoutMs - (ctx.now() - started))
+        if (remaining > 0) await ctx.sleep(Math.min(2000, remaining))
+      }
     }
   } finally {
     process.off('SIGINT', onInterrupt)

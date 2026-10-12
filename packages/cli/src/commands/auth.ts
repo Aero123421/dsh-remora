@@ -7,6 +7,7 @@ import { parseDuration } from '../format.ts'
 import { resolveHubUrl } from '../hub.ts'
 import { ADMIN_SCOPE, CONTENT_SCOPE, DEFAULT_SCOPE, discover, discoverResources, loginWithBrowser, loginWithDevice, revoke, toAccess } from '../oauth.ts'
 import { BACKEND_LABEL, openTokenStore, type StoredTokens } from '../tokens.ts'
+import { withTokenLock } from '../token-lock.ts'
 
 export const login: CommandDef = {
   name: 'login',
@@ -53,7 +54,7 @@ export const login: CommandDef = {
       access: { api: toAccess(ctx, response) },
     }
     const store = await openTokenStore(ctx)
-    const where = await store.save(tokens)
+    const where = await withTokenLock(ctx, hubUrl, () => store.save(tokens))
     await saveProfile(ctx, { ...(await loadProfile(ctx)), hubUrl, scope })
     if (json) {
       printJson(ctx, { hubUrl, scope: tokens.scope, store: where, refreshable: tokens.refreshToken !== null })
@@ -80,9 +81,12 @@ export const logout: CommandDef = {
       return EXIT.ok
     }
     const store = await openTokenStore(ctx)
-    const tokens = await store.load(hubUrl)
-    const revoked = tokens ? await revoke(ctx, tokens) : false
-    await store.clear(hubUrl)
+    const { tokens, revoked } = await withTokenLock(ctx, hubUrl, async () => {
+      const tokens = await store.load(hubUrl)
+      const revoked = tokens ? await revoke(ctx, tokens) : false
+      await store.clear(hubUrl)
+      return { tokens, revoked }
+    })
     if (json) {
       printJson(ctx, { loggedOut: true, hubUrl, revoked })
     } else {

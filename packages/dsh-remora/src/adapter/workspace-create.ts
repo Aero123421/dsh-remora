@@ -10,7 +10,7 @@
  *   config disabled, a timeout and a size cap.
  */
 import { spawn } from 'node:child_process'
-import { lstat, mkdir, readdir, realpath, rm } from 'node:fs/promises'
+import { lstat, mkdir, readdir, realpath, rm, rmdir } from 'node:fs/promises'
 import { join, sep } from 'node:path'
 import type { OperationParams, OperationResults, WorkspaceSummary } from '@dsh-remora/protocol'
 import type { OperationContext, WorkspaceCreationRecord } from '../ops/types.ts'
@@ -191,7 +191,7 @@ export function failedClones(records: readonly WorkspaceCreationRecord[], now = 
 export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT_CLONE_LIMITS) {
   const running = new Map<string, Promise<Result<'workspace.create'>>>()
   /** Background clones, so dispose() can stop them. */
-  const clones = new Map<string, AbortController>()
+  const clones = new Map<string, { controller: AbortController; done: Promise<void> }>()
 
   function summary(workspace: DshWorkspace, record?: WorkspaceCreationRecord): WorkspaceSummary {
     return {
@@ -214,20 +214,36 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
 
   /** Remove the folder and the DSH registration of a clone that did not finish. */
   async function cleanUp(record: WorkspaceCreationRecord, message: string): Promise<void> {
-    await rm(record.path, { recursive: true, force: true }).catch(() => undefined)
+    const directory = record.directory
+    let owned = false
+    if (directory) {
+      try {
+        const placement = rt.deps.scope.resolvePlacement
+          ? await rt.deps.scope.resolvePlacement(directory.placementId)
+          : rt.deps.scope.placements().find(item => item.placementId === directory.placementId)
+        if (placement?.path === directory.placementPath && await realpath(placement.path) === placement.path
+          && record.path === join(placement.path, record.name) && await realpath(record.path) === record.path) {
+          const current = await lstat(record.path, { bigint: true })
+          owned = current.isDirectory() && current.dev.toString() === directory.dev && current.ino.toString() === directory.ino
+        }
+      } catch {
+        // No destructive cleanup when the current placement or directory cannot be proved.
+      }
+    }
+    if (owned) await rm(record.path, { recursive: true, force: true }).catch(() => undefined)
     if (record.workspaceId) await rt.workspaces?.delete(record.workspaceId).catch(() => false)
-    await save(record, { state: 'clone-failed', message: redactLine(message, 500) })
+    await save(record, { state: 'clone-failed', message: redactLine(owned ? message : `${message}; the folder was kept because its ownership could not be verified`, 500) })
   }
 
   function startClone(record: WorkspaceCreationRecord, url: string): void {
     const controller = new AbortController()
-    clones.set(record.key, controller)
     // Not tied to the request: the clone outlives the hub's request timeout.
-    runClone(url, record.path, limits, controller.signal)
-      .then(() => save(record, { state: 'ready' }))
+    const done = runClone(url, record.path, limits, controller.signal)
+      .then(async () => { await save(record, { state: 'ready' }) })
       .catch((error: unknown) => cleanUp(record, error instanceof Error ? error.message : String(error)))
       .catch((error: unknown) => rt.deps.logger.warn('Remora: recording the clone result failed', error))
       .finally(() => clones.delete(record.key))
+    clones.set(record.key, { controller, done })
   }
 
   async function create(params: Params<'workspace.create'>, context: OperationContext): Promise<Result<'workspace.create'>> {
@@ -247,10 +263,15 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
     const url = params.gitUrl === undefined ? undefined : checkGitUrl(params.gitUrl, rt.deps.scope.gitHosts())
     let root: string
     try {
-      root = await realpath(placement.path)
-    } catch {
-      throw unavailable('the placement folder does not exist')
+      root = rt.deps.scope.resolvePlacement
+        ? (await rt.deps.scope.resolvePlacement(placement.placementId)).path
+        : await realpath(placement.path)
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === 'forbidden') throw denied('the placement folder is no longer allowed; check it on the DSH settings tab')
+      throw unavailable('the placement folder is not available')
     }
+    if (root !== placement.path) throw denied('the placement folder now resolves to a different folder; register its new location on the DSH settings tab')
+    if (context.signal.aborted) throw unavailable('creating the workspace was cancelled')
     const target = join(root, params.name)
     if (!isInside(target, root)) throw denied('the folder would be outside the placement')
     try {
@@ -263,6 +284,14 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
     let workspace: DshWorkspace
     try {
       real = await realpath(target)
+      if (rt.deps.scope.resolvePlacement) {
+        try {
+          if ((await rt.deps.scope.resolvePlacement(placement.placementId)).path !== root) throw new Error('changed placement')
+        } catch {
+          throw denied('the placement is no longer allowed; check it on the DSH settings tab')
+        }
+      }
+      if (await realpath(placement.path) !== root) throw denied('the placement folder changed while creating the workspace')
       if (!isInside(real, root)) throw denied('the folder resolved outside the placement')
       try {
         workspace = (await registry.resolveByPath(real)) ?? await registry.create(real)
@@ -270,15 +299,26 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
         throw fromDsh(error, 'registering the workspace with DSH failed')
       }
     } catch (error) {
-      await rm(target, { recursive: true, force: true }).catch(() => undefined)
+      // A replaced parent must not make cleanup remove an unrelated folder.
+      if (await realpath(placement.path).catch(() => null) === root) await rmdir(target).catch(() => undefined)
       throw error instanceof OperationError ? error : new OperationError('internal', `creating the workspace failed: ${(error as Error).message}`)
     }
     // Untrusted before anyone can see it, so no prompt reaches a half-cloned repository.
     if (url) await rt.deps.scope.markUntrustedWorkspace(workspace.id)
+    const identity = await lstat(real, { bigint: true })
     const now = Date.now()
-    const record: WorkspaceCreationRecord = { key, workspaceId: workspace.id, path: real, name: params.name, state: url ? 'cloning' : 'ready', createdAt: now, updatedAt: now }
+    const record: WorkspaceCreationRecord = {
+      key, workspaceId: workspace.id, path: real, name: params.name, state: url ? 'cloning' : 'ready', createdAt: now, updatedAt: now,
+      directory: { placementId: placement.placementId, placementPath: root, dev: identity.dev.toString(), ino: identity.ino.toString() },
+    }
     await rt.creations.put(record)
-    if (url) startClone(record, url)
+    if (url) {
+      if (context.signal.aborted) {
+        await cleanUp(record, 'creating the workspace was cancelled')
+        throw unavailable('creating the workspace was cancelled')
+      }
+      startClone(record, url)
+    }
     return { workspace: summary(workspace, record) }
   }
 
@@ -300,7 +340,13 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
       }
     },
     dispose(): void {
-      for (const controller of clones.values()) controller.abort()
+      for (const clone of clones.values()) clone.controller.abort()
+    },
+    async stop(): Promise<void> {
+      await Promise.allSettled([...running.values()])
+      const pending = [...clones.values()]
+      for (const clone of pending) clone.controller.abort()
+      await Promise.allSettled(pending.map(clone => clone.done))
     },
   }
 }
