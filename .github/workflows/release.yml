@@ -29,11 +29,11 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
@@ -74,11 +74,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
@@ -96,7 +96,7 @@ jobs:
             const pkg = JSON.parse(require("fs").readFileSync(0, "utf8"));
             const bad = ["scripts", "dependencies", "devDependencies"].filter(key => pkg[key] && Object.keys(pkg[key]).length);
             if (bad.length) { console.error(`::error::packed package.json has ${bad.join(", ")}`); process.exit(1) }'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-plugin
           path: release/
@@ -111,11 +111,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
@@ -130,7 +130,7 @@ jobs:
           case "$out" in *"$VERSION"*) ;; *) echo "::error::remora.mjs --version printed '$out', expected $VERSION"; exit 1 ;; esac
           mkdir -p release
           cp packages/cli/dist/remora.mjs release/remora.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-cli-script
           path: release/remora.mjs
@@ -157,11 +157,11 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
@@ -193,7 +193,7 @@ jobs:
           out="$("./artifacts/cli/remora-${TARGET}${ext}" --version)"
           echo "$out"
           case "$out" in *"$VERSION"*) ;; *) echo "::error::remora --version printed '$out', expected $VERSION"; exit 1 ;; esac
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-cli-${{ matrix.target }}
           path: artifacts/cli/remora-${{ matrix.target }}*
@@ -210,11 +210,11 @@ jobs:
       id-token: write       # OIDC token for the provenance attestation
       attestations: write   # store the attestation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist
@@ -237,7 +237,7 @@ jobs:
           cat SHA256SUMS
           sha256sum -c SHA256SUMS
       - name: Build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/dsh-remora-*.tgz

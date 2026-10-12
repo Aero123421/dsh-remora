@@ -7,12 +7,14 @@ permissions:
 jobs:
   packages:
     name: Protocol, plugin and CLI
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
@@ -23,7 +25,7 @@ jobs:
       - name: hub/ has the current protocol copy
         run: pnpm vendor:check
       - run: pnpm pack:plugin
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dsh-remora-plugin
           path: artifacts/
@@ -31,14 +33,16 @@ jobs:
 
   hub:
     name: Hub (Cloudflare Worker)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
       run:
         working-directory: hub
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
