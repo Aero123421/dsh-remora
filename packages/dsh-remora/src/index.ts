@@ -1,23 +1,28 @@
 /**
  * Remora — DSH host side.
  *
- * P0 scaffold: exposes the settings-tab state over the authenticated DSH
- * connection and reports which operations this DSH can serve. The outbound
- * hub connection, pairing and the operation handlers land next; see
- * docs/development.md for the plan.
+ * Creates the core (storage, host key, pairing, hub link, dispatch, events),
+ * hands the adapter its dependencies, and exposes the settings tab's RPC
+ * over DSH's authenticated connection. Everything is disposed on unload.
  */
+import { createAdapter } from './adapter/index.ts'
 import type { HostContext } from './dsh.ts'
+import { RemoraCore, type RemoraOptions } from './core/remora.ts'
 import { registerRoutes } from './routes.ts'
-import { RemoraState } from './state.ts'
 
 export const name = 'dsh-remora'
 export const inject = ['connection']
 
-export function apply(ctx: HostContext): void {
-  const state = new RemoraState(service => ctx.get(service) !== undefined)
-  registerRoutes(ctx, state)
-  ctx.logger.info('Remora: settings routes ready (hub connection not configured)')
+/** Test hook: options merged into the core (data folder, socket factory, fetch). */
+export interface ApplyOptions extends Partial<RemoraOptions> {}
+
+export function apply(ctx: HostContext, _config?: unknown, options: ApplyOptions = {}): RemoraCore {
+  const core = new RemoraCore(ctx, { createAdapter, ...options })
+  registerRoutes(ctx, core)
+  ctx.effect(() => () => { void core.dispose() }, 'dsh-remora: core')
+  void core.ready.then(() => ctx.logger.info(`Remora: ready (data in ${core.dataDir})`))
+  return core
 }
 
-export { RemoraState } from './state.ts'
+export { RemoraCore } from './core/remora.ts'
 export { detectFeatures } from './features.ts'

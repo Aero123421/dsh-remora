@@ -5,37 +5,155 @@
  * routes instead. Envelope matches DSH's client RPC:
  *   request  { type: 'client-request', rpcId, method, payload }
  *   response { type: 'server-response', rpcId, result: { ok, value | error } }
+ *
+ * Changes that widen remote access (raising the ceiling, full access,
+ * turning the kill switch off, pairing, adding workspaces, placements or
+ * allowed commands …) are accepted only from a browser on this PC; see
+ * `isLocalRequest`. Narrowing changes are accepted from anywhere.
  */
 import type { HostContext } from './dsh.ts'
-import type { RemoraState } from './state.ts'
+import type { RemoraCore } from './core/remora.ts'
+import { RpcError } from './core/rpc-error.ts'
+import { UpdateError } from './core/updates.ts'
+import { PairingError } from './core/pairing.ts'
+
+export { RpcError } from './core/rpc-error.ts'
 
 export const RPC_NAMESPACE = 'remora'
 
-export class RpcError extends Error {
-  readonly code: string
-  constructor(code: string) {
-    super(code)
-    this.code = code
-  }
+export interface CallInfo {
+  /** The browser reached DSH Web through a loopback address on this PC. */
+  local: boolean
 }
 
-type Method = (payload: unknown) => unknown | Promise<unknown>
+type Method = (payload: unknown, info: CallInfo) => unknown | Promise<unknown>
 
-export function createMethods(state: RemoraState): Record<string, Method> {
-  return {
-    state: () => state.snapshot(),
-    'kill-switch': payload => {
-      const on = (payload as { on?: unknown } | null)?.on
-      if (typeof on !== 'boolean') throw new RpcError('invalid-payload')
-      return state.setKillSwitch(on)
-    },
+function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase()
+  if (host === 'localhost' || host === '[::1]' || host === '::1') return true
+  const parts = host.split('.')
+  return parts.length === 4 && parts[0] === '127' && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+}
+
+function hostnameOf(authority: string): string | null {
+  try { return new URL(`http://${authority}`).hostname } catch { return null }
+}
+
+/**
+ * Whether a settings request comes from a browser on this PC. DSH's own
+ * fence already rejected Hosts other than loopback, the bind address and
+ * configured `trustedHosts`; here only a loopback Host (and loopback Origin,
+ * when sent) without any reverse-proxy forwarding header counts as local.
+ * An SSH port forward to the loopback port also counts: whoever holds that
+ * tunnel already has a shell on this PC.
+ */
+export function isLocalRequest(request: Request): boolean {
+  const headers = request.headers
+  for (const name of ['forwarded', 'x-forwarded-for', 'x-forwarded-host', 'x-real-ip', 'cf-connecting-ip', 'true-client-ip']) {
+    if (headers.get(name) !== null) return false
   }
+  const host = headers.get('host')
+  const hostName = host === null ? null : hostnameOf(host)
+  if (hostName === null || !isLoopbackHostname(hostName)) return false
+  const origin = headers.get('origin')
+  if (origin !== null) {
+    try {
+      if (!isLoopbackHostname(new URL(origin).hostname)) return false
+    } catch {
+      return false
+    }
+  }
+  return true
+}
+
+function field(payload: unknown, key: string): unknown {
+  return typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>)[key] : undefined
+}
+
+function bool(payload: unknown, key: string): boolean {
+  const value = field(payload, key)
+  if (typeof value !== 'boolean') throw new RpcError('invalid-payload', key)
+  return value
+}
+
+export function createMethods(core: RemoraCore): Record<string, Method> {
+  const withReady = (method: Method): Method => async (payload, info) => {
+    await core.ready
+    return method(payload, info)
+  }
+  const methods: Record<string, Method> = {
+    state: (_, { local }) => core.snapshot(local),
+    catalog: () => core.catalog(),
+    audit: () => ({ entries: core.auditEntries(200) }),
+    clients: () => ({ clients: core.clients() }),
+    'kill-switch': async (payload, { local }) => {
+      await core.setKillSwitch(bool(payload, 'on'), local)
+      return core.snapshot(local)
+    },
+    permission: async (payload, { local }) => {
+      const level = field(payload, 'level')
+      if (level !== 'view' && level !== 'request' && level !== 'full') throw new RpcError('invalid-payload', 'level')
+      const overrides = field(payload, 'overrides')
+      if (overrides !== undefined && (typeof overrides !== 'object' || overrides === null || Array.isArray(overrides))) throw new RpcError('invalid-payload', 'overrides')
+      const confirmFull = field(payload, 'confirmFull') === true
+      await core.setPermission({ level, ...(overrides ? { overrides: overrides as Record<string, boolean> } : {}), confirmFull }, local)
+      return core.snapshot(local)
+    },
+    'full-access-extend': async (_, { local }) => {
+      await core.extendFullAccess(local)
+      return core.snapshot(local)
+    },
+    settings: async (payload, { local }) => {
+      await core.updateSettings(payload, local)
+      return core.snapshot(local)
+    },
+    'placement-add': async (payload, { local }) => {
+      await core.addPlacement(field(payload, 'path'), local)
+      return core.snapshot(local)
+    },
+    'placement-remove': async (payload, { local }) => {
+      await core.removePlacement(field(payload, 'placementId'), local)
+      return core.snapshot(local)
+    },
+    'pairing-start': async (payload, { local }) => {
+      const hubUrl = field(payload, 'hubUrl')
+      if (typeof hubUrl !== 'string' || hubUrl.length > 2000) throw new RpcError('invalid-payload', 'hubUrl')
+      await core.startPairing(hubUrl, local)
+      return core.snapshot(local)
+    },
+    'pairing-cancel': (_, { local }) => {
+      core.cancelPairing()
+      return core.snapshot(local)
+    },
+    unpair: async (_, { local }) => {
+      await core.unpair(local)
+      return core.snapshot(local)
+    },
+    'owner-credentials': async (payload, { local }) => {
+      await core.resolveCredentialChange(bool(payload, 'accept'), local)
+      return core.snapshot(local)
+    },
+    reconnect: (_, { local }) => {
+      core.reconnect()
+      return core.snapshot(local)
+    },
+    'update-check': async payload => core.checkUpdate(field(payload, 'force') === true),
+    'update-install': async (_, { local }) => core.installUpdate(local),
+  }
+  return Object.fromEntries(Object.entries(methods).map(([name, method]) => [name, withReady(method)]))
 }
 
 const json = (value: unknown, status = 200) =>
   Response.json(value, { status, headers: { 'cache-control': 'no-store' } })
 
-export function createHandler(method: string, impl: Method): (request: Request) => Promise<Response> {
+function errorCode(error: unknown): { code: string; detail?: string } {
+  if (error instanceof RpcError) return error.detail === undefined ? { code: error.code } : { code: error.code, detail: error.detail }
+  if (error instanceof PairingError) return { code: `pairing-${error.code}` }
+  if (error instanceof UpdateError) return { code: `update-${error.code}` }
+  return { code: 'unavailable' }
+}
+
+export function createHandler(method: string, impl: Method, log?: (message: string, error: unknown) => void): (request: Request) => Promise<Response> {
   const endpoint = `${RPC_NAMESPACE}/${method}`
   return async request => {
     let rpcId: string | undefined
@@ -47,23 +165,24 @@ export function createHandler(method: string, impl: Method): (request: Request) 
       }
       rpcId = envelope.rpcId
       request.signal.throwIfAborted()
-      const value = await impl(envelope.payload)
+      const value = await impl(envelope.payload, { local: isLocalRequest(request) })
       return json({ type: 'server-response', rpcId, result: { ok: true, value } })
     } catch (error) {
       if (rpcId === undefined) return new Response('invalid request', { status: 400 })
-      const code = error instanceof RpcError ? error.code : 'unavailable'
-      return json({ type: 'server-response', rpcId, result: { ok: false, error: { code: `${RPC_NAMESPACE}/${code}`, message: code, details: {} } } })
+      const { code, detail } = errorCode(error)
+      if (code === 'unavailable') log?.(`Remora: ${endpoint} failed`, error)
+      return json({ type: 'server-response', rpcId, result: { ok: false, error: { code: `${RPC_NAMESPACE}/${code}`, message: code, details: detail === undefined ? {} : { detail } } } })
     }
   }
 }
 
-export function registerRoutes(ctx: HostContext, state: RemoraState): void {
-  for (const [method, impl] of Object.entries(createMethods(state))) {
+export function registerRoutes(ctx: HostContext, core: RemoraCore): void {
+  for (const [method, impl] of Object.entries(createMethods(core))) {
     ctx.connection.fetch.register({
       path: `/api/${RPC_NAMESPACE}/${method}`,
       methods: ['POST'],
       requestBody: 'buffered',
-      fetch: createHandler(method, impl),
+      fetch: createHandler(method, impl, (message, error) => ctx.logger.warn(message, error)),
     })
   }
 }

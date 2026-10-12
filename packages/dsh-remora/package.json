@@ -64,6 +64,10 @@
   },
   "devDependencies": {
     "@dsh-remora/protocol": "workspace:*",
-    "@types/react": "18.3.31"
+    "@types/react": "18.3.31",
+    "@types/ws": "8.18.1",
+    "clsx": "2.1.1",
+    "qrcode-generator": "1.5.2",
+    "ws": "8.18.3"
   }
 }
