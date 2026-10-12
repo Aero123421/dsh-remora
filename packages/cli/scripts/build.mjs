@@ -1,5 +1,5 @@
-// Bundles the CLI into one ESM file. Standalone binaries (Node SEA or Bun
-// compile — decided in P0) are produced from this file by the release job.
+// Bundles the CLI into one ESM file. scripts/build-binaries.mjs turns it into
+// a standalone executable (Node single executable application) per platform.
 import { build } from 'esbuild'
 import { chmod, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'

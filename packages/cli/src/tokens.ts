@@ -189,6 +189,8 @@ export class LayeredTokenStore implements TokenStore {
 
   async save(tokens: StoredTokens): Promise<BackendName> {
     const value = encode(tokens)
+    // Warn when tokens first land in the file, not on every refresh afterwards.
+    if (await this.file.get(tokens.hubUrl) !== null) this.warned = true
     if (this.keychain) {
       try {
         await this.keychain.set(tokens.hubUrl, value)

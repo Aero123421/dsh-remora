@@ -49,7 +49,16 @@ async function get(ctx: Ctx, url: string, accept?: string): Promise<Response> {
 export async function fetchRelease(ctx: Ctx, version: string | undefined): Promise<Release> {
   const api = (ctx.env.REMORA_RELEASES_API ?? DEFAULT_RELEASES_API).replace(/\/$/, '')
   const tag = version ? (version.startsWith('v') ? version : `v${version}`) : undefined
-  const release = await (await get(ctx, tag ? `${api}/tags/${encodeURIComponent(tag)}` : `${api}/latest`)).json() as Release
+  let response: Response
+  try {
+    response = await get(ctx, tag ? `${api}/tags/${encodeURIComponent(tag)}` : `${api}/latest`)
+  } catch (error) {
+    if (error instanceof CliError && error.detail.status === 404) {
+      throw new CliError(tag ? `リリース ${tag} が見つかりません。` : `${REPOSITORY} のリリースが見つかりません（まだ公開されていない可能性があります）。`, EXIT.notFound, { code: 'no_release' })
+    }
+    throw error
+  }
+  const release = await response.json() as Release
   if (!release || typeof release.tag_name !== 'string' || !Array.isArray(release.assets)) throw new CliError('リリース情報が不正です。', EXIT.failure)
   return release
 }
