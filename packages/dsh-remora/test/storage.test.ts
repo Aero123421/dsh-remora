@@ -131,3 +131,16 @@ test('audit rotation keeps the chain going across files', async () => {
     assert.equal(verifyChain(log.entries()), -1)
   } finally { await cleanup() }
 })
+
+test('workspace creation records survive reopening the document', async () => {
+  const { JsonDocument } = await import('../src/core/storage.ts')
+  const { FileWorkspaceCreationStore, workspaceCreationsSpec } = await import('../src/core/workspace-creations.ts')
+  const { dir, cleanup } = await (await import('./helpers.ts')).tempDir()
+  try {
+    const store = new FileWorkspaceCreationStore(await JsonDocument.open(dir, workspaceCreationsSpec))
+    await store.put({ key: 'c\u0000k', workspaceId: 'w1', path: '/p/x', name: 'x', state: 'cloning', createdAt: 1, updatedAt: Date.now() })
+    await store.put({ key: 'c\u0000k', workspaceId: 'w1', path: '/p/x', name: 'x', state: 'ready', createdAt: 1, updatedAt: Date.now() })
+    const reopened = new FileWorkspaceCreationStore(await JsonDocument.open(dir, workspaceCreationsSpec))
+    assert.deepEqual(reopened.list().map(r => [r.key, r.state]), [['c\u0000k', 'ready']])
+  } finally { await cleanup() }
+})

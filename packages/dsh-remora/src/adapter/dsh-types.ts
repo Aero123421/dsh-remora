@@ -153,6 +153,8 @@ export interface DshWorkspaceRegistry {
   get(id: string): DshWorkspace | undefined
   create(path: string): Promise<DshWorkspace>
   resolveByPath(path: string): Promise<DshWorkspace | undefined>
+  /** Unregister (folder and session logs are kept). */
+  delete(id: string): Promise<boolean>
   readonly archivedSessionIds: readonly string[]
   readonly pinnedSessionIds: readonly string[]
 }

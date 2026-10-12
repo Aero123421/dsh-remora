@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { FORBIDDEN_COMMANDS } from '@dsh-remora/protocol'
 import { Button, Input, SegmentedControl, Switch, Tag } from 'remora-official-primitives'
 import type { CopyKey } from '../locales.ts'
 import type { Catalog, CatalogItem, ScopeSettings } from '../state.ts'
@@ -113,7 +114,7 @@ export function ScopeSection({ snapshot, t, run, busy, ctx }: SectionProps & { c
     {([['skills', 'scope.skills', catalog?.skills], ['agentPresets', 'scope.presets', catalog?.agentPresets], ['commands', 'scope.commands', catalog?.commands]] as const).map(([key, title, items]) => <div key={key}>
       <Head title={t(title as CopyKey)} />
       {unavailable(key)}
-      <AllowList items={(items ?? []).filter(item => key !== 'commands' || (item.id !== '/feedback' && item.id !== '/export'))} allowed={scope[key]} busy={busy} t={t} manualPlaceholder={t('scope.manual')}
+      <AllowList items={(items ?? []).filter(item => key !== 'commands' || !FORBIDDEN_COMMANDS.has(item.id))} allowed={scope[key]} busy={busy} t={t} manualPlaceholder={t('scope.manual')}
         onChange={next => setList(key, next)} {...(key === 'commands' ? { normalize: (value: string) => { const v = value.trim().toLowerCase(); return v === '' ? '' : v.startsWith('/') ? v : `/${v}` } } : {})} />
     </div>)}
 

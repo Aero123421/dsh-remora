@@ -20,6 +20,7 @@ import {
 import { OperationError, type HostOperationId, type OperationContext, type OperationHandler, type OperationHandlers } from '../ops/types.ts'
 import type { AuditInput } from './audit.ts'
 import { verifyConfirmation } from './confirmation.ts'
+import { fullAccessActive } from './permissions.ts'
 import type { PairedHub } from './settings.ts'
 
 export interface ConfirmationLedger {
@@ -66,6 +67,11 @@ function sanitize(error: OperationError): RemoraError {
 }
 
 class DeadlineError extends Error {}
+
+/** Full access for this caller: ceiling ∩ hub grant, both `full` and unexpired. */
+export function effectiveFullAccess(ceiling: Grant, grant: Grant | undefined, now: number): boolean {
+  return fullAccessActive(ceiling, now) && grant !== undefined && typeof grant === 'object' && fullAccessActive(grant, now)
+}
 
 export class Dispatcher {
   private readonly deps: DispatchDeps
@@ -142,6 +148,7 @@ export class Dispatcher {
       actor: { clientId: String(frame.actor?.clientId ?? 'unknown'), clientName: String(frame.actor?.clientName ?? 'unknown') },
       requestId: frame.id,
       scopes: Array.isArray(frame.scopes) ? [...frame.scopes] : [],
+      fullAccess: effectiveFullAccess(this.deps.ceiling(), frame.grant, now()),
       signal: controller.signal,
     }
     if (typeof frame.taskId === 'string') context.taskId = frame.taskId

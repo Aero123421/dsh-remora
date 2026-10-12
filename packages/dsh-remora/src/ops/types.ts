@@ -35,7 +35,7 @@ export interface ScopePolicy {
   placements(): PlacementInfo[]
   isAllowedSkill(name: string, workspaceId: string | null): boolean
   isAllowedAgentPreset(name: string): boolean
-  /** Already excludes FORBIDDEN_COMMANDS. */
+  /** Explicit allow-list only (full access does not widen it); always false for FORBIDDEN_COMMANDS. */
   isAllowedCommand(name: string): boolean
   /** alias -> sessionId, configured on the settings tab. */
   aliases(): Readonly<Record<string, string>>
@@ -75,6 +75,13 @@ export interface OperationContext {
   idempotencyKey?: string
   /** OAuth scopes of the caller; e.g. include `detail`/transcript text only with dsh.content. */
   scopes: readonly string[]
+  /**
+   * Whether THIS caller has unexpired full remote access: the DSH ceiling AND
+   * the caller's hub grant are both `full` and neither has expired. Never
+   * derive this from the ceiling alone. Full access does not widen the skill,
+   * agent-preset or command allow-lists.
+   */
+  fullAccess: boolean
   signal: AbortSignal
 }
 
@@ -83,9 +90,34 @@ export type OperationHandler<Op extends HostOperationId> =
 
 export type OperationHandlers = { [Op in HostOperationId]?: OperationHandler<Op> }
 
+/**
+ * One `workspace.create` request, kept durably so a retried idempotency key
+ * answers the same workspace after a restart and clone progress survives the
+ * request (the clone runs in the background, past the hub's request timeout).
+ */
+export interface WorkspaceCreationRecord {
+  /** `<clientId>\u0000<idempotencyKey>`. */
+  key: string
+  workspaceId: string | null
+  path: string
+  name: string
+  state: 'ready' | 'cloning' | 'clone-failed'
+  message?: string
+  createdAt: number
+  updatedAt: number
+}
+
+export interface WorkspaceCreationStore {
+  list(): WorkspaceCreationRecord[]
+  /** Durable before it resolves. */
+  put(record: WorkspaceCreationRecord): Promise<void>
+}
+
 export interface AdapterDeps {
   scope: ScopePolicy
   tasks: TaskStore
+  /** Durable workspace.create ledger. Without it the adapter keeps one in memory. */
+  workspaceCreations?: WorkspaceCreationStore
   /** Queue an event for the hub. The core sends task completion and attention changes at once and batches the rest (≥ 30 s). */
   emit(event: HostEvent): void
   logger: HostContext['logger']

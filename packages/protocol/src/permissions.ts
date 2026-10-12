@@ -69,8 +69,32 @@ export const FORBIDDEN_REMOTELY: ReadonlySet<string> = new Set([
   'remora.configure',
 ])
 
-/** Slash commands that `command.run` must reject regardless of grants. */
-export const FORBIDDEN_COMMANDS: ReadonlySet<string> = new Set(['/feedback', '/export'])
+/**
+ * Slash commands that `command.run` must reject regardless of grants or
+ * allow-lists. Built from every command DSH 0.2.1-alpha.2 registers on the
+ * host command registry:
+ *
+ * - `/permission` (packages/interaction/permission-presets/src/index.ts):
+ *   switches the sandbox mode and approval policy. DSH presets are
+ *   deployment-configurable (plus the dynamic Auto preset), so "weaker than
+ *   the current one" cannot be decided reliably: forbidden outright.
+ * - `/feedback` (packages/feedback/command-feedback): sends session data out.
+ * - `/export` (packages/session-query/session-log-export): exports the log.
+ *
+ * The remaining built-ins (`/plan` plan-mode, `/compact` command-compact,
+ * `/goal` command-goal) are allowed only when listed on the DSH tab; `/file`
+ * is a browser-composer command, not a host one. The other names are
+ * reserved defensively for commands that would change permissions, the
+ * sandbox or approvals, manage plugins or credentials, sign in or out,
+ * send data out, or configure Remora, should a plugin register one.
+ */
+export const FORBIDDEN_COMMANDS: ReadonlySet<string> = new Set([
+  '/permission', '/permissions', '/sandbox', '/approval', '/approvals', '/yolo', '/trust',
+  '/plugin', '/plugins', '/install', '/uninstall', '/mcp',
+  '/credentials', '/credential', '/login', '/logout', '/auth', '/apikey', '/api-key', '/keys',
+  '/feedback', '/export', '/share', '/upload', '/report', '/bug',
+  '/remora', '/settings', '/config',
+])
 
 function effectiveLevel(grant: Grant, now: number): { level: PermissionLevel; expired: boolean } {
   if (grant.level === 'full' && grant.fullAccessExpiresAt !== undefined && grant.fullAccessExpiresAt <= now) {

@@ -57,8 +57,18 @@ export interface WorkspaceSummary {
   path: string | null
   pinned: boolean
   archived: boolean
-  /** Created by cloning a Git URL through Remora; skills inside are not trusted until allowed on DSH. */
+  /** Created by cloning a Git URL through Remora; prompts are refused until the owner trusts it on DSH. */
   untrusted: boolean
+  /**
+   * Clone progress for a workspace created with `gitUrl`. `workspace.create`
+   * returns at once with `cloning`; the clone runs on the host (10-minute and
+   * size limits) and `workspaces.list` reports `ready` or `clone-failed`
+   * (the folder is removed and the workspace unregistered on failure). Tasks
+   * are refused with `conflict` until it is `ready`. Absent means ready.
+   */
+  state?: 'ready' | 'cloning' | 'clone-failed'
+  /** Why the clone failed, when `state` is `clone-failed`. */
+  stateMessage?: string
 }
 
 export interface ModelChoice {

@@ -155,6 +155,7 @@ const context = (taskId, content = true) => ({
   requestId: `r-${Math.random()}`,
   ...(taskId ? { taskId } : {}),
   scopes: content ? ['dsh.read', 'dsh.content', 'dsh.tasks'] : ['dsh.read', 'dsh.tasks'],
+  fullAccess: false,
   signal: AbortSignal.timeout(30_000),
 })
 const waitFor = async (what, check, ms = 15_000) => {

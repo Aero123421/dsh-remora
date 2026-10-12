@@ -30,7 +30,7 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
   const handlers: OperationHandlers = {
     ...reads,
     ...actions,
-    ...workspaces,
+    ...workspaces.handlers,
     'task.start': (params, context: OperationContext) => tasks.start(params, context),
     'task.get': (params, context) => tasks.get(params, context),
     'task.wait': (params, context) => tasks.wait(params, context),
@@ -43,8 +43,14 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
   return {
     handlers,
     has: (service: string) => ctx.get(service) !== undefined,
-    start: () => watcher.start(),
-    dispose: () => watcher.dispose(),
+    start: () => {
+      watcher.start()
+      void workspaces.recover()
+    },
+    dispose: () => {
+      watcher.dispose()
+      workspaces.dispose()
+    },
     /** Internals for tests. */
     runtime: rt,
     tasks,

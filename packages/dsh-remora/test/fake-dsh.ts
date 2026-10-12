@@ -210,6 +210,7 @@ export class FakeDsh {
     get: (id: string) => self.workspaces.find(w => w.id === id),
     create: async (path: string) => self.addWorkspace(`ws-${self.workspaces.length + 1}`, path),
     resolveByPath: async (path: string) => self.workspaces.find(w => w.path === path),
+    delete: async (id: string) => { const before = self.workspaces.length; self.workspaces = self.workspaces.filter(w => w.id !== id); return self.workspaces.length < before },
     get archivedSessionIds() { return self.archived },
     get pinnedSessionIds() { return self.pinned },
   }))(this)
@@ -329,12 +330,13 @@ export function harness(fakeDsh: FakeDsh, scope: ScopeOptions = {}) {
 }
 
 let requestCounter = 0
-export function context(options: { taskId?: string; content?: boolean; clientId?: string; scopes?: string[] } = {}): OperationContext {
+export function context(options: { taskId?: string; content?: boolean; clientId?: string; scopes?: string[]; fullAccess?: boolean } = {}): OperationContext {
   return {
     actor: { clientId: options.clientId ?? 'client-1', clientName: 'Test' },
     requestId: `req-${++requestCounter}`,
     ...(options.taskId ? { taskId: options.taskId } : {}),
     scopes: options.scopes ?? (options.content === false ? ['dsh.read', 'dsh.tasks'] : ['dsh.read', 'dsh.content', 'dsh.tasks']),
+    fullAccess: options.fullAccess ?? false,
     signal: new AbortController().signal,
   }
 }

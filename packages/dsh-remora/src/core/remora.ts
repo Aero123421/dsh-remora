@@ -31,6 +31,7 @@ import {
   type ConfirmationsDocument, type PairingState, type RemoraSettings, type ScopeSettings, type SessionException,
 } from './settings.ts'
 import { JsonDocument, remoraDataDir, resolveDshHome } from './storage.ts'
+import { FileWorkspaceCreationStore, workspaceCreationsSpec } from './workspace-creations.ts'
 import { FileTaskStore } from './tasks.ts'
 import { readQuestionModes, switchToTimed, type QuestionModeReport } from './question-mode.ts'
 import { checkForUpdate, downloadVerified, type UpdateCheck } from './updates.ts'
@@ -144,6 +145,7 @@ export class RemoraCore {
   private hostKey: HostKey | null = null
   private scope!: SettingsScopePolicy
   private tasks!: FileTaskStore
+  private workspaceCreations!: FileWorkspaceCreationStore
   private events!: EventQueue
   private dispatcher!: Dispatcher
   private link!: HubLink
@@ -182,6 +184,7 @@ export class RemoraCore {
     this.pairingDoc = await JsonDocument.open(dir, pairingSpec)
     this.confirmationsDoc = await JsonDocument.open(dir, confirmationsSpec)
     const tasksDoc = await JsonDocument.open(dir, tasksSpec)
+    const creationsDoc = await JsonDocument.open(dir, workspaceCreationsSpec)
     this.auditLog = await AuditLog.open(dir, { now: () => this.clock.now() })
     const adopted = adoptNewOperations(this.settingsDoc.value)
     if (adopted !== this.settingsDoc.value) await this.settingsDoc.update(() => adopted)
@@ -209,6 +212,7 @@ export class RemoraCore {
     })
     await this.scope.revalidatePlacements(this.roots())
     this.tasks = new FileTaskStore(tasksDoc, () => this.clock.now())
+    this.workspaceCreations = new FileWorkspaceCreationStore(creationsDoc, () => this.clock.now())
     this.link = new HubLink({
       paired: () => this.pairingDoc.value.paired,
       key: () => this.hostKey,
@@ -256,6 +260,7 @@ export class RemoraCore {
     this.adapter = this.options.createAdapter(this.ctx, {
       scope: this.scope,
       tasks: this.tasks,
+      workspaceCreations: this.workspaceCreations,
       emit: event => this.emit(event),
       logger: this.ctx.logger,
     })

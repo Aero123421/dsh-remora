@@ -33,6 +33,9 @@ import { hasContent, type Runtime, type SessionRow } from './runtime.ts'
 type Params<Op extends keyof OperationParams> = OperationParams[Op]
 type Result<Op extends keyof OperationResults> = OperationResults[Op]
 
+/** Where the owner trusts a cloned workspace. */
+export const UNTRUSTED_FIX = 'dsh:settings/remora#scope'
+
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 /** Activity families that keep a task running. Schedules are long-lived and never block completion. */
 const BLOCKING_ACTIVITY = new Set(['turn', 'subagent', 'job'])
@@ -280,7 +283,19 @@ export class Tasks {
   private async promptText(prompt: string, skills: readonly string[], workspaceId: string | null, sessionId: string | null, cwd: string | null, signal: AbortSignal): Promise<string> {
     if (prompt.trim() === '') throw invalid('prompt must not be empty')
     const scope = this.rt.deps.scope
-    const untrusted = workspaceId !== null && scope.isUntrustedWorkspace(workspaceId)
+    if (workspaceId !== null) {
+      const state = this.rt.workspaceState(workspaceId)
+      if (state === 'cloning') throw new OperationError('conflict', 'the workspace is still being cloned; try again when workspaces.list shows it ready')
+      if (state === 'clone-failed') throw new OperationError('conflict', 'cloning this workspace failed; create it again')
+      // DSH's tool-skill lets the model load any skill named in prose, not only
+      // `/name` gestures, so skills inside a cloned (untrusted) workspace cannot be
+      // kept off by checking the prompt. Refuse prompts there until the owner trusts it.
+      if (scope.isUntrustedWorkspace(workspaceId)) {
+        throw new OperationError('denied', 'this workspace was cloned through Remora and is not trusted yet; trust it on the DSH Remora tab (Scope → Untrusted workspaces) before sending prompts to it', {
+          denial: { layer: 'dsh', reason: 'switched-off' }, fix: UNTRUSTED_FIX,
+        })
+      }
+    }
     for (const name of skills) {
       if (!SKILL_NAME.test(name)) throw invalid(`"${name}" is not a skill name`)
     }
@@ -293,7 +308,6 @@ export class Tasks {
     }
     for (const name of gestures) {
       if (known && !known.has(name)) continue
-      if (untrusted) throw denied(`skills are disabled in this workspace until it is trusted on DSH (cloned through Remora): /${name}`)
       if (!scope.isAllowedSkill(name, workspaceId)) throw denied(`skill "/${name}" is not allowed for remote use`)
     }
     return text

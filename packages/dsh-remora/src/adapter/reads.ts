@@ -20,6 +20,7 @@ import {
   changesEvents, computeAttention, countTurns, findTaskTurn, lastReply, presentedFiles, transcriptItems, turnPreviews,
 } from './events.ts'
 import { hasContent, type Runtime, type SessionRow } from './runtime.ts'
+import { failedClones } from './workspace-create.ts'
 
 type Params<Op extends keyof OperationParams> = OperationParams[Op]
 type Result<Op extends keyof OperationResults> = OperationResults[Op]
@@ -177,7 +178,11 @@ export function createReads(rt: Runtime) {
           pinned: false,
           archived: false,
           untrusted: rt.deps.scope.isUntrustedWorkspace(workspace.id),
+          state: rt.workspaceState(workspace.id) ?? 'ready',
         })
+      }
+      for (const failed of failedClones(rt.creations.list())) {
+        if (rt.deps.scope.canAccessWorkspace(failed.workspaceId || null, failed.path)) workspaces.push(failed)
       }
       void params.includeArchived
       return { workspaces, placements: rt.deps.scope.placements() }
