@@ -164,7 +164,10 @@ test('pair, connect, dispatch with permission checks, events, kill switch and pa
 
     // Unpair forgets the key and stops the link.
     assert.ok((await rpc(host.routes, 'unpair', {}, remote)).ok)
-    assert.equal((await state()).hub.paired, false)
+    const unpaired = await state()
+    assert.equal(unpaired.hub.paired, false)
+    assert.equal(hub.unpaired, true, 'the hub got a valid signed unpair request')
+    assert.equal(unpaired.lastUnpair?.hub, 'removed')
     assert.equal(core.internals.link.status.state, 'idle')
   } finally {
     host.dispose()
@@ -193,11 +196,17 @@ test('a second DSH process with the same data folder does not connect', async ()
     assert.ok(snapshot.ok)
     assert.equal(snapshot.value.hub.lock, 'other')
     assert.equal(hub.connections, 1)
+    // With the hub gone, unpairing still clears local state and says so.
+    await hub.close()
+    const result = await rpc<RemoraSnapshot>(first.routes, 'unpair')
+    assert.ok(result.ok)
+    assert.equal(result.value.hub.paired, false)
+    assert.equal(result.value.lastUnpair?.hub, 'unreachable')
   } finally {
     first.dispose(); second.dispose()
     await secondCore?.dispose()
     await firstCore.dispose()
-    await hub.close()
+    await hub.close().catch(() => {})
     await cleanup()
   }
 })

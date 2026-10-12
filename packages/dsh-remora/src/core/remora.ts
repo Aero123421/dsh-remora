@@ -7,7 +7,8 @@ import { homedir, hostname } from 'node:os'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import {
-  OPERATIONS, PROTOCOL_VERSION, canonicalJson,
+  ENDPOINTS, OPERATIONS, PROTOCOL_VERSION, canonicalJson, unpairMessage,
+  type UnpairRequest,
   type Grant, type HostEvent, type OperationId, type OwnerCredential, type PermissionLevel, type RequestFrame,
 } from '@dsh-remora/protocol'
 import type { HostContext } from '../dsh.ts'
@@ -93,6 +94,8 @@ export interface RemoraSnapshot {
     lock: 'held' | 'other' | 'none'
   }
   pairing: PairingView
+  /** Result of the last unpair in this process: whether the hub also forgot the host. */
+  lastUnpair: { at: number; hub: 'removed' | 'refused' | 'unreachable' | 'not-paired' } | null
   pendingCredentials: { receivedAt: number; added: string[]; removed: string[]; total: number } | null
   keyStorage: 'credentials' | 'file'
   dataDir: string
@@ -149,6 +152,7 @@ export class RemoraCore {
   private lockTimer: unknown = null
   private expiryTimer: unknown = null
   private updateCheck: UpdateCheck | null = null
+  private lastUnpair: { at: number; hub: 'removed' | 'refused' | 'unreachable' | 'not-paired' } | null = null
   private fatal: string | null = null
   private disposed = false
   private readonly dshVersion = dshVersion()
@@ -352,6 +356,7 @@ export class RemoraCore {
 
   private async onPaired(approved: ApprovedPairing, key: HostKey): Promise<void> {
     await this.stopLink('idle', null)
+    this.lastUnpair = null
     await this.keyStore.save(key)
     this.hostKey = key
     await this.pairingDoc.update(() => ({
@@ -379,12 +384,38 @@ export class RemoraCore {
   /** Forget the pairing and the key. The host should also be removed on the hub. */
   async unpair(local: boolean): Promise<void> {
     this.pairing.reset()
+    this.lastUnpair = { at: this.clock.now(), hub: await this.unpairAtHub() }
     await this.stopLink('idle', null)
     await this.keyStore.delete()
     this.hostKey = null
     this.adapterStarted = false
     await this.pairingDoc.reset()
-    this.audit({ kind: 'settings', action: 'unpaired', outcome: 'ok', local })
+    this.audit({ kind: 'settings', action: 'unpaired', outcome: this.lastUnpair.hub === 'removed' ? 'ok' : 'error', reason: `hub:${this.lastUnpair.hub}`, local })
+  }
+
+  /**
+   * Ask the hub to forget this host (`POST /pair/unpair`, signed with the
+   * host key). Local state is cleared whatever the answer; a failure only
+   * means the user must also remove the host on the hub.
+   */
+  private async unpairAtHub(): Promise<'removed' | 'refused' | 'unreachable' | 'not-paired'> {
+    const paired = this.pairingDoc.value.paired
+    const key = this.hostKey
+    if (!paired || !key) return 'not-paired'
+    const issuedAt = this.clock.now()
+    const body: UnpairRequest = { hostId: paired.hostId, issuedAt, signature: key.sign(unpairMessage(paired.hubOrigin, paired.hostId, issuedAt)) }
+    const fetchImpl: FetchLike = this.options.fetch ?? ((input, init) => fetch(input, init))
+    try {
+      const response = await fetchImpl(`${paired.hubOrigin}${ENDPOINTS.hostUnpair}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10_000),
+      })
+      return response.ok ? 'removed' : 'refused'
+    } catch {
+      return 'unreachable'
+    }
   }
 
   async resolveCredentialChange(accept: boolean, local: boolean): Promise<void> {
@@ -661,6 +692,7 @@ export class RemoraCore {
         lock: this.lockState,
       },
       pairing: this.pairing.view,
+      lastUnpair: this.lastUnpair,
       pendingCredentials: pending ? {
         receivedAt: pending.receivedAt,
         added: pending.credentials.map(c => c.credentialId).filter(id => !pinnedIds.includes(id)),

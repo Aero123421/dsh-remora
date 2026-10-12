@@ -52,6 +52,8 @@ export function ConnectionSection({ snapshot, t, run, busy }: SectionProps) {
         </div>
       </div>
     </> : <p className="rmr-muted">{t('conn.notPaired')}</p>}
+    {!hub.paired && snapshot.lastUnpair && snapshot.lastUnpair.hub !== 'not-paired'
+      ? <p className="rmr-notice" data-tone={snapshot.lastUnpair.hub === 'removed' ? 'info' : undefined}>{t(snapshot.lastUnpair.hub === 'removed' ? 'conn.unpairedHub' : 'conn.unpairedLocalOnly')}</p> : null}
 
     {hub.lock === 'other' ? <p className="rmr-notice">{t('conn.lockOther')}</p> : null}
     {hub.revoked ? <p className="rmr-notice" data-tone="danger">{t('conn.revoked')}</p> : null}
