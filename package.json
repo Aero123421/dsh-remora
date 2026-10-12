@@ -16,7 +16,12 @@
     "pack:plugin": "pnpm --filter dsh-remora run pack:plugin",
     "vendor:sync": "node scripts/vendor-protocol.mjs",
     "vendor:check": "node scripts/vendor-protocol.mjs --check",
-    "hub:check": "npm --prefix hub ci && npm --prefix hub run typecheck && npm --prefix hub test"
+    "hub:check": "npm --prefix hub ci && npm --prefix hub run typecheck && npm --prefix hub test",
+    "e2e:install": "npm --prefix e2e ci --no-audit --no-fund",
+    "e2e": "node e2e/run.mjs",
+    "e2e:browser": "node e2e/run.mjs --only=browser",
+    "e2e:flow": "node e2e/run.mjs --only=flow",
+    "check:version": "node scripts/check-version.mjs"
   },
   "devDependencies": {
     "@types/node": "22.20.4",

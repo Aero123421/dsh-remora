@@ -1,0 +1,92 @@
+# E2E: real DSH from npm + the Remora plugin tarball (+ the hub under
+# wrangler dev for the flow). See docs/e2e.md.
+#   - pull requests touching the plugin, protocol, hub or harness
+#   - nightly: the pinned DSH (upstream.json) and the newest published DSH,
+#     which tells us when the plugin's peer range should be widened
+#   - called by the release workflow before publishing
+name: E2E
+on:
+  pull_request:
+    paths:
+      - 'packages/dsh-remora/**'
+      - 'packages/protocol/**'
+      - 'hub/**'
+      - 'e2e/**'
+      - 'upstream.json'
+      - '.github/workflows/e2e.yml'
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'all, browser or flow'
+        default: all
+        type: choice
+        options: [all, browser, flow]
+      dsh-version:
+        description: 'DSH version, npm dist-tag or "newest" (empty = upstream.json)'
+        default: ''
+        type: string
+      strict:
+        description: 'Fail when a step is skipped'
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      only:
+        default: browser
+        type: string
+      dsh-version:
+        default: ''
+        type: string
+      strict:
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: E2E (DSH ${{ matrix.dsh || 'pinned' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.dsh == 'newest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The newest published DSH only on the nightly run.
+        dsh: ${{ github.event_name == 'schedule' && fromJSON('["", "newest"]') || fromJSON('[""]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Harness dependencies (Playwright pinned in e2e/package-lock.json)
+        run: |
+          npm --prefix e2e ci --no-audit --no-fund
+          npm --prefix e2e exec -- playwright install --with-deps chromium
+      - name: Run
+        env:
+          ONLY: ${{ inputs.only || 'all' }}
+          DSH_VERSION: ${{ matrix.dsh || inputs.dsh-version || '' }}
+          STRICT: ${{ inputs.strict && '--strict' || '' }}
+        run: |
+          args="--only=${ONLY}"
+          [ "$ONLY" = "all" ] && args=""
+          [ -n "$DSH_VERSION" ] && args="$args --dsh-version=$DSH_VERSION"
+          node e2e/run.mjs $args $STRICT
+      - name: Summary
+        if: always()
+        run: test -f artifacts/e2e/summary.md && cat artifacts/e2e/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-${{ matrix.dsh || 'pinned' }}-${{ github.run_attempt }}
+          path: artifacts/e2e/
+          retention-days: 14
