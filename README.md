@@ -4,14 +4,12 @@
 
 **Self-hosted remote control for DSH (DeepSeek Harness).** View and drive your DSH sessions from ChatGPT, Claude, a CLI or an HTTP API through your own Cloudflare hub. Unofficial.
 
-自分の Cloudflare ハブ経由で、ChatGPT・Claude・CLI・HTTP API から DSH のセッションを見て、依頼して、終わったかどうかを知るためのプラグインです。DeepSeek とは関係のない非公式のプロジェクトです。
-
-> **状態: 準備中（P0 の土台）。** まだ実際には使えません。今動くのは、DSH の設定画面の Remora タブ（状態と緊急停止）、ハブのトップページ、ホスト接続のハンドシェイクの骨組みです。
+自分の Cloudflare ハブ経由で、ChatGPT・Claude・CLI・HTTP API から、すでに動いている DSH のセッションを見て、依頼して、終わったかどうかを知るためのプラグインです。DeepSeek とは関係のない非公式のプロジェクトです。
 
 ## しくみ
 
 ```text
-ChatGPT / Claude / CLI / HTTP API / ハブの画面
+ChatGPT / Claude / Claude Code / remora CLI / HTTP API / ハブの画面
         │  HTTPS（OAuth・パスキー）
         ▼
 Cloudflare ハブ（Worker + Durable Objects、無料枠）
@@ -20,33 +18,65 @@ Cloudflare ハブ（Worker + Durable Objects、無料枠）
 DSH ホスト A, B, …（dsh-remora プラグイン）
 ```
 
-- **ハブ**は自分の Cloudflare アカウントの無料枠で動かします。ログインはパスキー、外部クライアントは OAuth です。会話の本文は保存せず中継するだけです。
-- **DSH 側**はプラグインを入れて、設定画面の「Remora」タブで接続と権限を決めます。DSH からハブへ外向きにつなぐので、DSH にポートを開ける必要はありません。
-- **権限**は「見るだけ／依頼できる／リモート全権」と操作ごとのスイッチで決めます。上限は DSH の画面でしか上げられず、最終判定は毎回 DSH 側のプラグインが行います。
+- **ハブ**は自分の Cloudflare アカウントの無料枠で動かします。ログインはパスキーだけ、外部クライアントは OAuth です。会話の本文は保存せず中継するだけです。
+- **DSH 側**はプラグインを入れて、設定画面の「Remora」タブで接続・権限・範囲を決めます。DSH からハブへ外向きにつなぐので、DSH にポートを開ける必要はありません。
+- **権限**は「見るだけ／依頼できる／リモート全権」と操作ごとのスイッチで決めます。上限は DSH の画面（この PC で開いた DSH Web）でしか上げられず、最終判定は毎回 DSH 側のプラグインが行います。
 
-設計の詳細は [docs/architecture.md](docs/architecture.md) にあります。
+## 始め方
+
+1. **ハブを立てる**: [hub/README.md](hub/README.md) の Deploy to Cloudflare ボタンを押し、`SETUP_TOKEN` に長いランダムな文字列を入れます。デプロイされた URL を開き、`SETUP_TOKEN` と一緒に最初のパスキーを登録します（2 本目の登録とリカバリーコードの保管もおすすめします）。
+2. **プラグインを入れる**: [Releases](https://github.com/Aero123421/dsh-remora/releases) の `dsh-remora-<版>.tgz` の URL を、DSH Web の「Plugins → Add plugin」に貼ってインストールし、DSH を再起動します。
+3. **ペアリング**: DSH の「設定 → Remora → 接続」にハブの URL を入れて「ペアリングを始める」を押します。表示された確認コードをハブの画面で確かめ、パスキーで承認します。
+4. **権限と範囲**: 既定は「見るだけ」で、どのワークスペースも外から触れません。同じタブで、外から触ってよいワークスペースと、上限（たとえば「依頼できる」）を決めます。
+5. **クライアントをつなぐ**: ハブの「接続」画面に手順があります。
+   - ChatGPT: `chatgpt.com/plugins` の ＋ →「カスタム MCP サーバーを追加」に `https://<ハブ>/mcp`
+   - Claude: カスタムコネクターに `https://<ハブ>/mcp`
+   - CLI: `curl -fsSL https://github.com/Aero123421/dsh-remora/releases/latest/download/install.sh | sh` → `remora login https://<ハブ>`（Windows は `install.ps1`）
+
+新しいクライアントは、どのホストでも「見るだけ」から始まります。ハブの「接続」画面で、クライアントごとに上限の範囲内で狭めたり取り消したりできます。
+
+## できること
+
+| 分類 | 操作 |
+| --- | --- |
+| 見る | ホスト・ワークスペース・セッションの一覧、セッションの概要と本文、コンテキストとトークン使用量、変更ファイルと差分、成果物、ジョブの出力 |
+| 依頼する | スキル付きのタスク投入（冪等キーつき、オフライン中は保留）、完了待ち（最長 25 秒ずつ）、追加指示、取り消し、再投入、新しいセッション（エージェントプリセットを選ぶ） |
+| 応答する | AI からの質問への回答（DSH の `tool-ask-user` が `timed` モードのとき）、止まったゴールの再開 |
+| 管理する | ワークスペースの作成（許可した置き場所の下だけ、Git クローンも可）、モデル・Effort の変更、許可したスラッシュコマンドの実行、ゴールの操作 |
+
+MCP のツール名と説明は `packages/protocol/src/operations.ts` で固定しています。
+
+## できないこと・注意
+
+- DSH の既定（`tool-ask-user` の `legacy` モード）では、AI からの質問に外から答えられません。`timed` モードへの切り替え方は Remora タブの「権限」で案内します。
+- プランの確認と承認は、DSH 0.2.1 に答えるための API がないため、外からは答えられません（DSH Web で答えます）。
+- ターミナル、ジョブの停止、スケジュール、遠隔承認はまだありません。
+- `/permission` など権限・設定・データの持ち出しに関わるスラッシュコマンドは、どの権限でも外から実行できません。スキル・プリセット・コマンドは DSH 側で明示的に許可したものだけ使えます。
+- Git でクローンしたワークスペースは「信頼していない」扱いで、DSH 側で信頼するまで外からタスクを送れません。
+- DSH のサンドボックスが制限するのは書き込みだけで、読み取りとネットワークは制限しません。タスクを投げられるクライアントは、その PC のファイルを読ませて外へ通信させられます。
+- 対応する DSH: `>=0.2.1-alpha.2 <0.2.2-0`
 
 ## 構成
 
 | 場所 | 中身 |
 | --- | --- |
-| `packages/protocol` | ハブ・プラグイン・CLI が共有する型（操作カタログ、権限判定、WebSocket のフレーム）。唯一の正本 |
-| `packages/dsh-remora` | DSH プラグイン（ホスト側と DSH Web 側）。GitHub Releases に tarball で配布 |
-| `packages/cli` | `remora` コマンド。Windows・macOS・Linux 向けの単体実行ファイルで配布予定 |
+| `packages/protocol` | ハブ・プラグイン・CLI が共有する取り決め（操作カタログ、入出力の型と入力スキーマ、権限判定、WebSocket のフレーム、ペアリング、パスキー確認）。唯一の正本 |
+| `packages/dsh-remora` | DSH プラグイン（ホスト側と DSH Web の設定タブ）。GitHub Releases に tarball で配布 |
+| `packages/cli` | `remora` コマンド。Windows・macOS・Linux 向けの単体実行ファイルで配布 |
 | `hub/` | Cloudflare Worker。Deploy to Cloudflare ボタンでこのフォルダだけを複製できるよう自己完結させている |
-| `assets/` | ロゴ（コバンザメと泡）。SVG と PNG |
+| `e2e/` | npm 版の DSH とローカルのハブを使った通しテスト |
+| `assets/` | ロゴ（コバンザメと泡） |
 
-## 入れ方（予定）
+設計は [docs/design.md](docs/design.md)（設計書）と [docs/architecture.md](docs/architecture.md)（要点）、開発は [docs/development.md](docs/development.md)、通しテストは [docs/e2e.md](docs/e2e.md) にあります。npm には公開しません。
 
-- **プラグイン**: [Releases](https://github.com/Aero123421/dsh-remora/releases) の `dsh-remora-<版>.tgz` の URL を、DSH Web の「Plugins → Add plugin」に貼ります。
-- **ハブ**: [hub/README.md](hub/README.md) の Deploy to Cloudflare ボタンから。
-- **CLI**: Releases の `install.sh`／`install.ps1` から。
+## リリースの確かめ方
 
-npm には公開しません。
+各リリースには、すべての配布物の `SHA256SUMS` と、GitHub Actions でビルドしたことを示すビルド来歴（attestation）が付いています。
 
-## 開発
-
-[docs/development.md](docs/development.md) を見てください。
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify dsh-remora-<版>.tgz --repo Aero123421/dsh-remora
+```
 
 ## ライセンス
 

@@ -2,7 +2,7 @@
 
 Remora のハブです。自分の Cloudflare アカウントの無料枠で動かし、DSH ホストと ChatGPT・Claude・CLI・HTTP API の間を中継します。会話の本文は保存しません。
 
-> まだ実機（DSH・ChatGPT・Claude）との結合テスト前の版です。
+> npm 版の DSH と手元の `wrangler dev` での通しテスト（ペアリング、タスク投入から完了、要対応への回答、緊急停止）は通っています。実際の ChatGPT・Claude からの接続と、Cloudflare への実デプロイはまだ確かめていません。
 
 ## できること
 

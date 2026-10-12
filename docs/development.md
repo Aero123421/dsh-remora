@@ -46,13 +46,15 @@ npm test
 - 外から答えられる質問は `tool-ask-user` が `timed` モードのものだけです。プランの確認と承認は外から答えられません。
 - `packages/protocol` や `assets/` のロゴを変えたら `pnpm vendor:sync` を実行し、`hub/` 側のコピーも一緒にコミットします。
 
-## 確認済みのこと（2026-10-12）
+## 確認済みのこと（2026-10-12、v0.1.0）
 
-- protocol・プラグイン・CLI・ハブのテストと型検査が通る
-- `wrangler dev` でハブを起動し、トップページ（CSP 付き）、アイコンの静的配信、`/mcp` の 501、ホスト用 WebSocket のチャレンジ送信・キープアライブの自動応答・プロトコル不一致での切断・未実装の認証での切断を確認
+- protocol・プラグイン・CLI の単体テスト（計 183 件）と型検査、ハブの結合テスト（workerd 上、16 件）が通る
+- 公式 DSH のソース（`upstream.json` の固定コミット）と組み合わせた互換テスト 9 件が通る（`pnpm --filter dsh-remora test:compat`）
+- npm 版の DSH 0.2.1-alpha.2 と `wrangler dev` のハブで、通しテスト 29 項目が `--strict` で通る（`pnpm e2e`、[docs/e2e.md](e2e.md)）: 設定タブの表示、緊急停止、パスキー登録、ペアリング、トークン発行、タスク投入から完了、要対応への回答、緊急停止の強制、別端末からの表示と制限
+- 作業に関わっていないレビュアーによるセキュリティレビューと、指摘の修正の再確認
 
-DSH 実機へのインストールと、Cloudflare への実デプロイはまだです。
+まだ確かめていないこと: 実際の ChatGPT・Claude からの接続（OAuth と MCP）、Cloudflare への実デプロイと無料枠の実使用量、macOS・Windows での CLI とキーチェーン、プロキシ環境での接続、タブからの質問モード切り替え。
 
-## リリース（予定）
+## リリース
 
-タグ `v<版>` で、プラグインの tarball と `SHA256SUMS`、CLI の単体実行ファイルとインストールスクリプトを GitHub Releases に置きます。プラグイン・CLI・ハブは同じ版番号にします。
+プラグイン・CLI・ハブを同じ版番号にそろえ（`pnpm check:version`）、タグ `v<版>` を push すると `.github/workflows/release.yml` が検査・通しテスト・ビルドを行い、プラグインの tarball、5 種類の CLI 実行ファイル、インストールスクリプト、まとめた `SHA256SUMS` とビルド来歴を GitHub Releases に置きます。
