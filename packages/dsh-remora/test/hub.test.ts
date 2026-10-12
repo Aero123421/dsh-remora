@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Grant, RequestFrame } from '@dsh-remora/protocol'
 import { apply } from '../src/index.ts'
+import { InstanceLock } from '../src/core/lock.ts'
 import { OperationError, type AdapterDeps, type CreateAdapter } from '../src/ops/types.ts'
 import type { RemoraSnapshot } from '../src/state.ts'
 import { FakeHub } from './fake-hub.ts'
@@ -300,6 +301,7 @@ test('approvals need the owner\'s passkey unless this PC allows them from MCP an
 
 test('host key rotation: the new key proves itself, survives a restart, and a refused new key falls back to the old one', async () => {
   const { dir, cleanup } = await tempDir()
+  const auditLock = new InstanceLock(dir, 'audit.lock')
   const hub = new FakeHub({ port: PORT + 9, owner: [makePasskey('es256').credential] })
   await hub.listen()
   let host = fakeHost()
@@ -311,11 +313,22 @@ test('host key rotation: the new key proves itself, survives a restart, and a re
     const first = hub.publicKey
     const connections = hub.connections
 
+    await core.auditEntries()
+    assert.equal(await auditLock.acquire(), true)
     const rotated = await hub.rotate()
     await until(() => hub.publicKey === rotated && core.internals.link.connected && hub.connections > connections, 5000, 'reconnected with the new key')
     assert.notEqual(rotated, first)
     assert.deepEqual(hub.keysUsed, ['next'])
     await until(() => core.internals.keys().previous === null && core.internals.pairing().paired?.publicKey === rotated, 3000, 'previous key dropped')
+    // Reconnecting does not mean the asynchronous audit writes have finished.
+    // Hold their actual mutation lock until the read has started waiting.
+    let readFinished = false
+    const pendingAudit = Promise.resolve(core.auditEntries()).then(entries => { readFinished = true; return entries })
+    await Promise.resolve()
+    assert.equal(readFinished, false, 'an audit read waits for pending writes')
+    await auditLock.release()
+    const entries = await pendingAudit
+    assert.ok(['rotate-key-proposed', 'rotate-key-committed', 'rotate-key-finished'].every(action => entries.some(entry => entry.action === action)))
     const audit = await rpc<{ entries: { action: string; outcome: string }[] }>(host.routes, 'audit')
     assert.ok(audit.ok && ['rotate-key-proposed', 'rotate-key-committed', 'rotate-key-finished'].every(action => audit.value.entries.some(entry => entry.action === action)))
 
@@ -338,6 +351,7 @@ test('host key rotation: the new key proves itself, survives a restart, and a re
     await until(() => core.internals.pairing().paired?.publicKey === rotated, 3000, 'the working key is pinned again')
     assert.notEqual(core.internals.pairing().paired?.publicKey, abandoned)
   } finally {
+    await auditLock.release()
     host.dispose()
     await core.dispose()
     await hub.close()
