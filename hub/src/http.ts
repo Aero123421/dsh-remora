@@ -4,7 +4,8 @@ import { HTTP_STATUS_FOR_ERROR, type HttpErrorBody, type RemoraError } from './v
 export const SECURITY_HEADERS: Readonly<Record<string, string>> = {
   'content-security-policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
   'x-content-type-options': 'nosniff',
-  'referrer-policy': 'no-referrer',
+  // `no-referrer` would make browsers send `Origin: null` on form posts, defeating the Origin check.
+  'referrer-policy': 'same-origin',
   'x-frame-options': 'DENY',
   'cache-control': 'no-store',
 }
@@ -60,8 +61,9 @@ export function clearCookie(name: string): string {
  */
 export function sameOrigin(request: Request, origin: string): boolean {
   const sent = request.headers.get('origin')
-  if (sent !== null) return sent === origin
   const site = request.headers.get('sec-fetch-site')
+  if (sent !== null && sent !== 'null') return sent === origin
+  if (sent === 'null') return site === 'same-origin'
   if (site !== null) return site === 'same-origin'
   const referer = request.headers.get('referer')
   if (referer !== null) {

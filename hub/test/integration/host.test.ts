@@ -8,6 +8,11 @@ const actor = { clientId: 'client-a', clientName: 'Test client' }
 const call = (op: string, params: Record<string, unknown>, extra: Partial<ExecuteCall> = {}): ExecuteCall => ({
   op, params, actor, scopes: ['dsh.read', 'dsh.content', 'dsh.tasks'], grant: { level: 'request' }, ...extra,
 })
+/** The TaskInfo of a successful execute(). */
+const taskOf = (outcome: { ok: boolean }): TaskInfo => {
+  if (!outcome.ok) throw new Error(`expected success: ${JSON.stringify(outcome)}`)
+  return (outcome as unknown as { result: TaskInfo }).result
+}
 const hostObject = (hostId: string) => env.HOST.get(env.HOST.idFromName(hostId))
 
 describe('pairing and the host connection', () => {
@@ -104,7 +109,7 @@ describe('pairing and the host connection', () => {
     const start = call('task.start', { target: { sessionId: 'sess-1' }, prompt: 'hello', idempotencyKey: 'key-1' })
     const first = await stub.execute(start)
     expect(first.ok).toBe(true)
-    const task = (first as { result: TaskInfo }).result
+    const task = taskOf(first)
     expect(task.taskId.startsWith(`${host.hostId}-`)).toBe(true)
     expect(task.state).toBe('accepted')
     expect(task.sessionId).toBe('sess-1')
@@ -114,17 +119,17 @@ describe('pairing and the host connection', () => {
 
     // Same client + key: the same task, nothing sent again.
     const again = await stub.execute(start)
-    expect((again as { result: TaskInfo }).result.taskId).toBe(task.taskId)
+    expect(taskOf(again).taskId).toBe(task.taskId)
     expect(answers.filter(frame => frame.op === 'task.start')).toHaveLength(1)
     // Another client with the same key gets its own task.
     const other = await stub.execute({ ...start, actor: { clientId: 'client-b', clientName: 'B' } })
-    expect((other as { result: TaskInfo }).result.taskId).not.toBe(task.taskId)
+    expect(taskOf(other).taskId).not.toBe(task.taskId)
 
     // State follows task events; task.wait returns early on completion and fetches the result.
     host.sendEvent([{ kind: 'task', taskId: task.taskId, state: 'running', sessionId: 'sess-1', updatedAt: Date.now() }])
     await eventually(async () => {
       const got = await stub.execute(call('task.get', { taskId: task.taskId }))
-      expect((got as { result: TaskInfo }).result.state).toBe('running')
+      expect(taskOf(got).state).toBe('running')
     })
     const started = Date.now()
     const waiting = stub.execute(call('task.wait', { taskId: task.taskId, timeoutMs: 10_000 }))
@@ -132,7 +137,7 @@ describe('pairing and the host connection', () => {
     host.sendEvent([{ kind: 'task', taskId: task.taskId, state: 'completed', updatedAt: Date.now() }])
     const waited = await waiting
     expect(Date.now() - started).toBeLessThan(5000)
-    const done = (waited as { result: TaskInfo }).result
+    const done = taskOf(waited)
     expect(done.state).toBe('completed')
     expect(done.result?.reply).toBe('done!')
 
@@ -144,7 +149,7 @@ describe('pairing and the host connection', () => {
     host.socket?.close(1000, 'bye')
     await eventually(async () => expect((await stub.summary()).online).toBe(false))
     const parked = await stub.execute(call('task.start', { target: { sessionId: 'sess-1' }, prompt: 'later', idempotencyKey: 'key-2' }))
-    const parkedTask = (parked as { result: TaskInfo }).result
+    const parkedTask = taskOf(parked)
     expect(parkedTask.state).toBe('parked')
     const offline = await stub.execute(call('sessions.list', {}))
     expect(!offline.ok && offline.error.code).toBe('host_offline')
@@ -158,7 +163,7 @@ describe('pairing and the host connection', () => {
     expect(redelivered.taskId).toBe(parkedTask.taskId)
     await eventually(async () => {
       const got = await stub.execute(call('task.get', { taskId: parkedTask.taskId }))
-      expect((got as { result: TaskInfo }).result.state).toBe('accepted')
+      expect(taskOf(got).state).toBe('accepted')
     })
 
     // Every call is in the host's audit log, without content.

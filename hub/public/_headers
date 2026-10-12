@@ -1,3 +1,7 @@
 /*
   X-Content-Type-Options: nosniff
-  Referrer-Policy: no-referrer
+  Referrer-Policy: same-origin
+/js/*
+  Cache-Control: no-cache
+/hub.css
+  Cache-Control: no-cache
