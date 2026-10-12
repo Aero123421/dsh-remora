@@ -14,6 +14,17 @@ test('operations are offered only when implemented and every service is present'
   assert.deepEqual(report.missing, [{ operation: 'command.run', services: ['commands'] }])
 })
 
-test('the scaffold advertises only status', () => {
-  assert.deepEqual(detectFeatures(() => true).available, ['status'])
+test('every P0 and P1 operation is implemented; P2 ones are not', () => {
+  const available = new Set(detectFeatures(() => true).available)
+  for (const spec of OPERATIONS) {
+    if (spec.id === 'hosts.list') continue
+    assert.equal(available.has(spec.id), spec.phase !== 'P2', spec.id)
+  }
+})
+
+test('a missing DSH service disables only the operations that need it', () => {
+  const report = detectFeatures(service => service !== 'goals')
+  assert.ok(!report.available.includes('goal.manage'))
+  assert.ok(report.available.includes('task.start'))
+  assert.deepEqual(report.missing, [{ operation: 'goal.manage', services: ['goals'] }])
 })
