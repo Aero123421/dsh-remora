@@ -32,6 +32,7 @@ import {
 } from './settings.ts'
 import { JsonDocument, remoraDataDir, resolveDshHome } from './storage.ts'
 import { FileTaskStore } from './tasks.ts'
+import { readQuestionModes, switchToTimed, type QuestionModeReport } from './question-mode.ts'
 import { checkForUpdate, downloadVerified, type UpdateCheck } from './updates.ts'
 
 type GetFetch = (input: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => Promise<Response>
@@ -108,6 +109,8 @@ export interface RemoraSnapshot {
   auditIntact: boolean
   update: UpdateCheck | null
   canInstallUpdate: boolean
+  /** `ask_user_question` mode per agent preset: only `timed` questions can be answered remotely. */
+  questionModes: QuestionModeReport
 }
 
 const ALIAS_PATTERN = /^[A-Za-z0-9._-]{1,64}$/
@@ -432,6 +435,20 @@ export class RemoraCore {
     this.audit({ kind: 'settings', action: accept ? 'owner-credentials-accepted' : 'owner-credentials-rejected', outcome: 'ok', local })
   }
 
+  /** Switch every legacy preset to timed questions so they can be answered from outside. */
+  async switchQuestionMode(local: boolean): Promise<string[]> {
+    this.requireLocal(local, ['question-mode'])
+    let changed: string[]
+    try {
+      changed = await switchToTimed(service => this.ctx.get(service))
+    } catch (error) {
+      this.audit({ kind: 'settings', action: 'question-mode:timed', outcome: 'error', local })
+      throw new RpcError('question-mode-failed', (error as Error).message.slice(0, 300))
+    }
+    this.audit({ kind: 'settings', action: 'question-mode:timed', outcome: 'ok', local })
+    return changed
+  }
+
   reconnect(): void {
     if (this.link.status.state === 'idle' || this.link.status.state === 'stopped') void this.startLink()
     else this.link.reconnect()
@@ -713,6 +730,7 @@ export class RemoraCore {
       auditIntact: this.auditLog.intact,
       update: this.updateCheck,
       canInstallUpdate: this.pluginManager() !== null,
+      questionModes: readQuestionModes(service => this.ctx.get(service)),
     }
   }
 

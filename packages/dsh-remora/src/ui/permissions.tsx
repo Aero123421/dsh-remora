@@ -4,6 +4,7 @@ import type { CopyKey } from '../locales.ts'
 import type { OperationRow } from '../state.ts'
 import { formatRemaining } from './api.ts'
 import type { SectionProps } from './connection.tsx'
+import { QuestionModeNotice } from './question-mode.tsx'
 
 type Level = 'view' | 'request' | 'full'
 const RANK: Record<Level, number> = { view: 0, request: 1, full: 2 }
@@ -70,6 +71,7 @@ export function PermissionsSection({ snapshot, t, run, busy }: SectionProps) {
       </div>
     </div> : null}
     {showSandboxWarning ? <p className="rmr-notice" style={{ marginTop: 12 }}>{t('perm.sandboxWarning')}</p> : null}
+    <QuestionModeNotice snapshot={snapshot} t={t} run={run} busy={busy} />
 
     {custom ? <div className="rmr-stack" style={{ marginTop: 12 }}>
       <div className="rmr-section-head"><h3>{t('perm.ops')}</h3><span className="rmr-muted">{t('perm.opsHint')}</span></div>

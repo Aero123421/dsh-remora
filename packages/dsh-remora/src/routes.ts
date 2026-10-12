@@ -133,6 +133,10 @@ export function createMethods(core: RemoraCore): Record<string, Method> {
       await core.resolveCredentialChange(bool(payload, 'accept'), local)
       return core.snapshot(local)
     },
+    'question-mode': async (_, { local }) => {
+      await core.switchQuestionMode(local)
+      return core.snapshot(local)
+    },
     reconnect: (_, { local }) => {
       core.reconnect()
       return core.snapshot(local)

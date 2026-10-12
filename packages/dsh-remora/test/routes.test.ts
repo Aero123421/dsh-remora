@@ -142,3 +142,39 @@ test('full access expires into 依頼できる after 24 hours unless extended', 
     assert.equal(p.core.internals.settings().ceiling.fullAccessExpiresAt, undefined)
   } finally { await p.close() }
 })
+
+test('question mode: read per preset and switch legacy presets to timed from this PC only', async () => {
+  const entries = [
+    { options: { id: 'preset-standard', name: '@deepseek-ai/dsh-agent-preset', config: { id: 'standard', plugins: [{ id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs' }, { id: 'tool-ask-user', name: '@deepseek-ai/dsh-tool-ask-user' }] } } },
+    { options: { id: 'preset-ptc', name: '@deepseek-ai/dsh-agent-preset', config: { id: 'ptc', plugins: [{ id: 'tool-ask-user', name: '@deepseek-ai/dsh-tool-ask-user', config: { mode: 'timed', timeout: 60 } }] } } },
+    { options: { id: 'preset-minimal', name: '@deepseek-ai/dsh-agent-preset', config: { id: 'minimal', plugins: [] } } },
+    { options: { id: 'storage', name: '@deepseek-ai/dsh-storage', config: {} } },
+  ]
+  const edits: string[] = []
+  const configEditor = {
+    entries: () => entries,
+    edit: async (entry: (typeof entries)[number], change: (current: Record<string, unknown>, inherited: Record<string, unknown>) => Record<string, unknown>) => {
+      edits.push(entry.options.id)
+      entry.options.config = change(structuredClone(entry.options.config) as never, {}) as never
+    },
+  }
+  const p = await plugin({ configEditor })
+  try {
+    const before = await rpc<RemoraSnapshot>(p.routes, 'state')
+    assert.ok(before.ok)
+    assert.deepEqual(before.value.questionModes, { editable: true, presets: [
+      { presetId: 'standard', entryId: 'preset-standard', mode: 'legacy' },
+      { presetId: 'ptc', entryId: 'preset-ptc', mode: 'timed' },
+      { presetId: 'minimal', entryId: 'preset-minimal', mode: 'absent' },
+    ] })
+    const remoteSwitch = await rpc(p.routes, 'question-mode', {}, remote)
+    assert.equal(remoteSwitch.ok ? null : remoteSwitch.error.code, 'remora/local-only')
+    const after = await rpc<RemoraSnapshot>(p.routes, 'question-mode', {})
+    assert.ok(after.ok)
+    assert.deepEqual(edits, ['preset-standard'])
+    assert.deepEqual(after.value.questionModes.presets.map(preset => preset.mode), ['timed', 'timed', 'absent'])
+    const standard = entries[0]!.options.config as { plugins: { id: string; config?: unknown }[] }
+    assert.deepEqual(standard.plugins[0], { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs' })
+    assert.deepEqual(standard.plugins[1]?.config, { mode: 'timed' })
+  } finally { await p.close() }
+})

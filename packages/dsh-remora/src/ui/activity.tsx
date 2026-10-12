@@ -4,6 +4,7 @@ import type { CopyKey } from '../locales.ts'
 import type { AuditEntry, ClientSummary, RemoraSnapshot, UpdateCheck } from '../state.ts'
 import { call, errorText, formatTime, type ClientContext, type Translate } from './api.ts'
 import type { SectionProps } from './connection.tsx'
+import { QuestionModeTags } from './question-mode.tsx'
 
 const OUTCOME_TONE = { ok: 'success', error: 'warning', denied: 'danger' } as const
 
@@ -86,6 +87,9 @@ export function CompatSection({ snapshot, t, ctx, busy }: Pick<SectionProps, 'sn
         {snapshot.features.missing.map(item => <span key={item.operation} className="rmr-faint"><span className="rmr-mono">{item.operation}</span> ({item.services.join(', ')})</span>)}
       </div>
     </div> : null}
+    <div className="rmr-row">
+      <div className="rmr-row-text"><span>{t('compat.questionMode')}</span><QuestionModeTags snapshot={snapshot} t={t} /></div>
+    </div>
     <div className="rmr-row">
       <div className="rmr-row-text"><span>{t('compat.dataDir')}</span><span className="rmr-faint rmr-mono">{snapshot.dataDir}</span></div>
     </div>
