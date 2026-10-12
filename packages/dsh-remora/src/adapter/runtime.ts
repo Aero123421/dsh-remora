@@ -16,6 +16,8 @@ import { SERVICES } from './dsh-types.ts'
 import { denied, fromDsh, notFound, unavailable } from './errors.ts'
 
 export const CONTENT_SCOPE = 'dsh.content'
+/** Where the owner trusts a cloned workspace. */
+export const UNTRUSTED_FIX = 'dsh:settings/remora#scope'
 const TOMBSTONE_MS = 24 * 60 * 60 * 1000
 
 export interface SessionRow {
@@ -60,6 +62,26 @@ export class Runtime {
     this.ctx = ctx as HostContext & EventfulContext
     this.deps = deps
     this.creations = deps.workspaceCreations ?? memoryCreations()
+  }
+
+  /**
+   * Refuse anything that would start or continue agent turns in a workspace
+   * that is still cloning, failed to clone, or was cloned and is not trusted
+   * yet. DSH lets the model load any skill a turn names in prose, so the only
+   * way to keep a cloned repository's skills off is to not drive turns there.
+   * Called by every acting path: task.start / steer / resubmit, goal.manage
+   * set / resume, command.run, and attention.respond.
+   */
+  assertCanDriveTurns(workspaceId: string | null): void {
+    if (workspaceId === null) return
+    const state = this.workspaceState(workspaceId)
+    if (state === 'cloning') throw new OperationError('conflict', 'the workspace is still being cloned; try again when workspaces.list shows it ready')
+    if (state === 'clone-failed') throw new OperationError('conflict', 'cloning this workspace failed; create it again')
+    if (this.deps.scope.isUntrustedWorkspace(workspaceId)) {
+      throw new OperationError('denied', 'this workspace was cloned through Remora and is not trusted yet; trust it on the DSH Remora tab (Scope → Untrusted workspaces) before driving the agent there remotely', {
+        denial: { layer: 'dsh', reason: 'switched-off' }, fix: UNTRUSTED_FIX,
+      })
+    }
   }
 
   /** Clone state of a workspace Remora created; undefined for every other workspace (ready). */

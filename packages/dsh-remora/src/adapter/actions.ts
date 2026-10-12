@@ -50,9 +50,15 @@ export function catalogChoices(catalog: DshModelCatalog, provider?: string): Mod
 }
 
 export function createActions(rt: Runtime) {
-  async function sessionFor(sessionId: string, context: OperationContext): Promise<SessionRow> {
+  /**
+   * The session an acting operation targets. `drives` marks operations that can
+   * start or continue agent turns; those are refused in cloning or untrusted
+   * workspaces (see Runtime.assertCanDriveTurns).
+   */
+  async function sessionFor(sessionId: string, context: OperationContext, drives: boolean): Promise<SessionRow> {
     const row = await rt.row(sessionId, context.signal)
     promptable(row)
+    if (drives) rt.assertCanDriveTurns(row.workspace?.id ?? null)
     return row
   }
 
@@ -63,7 +69,8 @@ export function createActions(rt: Runtime) {
   }
 
   async function manageGoal(params: Params<'goal.manage'>, context: OperationContext): Promise<Result<'goal.manage'>> {
-    const row = params.action === 'get' ? await rt.row(params.sessionId, context.signal) : await sessionFor(params.sessionId, context)
+    // set / resume start goal rounds (agent turns); pause / clear only stop them.
+    const row = params.action === 'get' ? await rt.row(params.sessionId, context.signal) : await sessionFor(params.sessionId, context, params.action === 'set' || params.action === 'resume')
     if (params.action === 'get') return goalState(row.sessionId, context)
     const goals = rt.get<DshGoals>(SERVICES.goals)
     if (!goals) throw unavailable('DSH goals are not available')
@@ -103,6 +110,9 @@ export function createActions(rt: Runtime) {
 
     async 'attention.respond'(params: Params<'attention.respond'>, context: OperationContext): Promise<Result<'attention.respond'>> {
       const row = await rt.row(params.sessionId, context.signal)
+      // An answer (or a goal resume) continues the agent's turn, so it is refused in
+      // untrusted or cloning workspaces like a prompt; the owner answers on DSH Web.
+      rt.assertCanDriveTurns(row.workspace?.id ?? null)
       const [events, values] = await Promise.all([rt.events(row.sessionId, context.signal), rt.projections(row.sessionId, context.signal)])
       const item = computeAttention(row.sessionId, { events, values, loginError: rt.loginErrors.get(row.sessionId) ?? null })
         .find(candidate => candidate.attentionId === params.attentionId)
@@ -165,7 +175,8 @@ export function createActions(rt: Runtime) {
     },
 
     async 'model.select'(params: Params<'model.select'>, context: OperationContext): Promise<Result<'model.select'>> {
-      const row = await sessionFor(params.sessionId, context)
+      // Selecting a model starts no turn.
+      const row = await sessionFor(params.sessionId, context, false)
       let catalog: DshModelCatalog
       try {
         catalog = await rt.sessions.modelCatalog()
@@ -193,7 +204,8 @@ export function createActions(rt: Runtime) {
       const command = params.command.trim()
       if (!/^\/[a-z0-9][a-z0-9-]*$/.test(command)) throw invalid('command must look like /name')
       if (!rt.deps.scope.isAllowedCommand(command)) throw denied(`${command} is not allowed for remote use`)
-      const row = await sessionFor(params.sessionId, context)
+      // Any slash command may start or continue turns (e.g. /goal, /compact).
+      const row = await sessionFor(params.sessionId, context, true)
       const commands = rt.get<DshCommands>(SERVICES.commands)
       if (!commands) throw unavailable('DSH commands are not available')
       const agent = await rt.agent(row.sessionId)
