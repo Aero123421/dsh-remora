@@ -6,6 +6,54 @@
 // and talks to the plugin's authenticated routes (/api/remora/*).
 import { dsh as DSH, remora as REMORA } from './lib/selectors.mjs'
 import { firstPresent, instrument, mustBePresent, shot } from './lib/browser.mjs'
+import assert from 'node:assert/strict'
+
+/** Check the rendered selection surface, including constrained grid tracks. */
+export async function checkSettingsLayout(page, section) {
+  const viewport = page.viewportSize()
+  try {
+    for (const width of [1280, 600]) {
+      await page.setViewportSize({ width, height: viewport.height })
+      for (const value of ['connection', 'permissions', 'scope', 'activity', 'compat']) {
+        const tab = section.locator(`#rmr-tabs-${value}`)
+        await tab.click()
+        assert.equal(await tab.getAttribute('aria-selected'), 'true')
+        await page.waitForFunction(() => {
+          const indicator = document.querySelector('.rmr-tabs > [aria-hidden="true"]')
+          return !indicator || indicator.getAnimations().every(animation => animation.playState !== 'running')
+        })
+        const indicator = section.locator('.rmr-tabs > [aria-hidden="true"]')
+        const surface = await indicator.isVisible() ? indicator : tab
+        const [selectedBox, surfaceBox] = await Promise.all([tab.boundingBox(), surface.boundingBox()])
+        assert.ok(selectedBox && surfaceBox)
+        for (const dimension of ['x', 'y', 'width', 'height']) {
+          assert.ok(Math.abs(selectedBox[dimension] - surfaceBox[dimension]) < 1, `${value} selection ${dimension} is misaligned at ${width}px`)
+        }
+        const background = await surface.evaluate(element => getComputedStyle(element).backgroundColor)
+        assert.ok(background !== 'transparent' && background !== 'rgba(0, 0, 0, 0)', 'the selected tab has a visible background')
+        const panel = section.locator(`#rmr-tabs-${value}-panel`)
+        await panel.waitFor({ state: 'visible' })
+        assert.equal(await panel.getAttribute('aria-labelledby'), `rmr-tabs-${value}`)
+        if (value === 'permissions') {
+          const grid = await section.locator('.rmr-levels').evaluate(element => ({
+            rows: new Set([...element.children].map(child => child.getBoundingClientRect().y)).size,
+            columns: new Set([...element.children].map(child => child.getBoundingClientRect().x)).size,
+            overflow: element.scrollWidth - element.clientWidth,
+          }))
+          assert.deepEqual(grid, { rows: width === 1280 ? 2 : 4, columns: width === 1280 ? 2 : 1, overflow: 0 })
+        }
+      }
+      await section.locator('#rmr-tabs-permissions').click()
+      await section.locator('#rmr-tabs-permissions').press('ArrowRight')
+      await section.locator('#rmr-tabs-scope-panel').waitFor({ state: 'visible' })
+      assert.equal(await section.locator('#rmr-tabs-scope').evaluate(element => element === document.activeElement), true)
+    }
+  } finally {
+    await page.setViewportSize(viewport)
+    await section.locator('#rmr-tabs-connection').click()
+  }
+  return 'Five tabs and keyboard navigation: selection matches its panel at 1280px and 600px; permission cards use two columns or one without overflow'
+}
 
 /** Open DSH Web in a fresh English context and dismiss the first-use notice. */
 export async function openDsh({ browser, web, artifacts, log, label = 'dsh', trace = true }) {
@@ -114,6 +162,12 @@ export async function browserSteps(r, { browser, web, artifacts, plugin, prefix 
   })
 
   if (minimal) return out
+
+  await r.step(`${prefix}.settings-layout`, 'The selected tab matches its panel and the permission grid fits the settings column', { needs: [`${prefix}.remora-tab`], onFailure: failShot('settings-layout') }, async () => {
+    const { page } = out.session
+    const { section } = await openRemoraTab(page)
+    return checkSettingsLayout(page, section)
+  })
 
   await r.step(`${prefix}.kill-switch`, local
     ? 'The kill switch turns on through the authenticated route, survives a reload, and turns off'

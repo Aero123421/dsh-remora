@@ -89,6 +89,7 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 
 | ステップ | 示すこと |
 | --- | --- |
+| `browser.settings-layout` / `remote.settings-layout` | 幅1280pxと600pxで全タブとキーボード操作を確認。選択枠と選択したタブの位置・幅、表示パネルが一致し、権限カードが2列または1列で収まる |
 | `setup.plugin-tarball` | tarball が作られ、`SHA256SUMS` と一致する |
 | `setup.dsh-install` | 指定の版の DSH が npm から入り、`dsh --version` が一致する |
 | `setup.plugin-install` | `dsh plugin add` で入り、プロファイルの bundles と合成後の設定に `dsh-remora` の行がある（peer の範囲外なら DSH がここで拒否する） |
