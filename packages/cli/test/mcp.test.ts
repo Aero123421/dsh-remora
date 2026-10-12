@@ -52,18 +52,57 @@ test('mcp bridge answers requests with JSON-RPC errors when the hub is unreachab
   assert.match(reply.error.message, /接続できません/)
 })
 
-test('mcp probe lists tools across pages', async () => {
+test('mcp probe uses 2026-07-28 first and lists tools across pages', async () => {
   const hub = await new FakeHub(18111, { mcpMode: 'sse' }).start()
   try {
     const t = await testCtx()
     await seedLogin(t, hub)
     assert.equal(await main(['mcp', 'probe'], t.ctx), 0, t.stderr())
-    assert.match(t.stdout(), /remora-hub/)
+    assert.match(t.stdout(), /remora-hub 0\.0\.2（プロトコル 2026-07-28）/)
+    assert.ok(!hub.mcpCalls.some(c => (c.body as { method?: string }).method === 'initialize'), 'no handshake in the modern era')
+    const list = hub.mcpCalls.find(c => (c.body as { method?: string }).method === 'tools/list')
+    assert.equal(list?.headers['mcp-method'], 'tools/list')
+    assert.equal(list?.headers['mcp-protocol-version'], '2026-07-28')
     assert.match(t.stdout(), /dsh_status\s+読み取り/)
     assert.match(t.stdout(), /dsh_task_start\s+書き込み/)
     const j = await testCtx({ env: t.ctx.env })
     assert.equal(await main(['mcp', 'probe', '--json'], j.ctx), 0)
     assert.equal(JSON.parse(j.stdout()).tools.length, 2)
+  } finally {
+    await hub.stop()
+  }
+})
+
+test('mcp probe falls back to 2025-06-18 when the hub refuses 2026-07-28', async () => {
+  const hub = await new FakeHub(18115, { legacyOnly: true }).start()
+  try {
+    const t = await testCtx()
+    await seedLogin(t, hub)
+    assert.equal(await main(['mcp', 'probe', '--json'], t.ctx), 0, t.stderr())
+    const result = JSON.parse(t.stdout())
+    assert.equal(result.protocolVersion, '2025-06-18')
+    assert.equal(result.tools.length, 2)
+  } finally {
+    await hub.stop()
+  }
+})
+
+test('mcp bridge adds the 2026-07-28 headers and passes JSON-RPC errors through', async () => {
+  const hub = await new FakeHub(18116).start()
+  try {
+    const meta = { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' }
+    const t = await testCtx({
+      stdinText: lines(
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'dsh_status', arguments: {}, _meta: meta } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/list', params: { _meta: { 'io.modelcontextprotocol/protocolVersion': '2099-01-01' } } },
+      ),
+    })
+    await seedLogin(t, hub)
+    assert.equal(await main(['mcp'], t.ctx), 0, t.stderr())
+    const replies = t.out.map(line => JSON.parse(line))
+    assert.ok(replies.find(r => r.id === 1)?.result, 'Mcp-Name / Mcp-Method / MCP-Protocol-Version were derived from the body')
+    assert.equal(replies.find(r => r.id === 2)?.error?.code, -32022, "the hub's own JSON-RPC error reaches the client")
+    assert.equal(hub.mcpCalls[0]?.headers['mcp-name'], 'dsh_status')
   } finally {
     await hub.stop()
   }

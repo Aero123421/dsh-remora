@@ -17,7 +17,7 @@ irm https://raw.githubusercontent.com/Aero123421/dsh-remora/main/scripts/install
 
 | コマンド | 内容 |
 | --- | --- |
-| `login <ハブ URL> [--device] [--scope …]` | OAuth 2.1 ＋ PKCE（S256）、ループバック `http://127.0.0.1:<任意のポート>/callback`。`--device` は RFC 8628 |
+| `login <ハブ URL> [--device] [--content] [--scope …]` | OAuth 2.1 ＋ PKCE（S256）、ループバック `http://127.0.0.1:<任意のポート>/callback`。`--device` は RFC 8628 |
 | `logout` | トークンをハブで取り消し（RFC 7009、メタデータに `revocation_endpoint` がある場合）、保存分を削除 |
 | `hosts` | ホスト一覧 |
 | `sessions ls｜show｜read` | `read --depth summary｜turns｜page`、`--cursor`、`--all` |
@@ -30,7 +30,7 @@ irm https://raw.githubusercontent.com/Aero123421/dsh-remora/main/scripts/install
 | `mcp`、`mcp probe` | stdio MCP ブリッジと疎通確認 |
 | `self-update [--check] [--version]` | GitHub Releases から更新 |
 
-`audit verify`、`hub export`、`hosts rotate-key`、`open` はハブ側のエンドポイントが契約にまだ無いため「まだ使えません」と表示します（終了コード 2）。
+`open <セッション ID>` はハブのセッション画面（`/hosts/<ホスト>/sessions/<セッション>`）を開き、URL を表示します。`audit verify`、`hub export`、`hosts rotate-key` はハブ側のエンドポイントが契約にまだ無いため「まだ使えません」と表示します（終了コード 2）。
 
 全コマンドに `--json` があります。エラー時の `--json` は標準出力に `{"error":{"code","message","hint?","fix?","exitCode"}}` を出します。人向けの出力では、DSH から来た文字列の制御文字（エスケープシーケンス、bidi 制御）を取り除きます。
 
@@ -40,7 +40,7 @@ irm https://raw.githubusercontent.com/Aero123421/dsh-remora/main/scripts/install
 claude mcp add remora -- remora mcp        # Claude Code
 ```
 
-`remora mcp` は標準入力の JSON-RPC を 1 行ずつハブの `/mcp`（ステートレスな Streamable HTTP）へ CLI のトークン付きで POST し、JSON でも SSE でも応答を 1 行ずつ標準出力へ返します。`initialize` で決まったプロトコル版は以降 `MCP-Protocol-Version` ヘッダーで送ります。401 なら一度だけトークンを更新して再送し、ハブに届かないときは要求ごとに JSON-RPC エラーを返します。
+`remora mcp` は標準入力の JSON-RPC を 1 行ずつハブの `/mcp`（ステートレスな Streamable HTTP）へ CLI のトークン付きで POST し、JSON でも SSE でも応答を 1 行ずつ標準出力へ返します。`initialize` で決まったプロトコル版は以降 `MCP-Protocol-Version` ヘッダーで送ります。2026-07-28 の要求（`_meta` に版がある）には `MCP-Protocol-Version`／`Mcp-Method`／`Mcp-Name` ヘッダーを本文から付けます。`mcp probe` は 2026-07-28（`server/discover`）を先に試し、断られたら 2025-06-18 の `initialize` に戻ります。401 なら一度だけトークンを更新して再送し、ハブに届かないときは要求ごとに JSON-RPC エラーを返します。
 
 ## 終了コード
 
@@ -68,7 +68,9 @@ claude mcp add remora -- remora mcp        # Claude Code
   - どれも使えなければ設定フォルダーの `tokens-*.json`（0600）に保存し、最初の 1 回だけ警告。保存後は読み戻して確認する
   - `REMORA_TOKEN_STORE=file` でファイルを明示
 - `REMORA_TOKEN`: 個人トークンをそのまま使う（更新しない）。`REMORA_HUB_URL`: 保存したハブの代わりに使う。
-- ハブが RFC 9728 の保護リソースメタデータ（`/.well-known/oauth-protected-resource/api/v1` と `/mcp`）を出していれば、`resource` を付けて API 用と MCP 用のトークンを分けて取得します。出していなければ 1 つのトークンを共用します。
+- スコープ: 既定は `dsh.read dsh.tasks offline_access`（一覧、タスクの投入と待機、そのタスク自身の最終返答まで）。`sessions read`、`patch`、要対応の質問の全文には `dsh.content` が要るので `login --content` を付けます。会話や差分には秘密が紛れうるため既定では求めません。足りないときは送信前に終了コード 5 と案内を出します。
+- API 用と MCP 用のトークンは audience を分けて取得します（RFC 8707）。`resource` の値はハブの RFC 9728 メタデータ（`/.well-known/oauth-protected-resource/api/v1/ops` と `/mcp`）を正とし、取れなければ契約の `resourceIndicators()`。取り消しはメタデータの `revocation_endpoint`、無ければ `ENDPOINTS.revocation`。
+- アセット名は契約の `RELEASE_ASSETS`（`self-update`、`install.sh`、`install.ps1` で共通）。
 - プロキシの内側では Node の `NODE_USE_ENV_PROXY=1` と `HTTPS_PROXY` を設定してください（Node 22.21 以降）。
 
 ## 単体実行ファイル（Node SEA）

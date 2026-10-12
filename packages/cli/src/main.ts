@@ -11,7 +11,7 @@ import { CliError, EXIT } from './errors.ts'
 import { login, logout } from './commands/auth.ts'
 import { attention, hosts, sessions, workspaces } from './commands/read.ts'
 import { answer, patch, run, tasks } from './commands/tasks.ts'
-import { doctor, mcp, NOT_YET, selfUpdateCommand } from './commands/misc.ts'
+import { doctor, mcp, NOT_YET, open, selfUpdateCommand } from './commands/misc.ts'
 import { cleanupOldBinary } from './selfupdate.ts'
 import { CLI_VERSION } from './version.ts'
 
@@ -21,7 +21,7 @@ export type { Ctx } from './ctx.ts'
 export type Io = Ctx
 
 export const COMMANDS: readonly CommandDef[] = [
-  login, logout, hosts, sessions, tasks, run, attention, answer, patch, workspaces, doctor, mcp, selfUpdateCommand, ...NOT_YET,
+  login, logout, hosts, sessions, tasks, run, attention, answer, patch, workspaces, open, doctor, mcp, selfUpdateCommand, ...NOT_YET,
 ]
 
 const EXIT_CODE_HELP = [

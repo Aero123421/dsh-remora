@@ -164,6 +164,55 @@ export const selfUpdateCommand: CommandDef = {
   },
 }
 
+/** The hub's owner page for one session (hub/src/ui/routes.ts). */
+export function sessionPageUrl(hubUrl: string, hostId: string, sessionId: string): string {
+  return `${hubUrl}/hosts/${encodeURIComponent(hostId)}/sessions/${encodeURIComponent(sessionId)}`
+}
+
+export const open: CommandDef = {
+  name: 'open',
+  summary: 'セッションをハブの画面で開く',
+  usage: [
+    'remora open <セッション ID> [--host <ID>] [--no-browser]',
+    '',
+    'ハブのセッション画面（/hosts/<ホスト>/sessions/<セッション>）をブラウザで開き、URL を表示します。',
+    'ホストが複数あるときは、--host が無ければセッションを持つホストを探します。開くにはハブへのパスキーでのサインインが必要です。',
+  ],
+  flags: { host: 'string', 'no-browser': 'bool' },
+  async run(cmd) {
+    const { ctx, args, json } = cmd
+    const sessionId = args.positionals[0]
+    if (!sessionId) throw usageError('セッション ID を指定してください: remora open <セッション ID>')
+    const hub = await hubOf(cmd)
+    let hostId = str(args, 'host')
+    if (!hostId) {
+      const { hosts } = await hub.op('hosts.list', {})
+      if (hosts.length === 0) throw new CliError('ペアリング済みのホストがありません。', EXIT.notFound, { code: 'not_found' })
+      if (hosts.length === 1) hostId = (hosts[0] as HostSummary).hostId
+      else {
+        for (const host of [...hosts].sort((a, b) => Number(b.online) - Number(a.online))) {
+          try {
+            await hub.op('session.get', { hostId: host.hostId, sessionId })
+            hostId = host.hostId
+            break
+          } catch (error) {
+            if (!(error instanceof CliError) || error.exitCode === EXIT.auth) throw error
+          }
+        }
+        if (!hostId) throw new CliError(`セッション ${sessionId} を持つホストが見つかりません。--host で指定してください。`, EXIT.notFound, { code: 'not_found' })
+      }
+    }
+    const url = sessionPageUrl(hub.url, hostId, sessionId)
+    const opened = !bool(args, 'no-browser') && !ctx.env.REMORA_NO_BROWSER && await ctx.openBrowser(url).catch(() => false)
+    if (json) printJson(ctx, { url, hostId, sessionId, opened })
+    else {
+      ctx.out(url)
+      ctx.err(opened ? 'ブラウザで開きました。' : 'ブラウザを開けませんでした。上の URL を開いてください。')
+    }
+    return EXIT.ok
+  },
+}
+
 /** Commands whose hub endpoints are not in the contract yet. */
 function unavailable(name: string, summary: string, label: (positionals: string[]) => string): CommandDef {
   return {
@@ -179,5 +228,4 @@ export const NOT_YET: readonly CommandDef[] = [
   unavailable('audit', '監査ログの改ざん検査（audit verify）', p => `remora audit ${p[0] ?? 'verify'}`),
   unavailable('hub', 'ハブ設定の書き出し（hub export）', p => `remora hub ${p[0] ?? 'export'}`),
   unavailable('rotate-key', 'ホスト鍵の更新', () => 'remora rotate-key'),
-  unavailable('open', 'セッションを DSH Web で開く', () => 'remora open'),
 ]

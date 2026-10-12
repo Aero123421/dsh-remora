@@ -62,8 +62,12 @@ export async function fakeBrowser(url: string): Promise<boolean> {
 type OpHandler = (params: Record<string, unknown>, call: number) => { status?: number; body: unknown } | unknown
 
 export interface FakeHubOptions {
-  /** Serve RFC 9728 metadata for /api/v1 and /mcp. */
-  resources?: boolean
+  /** Serve RFC 9728 metadata for /api/v1/ops and /mcp, naming these resources. */
+  resources?: { api: string; mcp: string }
+  /** Leave revocation_endpoint out of the metadata. */
+  noRevocationMeta?: boolean
+  /** Refuse MCP 2026-07-28 requests like a hub that only speaks the legacy revisions. */
+  legacyOnly?: boolean
   accessTtl?: number
   issuerOverride?: string
   mcpMode?: 'json' | 'sse'
@@ -141,14 +145,16 @@ export class FakeHub {
         authorization_endpoint: `${this.url}/oauth/authorize`,
         token_endpoint: `${this.url}/oauth/token`,
         device_authorization_endpoint: `${this.url}/oauth/device_authorization`,
-        revocation_endpoint: `${this.url}/oauth/revoke`,
+        ...(this.options.noRevocationMeta ? {} : { revocation_endpoint: `${this.url}/oauth/revoke` }),
         code_challenge_methods_supported: ['S256'],
       })
       return
     }
     if (url.pathname.startsWith('/.well-known/oauth-protected-resource/')) {
       const path = url.pathname.slice('/.well-known/oauth-protected-resource'.length)
-      if (this.options.resources && (path === '/api/v1' || path === '/mcp')) { this.json(res, 200, { resource: this.url + path }); return }
+      const r = this.options.resources
+      if (r && path === '/api/v1/ops') { this.json(res, 200, { resource: r.api }); return }
+      if (r && path === '/mcp') { this.json(res, 200, { resource: r.mcp }); return }
       this.json(res, 404, {}); return
     }
     if (url.pathname === '/oauth/authorize') {
@@ -227,8 +233,17 @@ export class FakeHub {
       this.mcpCalls.push({ body, headers: req.headers })
       if (!auth || !this.validAccess.has(auth)) { this.json(res, 401, { error: 'invalid_token' }); return }
       if (body.id === undefined) { res.writeHead(202); res.end(); return }
+      const params = (body.params ?? {}) as Record<string, unknown>
+      const declared = ((params._meta ?? {}) as Record<string, unknown>)['io.modelcontextprotocol/protocolVersion']
+      if (declared !== undefined) {
+        const bad = (code: number, message: string) => { this.json(res, 400, { jsonrpc: '2.0', id: body.id, error: { code, message } }) }
+        if (this.options.legacyOnly || declared !== '2026-07-28') { bad(-32022, 'Unsupported protocol version'); return }
+        if (req.headers['mcp-protocol-version'] !== declared || req.headers['mcp-method'] !== body.method) { bad(-32020, 'Header mismatch'); return }
+        if (body.method === 'tools/call' && req.headers['mcp-name'] !== params.name) { bad(-32020, 'Header mismatch: Mcp-Name'); return }
+      }
       let result: unknown
-      if (body.method === 'initialize') result = { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'remora-hub', version: '0.0.1' } }
+      if (body.method === 'server/discover' && declared !== undefined) result = { resultType: 'complete', supportedVersions: ['2026-07-28', '2025-06-18'], capabilities: { tools: {} }, _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'remora-hub', version: '0.0.2' } } }
+      else if (body.method === 'initialize') result = { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'remora-hub', version: '0.0.1' } }
       else if (body.method === 'tools/list') {
         const cursor = (body.params as { cursor?: string } | undefined)?.cursor
         result = cursor
@@ -256,7 +271,7 @@ export class FakeHub {
 }
 
 /** Log a CLI into a fake hub without a browser by seeding the file token store. */
-export async function seedLogin(t: TestCtx, hub: FakeHub, opts: { expiresIn?: number } = {}): Promise<void> {
+export async function seedLogin(t: TestCtx, hub: FakeHub, opts: { expiresIn?: number; scope?: string } = {}): Promise<void> {
   const { saveProfile } = await import('../src/config.ts')
   const { openTokenStore } = await import('../src/tokens.ts')
   const issued = hub.issue()
@@ -264,7 +279,7 @@ export async function seedLogin(t: TestCtx, hub: FakeHub, opts: { expiresIn?: nu
   await store.save({
     hubUrl: hub.url,
     clientId: 'remora-cli',
-    scope: issued.scope,
+    scope: opts.scope ?? issued.scope,
     issuer: hub.url,
     tokenEndpoint: `${hub.url}/oauth/token`,
     revocationEndpoint: `${hub.url}/oauth/revoke`,

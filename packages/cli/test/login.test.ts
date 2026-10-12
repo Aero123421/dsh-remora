@@ -15,9 +15,9 @@ test('PKCE login through a simulated browser, then logout revokes', async () => 
     const auth = hub.authorizeRequests[0]
     assert.ok(auth)
     assert.equal(auth.get('code_challenge_method'), 'S256')
-    assert.equal(auth.get('scope'), 'dsh.read dsh.content dsh.tasks offline_access')
+    assert.equal(auth.get('scope'), 'dsh.read dsh.tasks offline_access', 'dsh.content is opt-in')
     assert.match(auth.get('redirect_uri') ?? '', /^http:\/\/127\.0\.0\.1:\d+\/callback$/)
-    assert.equal(auth.getAll('resource').length, 0, 'no resource indicators when the hub advertises none')
+    assert.deepEqual(auth.getAll('resource'), [`${hub.url}/api/v1/ops`, `${hub.url}/mcp`], 'contract resource indicators are the fallback')
     assert.match(t.stderr(), /oauth\/authorize/, 'the URL is always printed')
     assert.match(t.stdout(), /ログインしました/)
     assert.ok(!t.stdout().includes('at-'), 'tokens are never printed')
@@ -31,7 +31,7 @@ test('PKCE login through a simulated browser, then logout revokes', async () => 
     hub.ops['hosts.list'] = () => ({ hosts: [] })
     const h = await testCtx({ env: t.ctx.env })
     assert.equal(await main(['hosts'], h.ctx), 0, h.stderr())
-    assert.equal(hub.calls[0]?.auth, tokens.access.default?.token)
+    assert.equal(hub.calls[0]?.auth, tokens.access.api?.token)
 
     const out = await testCtx({ env: t.ctx.env })
     assert.equal(await main(['logout'], out.ctx), 0)
@@ -42,21 +42,22 @@ test('PKCE login through a simulated browser, then logout revokes', async () => 
   }
 })
 
-test('login requests per-resource tokens when the hub advertises RFC 9728 resources', async () => {
-  const hub = await new FakeHub(18101, { resources: true }).start()
+test('resource indicators from RFC 9728 metadata win over the contract defaults', async () => {
+  const resources = { api: 'https://aud.example/api', mcp: 'https://aud.example/mcp' }
+  const hub = await new FakeHub(18101, { resources }).start()
   try {
     const t = await testCtx({ openBrowser: fakeBrowser })
     assert.equal(await main(['login', hub.url, '--scope', 'dsh.read  offline_access'], t.ctx), 0, t.stderr())
     const auth = hub.authorizeRequests[0]!
-    assert.deepEqual(auth.getAll('resource'), [`${hub.url}/api/v1`, `${hub.url}/mcp`])
+    assert.deepEqual(auth.getAll('resource'), [resources.api, resources.mcp])
     assert.equal(auth.get('scope'), 'dsh.read offline_access')
     const exchange = hub.tokenRequests.find(r => r.grant_type === 'authorization_code')
-    assert.equal(exchange?.resource, `${hub.url}/api/v1`)
+    assert.equal(exchange?.resource, resources.api)
 
     const remora = await openHub(t.ctx, undefined)
     const mcpToken = await remora.token('mcp')
     const refreshReq = hub.tokenRequests.find(r => r.grant_type === 'refresh_token')
-    assert.equal(refreshReq?.resource, `${hub.url}/mcp`, 'the MCP token is minted for the MCP resource')
+    assert.equal(refreshReq?.resource, resources.mcp, 'the MCP token is minted for the MCP resource')
     assert.notEqual(mcpToken, await remora.token('api'))
   } finally {
     await hub.stop()
@@ -159,6 +160,21 @@ test('a second process that rotated the refresh token does not log the first one
     hub.validAccess.clear()
     const again = await first.token('api', true)
     assert.ok(hub.validAccess.has(again), 'refreshes with the rotated refresh token')
+  } finally {
+    await hub.stop()
+  }
+})
+
+test('--content adds dsh.content; logout falls back to ENDPOINTS.revocation', async () => {
+  const hub = await new FakeHub(18114, { noRevocationMeta: true }).start()
+  try {
+    const t = await testCtx({ openBrowser: fakeBrowser })
+    assert.equal(await main(['login', hub.url, '--content'], t.ctx), 0, t.stderr())
+    assert.equal(hub.authorizeRequests[0]?.get('scope'), 'dsh.read dsh.tasks offline_access dsh.content')
+    const stored = await (await openTokenStore(t.ctx)).load(hub.url)
+    assert.equal(stored?.revocationEndpoint, `${hub.url}/oauth/revoke`)
+    assert.equal(await main(['logout'], t.ctx), 0)
+    assert.ok(hub.revoked.includes(stored!.refreshToken!))
   } finally {
     await hub.stop()
   }

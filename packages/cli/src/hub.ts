@@ -1,8 +1,8 @@
 /** Authorized access to the hub: access tokens with automatic refresh, and the HTTP API. */
-import { ENDPOINTS, validateParams, type OperationParams, type OperationResults } from '@dsh-remora/protocol'
+import { ENDPOINTS, findOperation, validateParams, type OperationParams, type OperationResults } from '@dsh-remora/protocol'
 import type { Ctx } from './ctx.ts'
 import { loadProfile, normalizeHubUrl } from './config.ts'
-import { CliError, EXIT, fromHttpError, notLoggedIn, usageError } from './errors.ts'
+import { CliError, EXIT, fromHttpError, missingScope, notLoggedIn, usageError } from './errors.ts'
 import { refresh, toAccess } from './oauth.ts'
 import { openTokenStore, type StoredTokens, type TokenStore } from './tokens.ts'
 
@@ -93,6 +93,8 @@ export class Hub {
   async op<K extends OpId>(operation: K, params: OperationParams[K], timeoutMs = 30_000): Promise<OperationResults[K]> {
     const issues = validateParams(operation, params)
     if (issues.length > 0) throw usageError(`${operation} の入力が不正です: ${issues.map(i => `${i.path} ${i.message}`).join('; ')}`)
+    const needed = findOperation(operation)?.scope
+    if (needed && this.tokens && !this.tokens.scope.split(/\s+/).includes(needed)) throw missingScope(needed)
     const response = await this.authorizedFetch('api', this.url + ENDPOINTS.ops + operation, {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },

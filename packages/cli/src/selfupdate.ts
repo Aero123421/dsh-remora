@@ -11,6 +11,7 @@ import { chmod, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { RELEASE_ASSETS } from '@dsh-remora/protocol'
 import type { Ctx } from './ctx.ts'
 import { CliError, EXIT } from './errors.ts'
 
@@ -18,7 +19,7 @@ export const REPOSITORY = 'Aero123421/dsh-remora'
 export const DEFAULT_RELEASES_API = `https://api.github.com/repos/${REPOSITORY}/releases`
 
 export function assetName(platform: string, arch: string): string {
-  return `remora-${platform}-${arch}${platform === 'win32' ? '.exe' : ''}`
+  return RELEASE_ASSETS.cli(platform, arch)
 }
 
 interface ReleaseAsset { name: string; browser_download_url: string; size?: number }
@@ -139,8 +140,8 @@ export async function selfUpdate(ctx: Ctx, options: UpdateOptions): Promise<Upda
   if (latest === options.currentVersion && !options.force) return outcome
   const asset = release.assets.find(a => a.name === name)
   if (!asset) throw new CliError(`このリリース（${release.tag_name}）には ${name} がありません。`, EXIT.notFound, { code: 'no_asset' })
-  const sumsAsset = release.assets.find(a => a.name === 'SHA256SUMS')
-  if (!sumsAsset) throw new CliError(`このリリース（${release.tag_name}）には SHA256SUMS がないため、検証できません。`, EXIT.failure, { code: 'no_checksums' })
+  const sumsAsset = release.assets.find(a => a.name === RELEASE_ASSETS.checksums)
+  if (!sumsAsset) throw new CliError(`このリリース（${release.tag_name}）には ${RELEASE_ASSETS.checksums} がないため、検証できません。`, EXIT.failure, { code: 'no_checksums' })
 
   let target = options.target
   if (!target) {
@@ -151,7 +152,7 @@ export async function selfUpdate(ctx: Ctx, options: UpdateOptions): Promise<Upda
 
   const sums = parseSums(await (await get(ctx, sumsAsset.browser_download_url, 'application/octet-stream')).text())
   const expected = sums.get(name)
-  if (!expected) throw new CliError(`SHA256SUMS に ${name} の行がありません。`, EXIT.failure, { code: 'no_checksum' })
+  if (!expected) throw new CliError(`${RELEASE_ASSETS.checksums} に ${name} の行がありません。`, EXIT.failure, { code: 'no_checksum' })
 
   const fresh = join(dirname(target), `.${basename(target)}.${process.pid}.download`)
   try {

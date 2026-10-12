@@ -6,13 +6,19 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { CLI_CLIENT_ID, ENDPOINTS } from '@dsh-remora/protocol'
+import { CLI_CLIENT_ID, ENDPOINTS, resourceIndicators } from '@dsh-remora/protocol'
 import type { Ctx } from './ctx.ts'
 import { isAllowedEndpoint } from './config.ts'
 import { CliError, EXIT } from './errors.ts'
 import type { AccessToken, StoredTokens } from './tokens.ts'
 
-export const DEFAULT_SCOPE = 'dsh.read dsh.content dsh.tasks offline_access'
+/**
+ * Least privilege by default: list, start, wait and read each task's own final
+ * reply. `dsh.content` (transcripts, diffs, deliverables, full questions) is
+ * added with `remora login --content`.
+ */
+export const DEFAULT_SCOPE = 'dsh.read dsh.tasks offline_access'
+export const CONTENT_SCOPE = 'dsh.content'
 
 export interface AuthServerMetadata {
   issuer: string
@@ -72,7 +78,8 @@ export async function discover(ctx: Ctx, hubUrl: string): Promise<AuthServerMeta
   }
   const authorization = meta.authorization_endpoint ?? hubUrl + ENDPOINTS.authorize
   const token = meta.token_endpoint ?? hubUrl + ENDPOINTS.token
-  const endpoints = [authorization, token, meta.device_authorization_endpoint, meta.revocation_endpoint].filter((e): e is string => typeof e === 'string')
+  const revocation = meta.revocation_endpoint ?? hubUrl + ENDPOINTS.revocation
+  const endpoints = [authorization, token, meta.device_authorization_endpoint, revocation].filter((e): e is string => typeof e === 'string')
   for (const endpoint of endpoints) {
     if (!isAllowedEndpoint(endpoint)) throw new CliError(`OAuth メタデータのエンドポイントが https ではありません: ${endpoint}`, EXIT.failure, { code: 'metadata' })
   }
@@ -80,29 +87,28 @@ export async function discover(ctx: Ctx, hubUrl: string): Promise<AuthServerMeta
   if (Array.isArray(methods) && !methods.includes('S256')) {
     throw new CliError('ハブが PKCE（S256）に対応していません。', EXIT.failure, { code: 'metadata' })
   }
-  return { ...meta, issuer: meta.issuer, authorization_endpoint: authorization, token_endpoint: token } as AuthServerMetadata
+  return { ...meta, issuer: meta.issuer, authorization_endpoint: authorization, token_endpoint: token, revocation_endpoint: revocation } as AuthServerMetadata
 }
 
 /**
- * RFC 9728: the hub may expose separate resources (audiences) for the HTTP
- * API and MCP. Only resources the hub actually advertises are requested, so a
- * hub without per-resource metadata gets plain requests and one token.
+ * Audience-bound tokens (RFC 8707): one for the HTTP API, one for MCP. The
+ * hub's RFC 9728 protected resource metadata (path-inserted, e.g.
+ * `/.well-known/oauth-protected-resource/mcp`) is the source of truth; the
+ * contract's `resourceIndicators()` is the fallback.
  */
-export async function discoverResources(ctx: Ctx, hubUrl: string): Promise<StoredTokens['resources']> {
-  const resources: StoredTokens['resources'] = {}
-  const probe = async (path: string): Promise<string | undefined> => {
+export async function discoverResources(ctx: Ctx, hubUrl: string): Promise<Required<StoredTokens['resources']>> {
+  const fallback = resourceIndicators(hubUrl)
+  const probe = async (expected: string): Promise<string> => {
     try {
-      const { status, body } = await getJson(ctx, `${hubUrl}${ENDPOINTS.protectedResourceMetadata}${path}`)
+      const { status, body } = await getJson(ctx, `${hubUrl}${ENDPOINTS.protectedResourceMetadata}${new URL(expected).pathname}`)
       const resource = (body as { resource?: unknown } | null)?.resource
-      return status === 200 && typeof resource === 'string' && isAllowedEndpoint(resource) ? resource : undefined
+      return status === 200 && typeof resource === 'string' && isAllowedEndpoint(resource) ? resource : expected
     } catch {
-      return undefined
+      return expected
     }
   }
-  const [api, mcp] = await Promise.all([probe('/api/v1'), probe(ENDPOINTS.mcp)])
-  if (api) resources.api = api
-  if (mcp) resources.mcp = mcp
-  return resources
+  const [api, mcp] = await Promise.all([probe(fallback.api), probe(fallback.mcp)])
+  return { api, mcp }
 }
 
 export class OAuthError extends Error {
