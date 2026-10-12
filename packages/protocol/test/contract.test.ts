@@ -1,8 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  INPUT_SCHEMAS, OPERATIONS, REQUIRES_CONFIRMATION, canonicalJson, confirmationChallenge, formatUserCode,
-  fromBase64Url, normalizeUserCode, pairPollMessage, sha256, toBase64Url, validateParams, type OperationSpec,
+  AUDIT_GENESIS_HASH, INPUT_SCHEMAS, OPERATIONS, OWNER_APPROVED_OPERATIONS, REQUIRES_CONFIRMATION, auditHash, canonicalJson, confirmationChallenge, findOperation,
+  formatUserCode, fromBase64Url, normalizeUserCode, pairPollMessage, sha256, toBase64Url, validateParams, verifyAuditRecords, type AuditRecord, type OperationSpec,
 } from '../src/index.ts'
 
 test('every operation has an input schema that rejects unknown fields', () => {
@@ -79,4 +79,23 @@ test('pairing helpers', () => {
   assert.equal(pairPollMessage('https://hub.example', 'p1'), 'remora-pair/v1\nhttps://hub.example\np1')
   assert.equal(formatUserCode('ABCD2345'), 'ABCD-2345')
   assert.equal(normalizeUserCode(' abcd-2345 '), 'ABCD2345')
+})
+
+test('audit chains: a changed, removed or reordered row breaks the chain', async () => {
+  const fields = (n: number) => ({ at: n, actor: 'owner', actorName: 'オーナー', operation: `op.${n}`, hostId: null, outcome: 'ok' as const, layer: null, reason: null })
+  const records: AuditRecord[] = []
+  let prev = AUDIT_GENESIS_HASH
+  for (let seq = 1; seq <= 4; seq++) {
+    const hash = await auditHash(seq, fields(seq), prev)
+    records.push({ seq, ...fields(seq), prevHash: prev, hash })
+    prev = hash
+  }
+  assert.equal(await verifyAuditRecords(records), null)
+  assert.equal(await verifyAuditRecords(records.slice(2)), null, 'a pruned head is fine')
+  assert.equal(await verifyAuditRecords([...records].reverse()), null, 'order of the input does not matter')
+  assert.equal(await verifyAuditRecords(records.map(r => (r.seq === 2 ? { ...r, actorName: 'someone else' } : r))), 2)
+  assert.equal(await verifyAuditRecords(records.filter(r => r.seq !== 3)), 4)
+  assert.equal(await verifyAuditRecords([]), null)
+  assert.ok(OWNER_APPROVED_OPERATIONS.has('audit.export') && OWNER_APPROVED_OPERATIONS.has('host.rotate-key'))
+  for (const id of OWNER_APPROVED_OPERATIONS) assert.equal(findOperation(id)?.tool, undefined, `${id} is not an MCP tool`)
 })

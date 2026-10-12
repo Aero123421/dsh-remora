@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { PROTOCOL_VERSION, ProtocolError, hostAuthMessage, isSupportedProtocol, parseHostFrame, parseHubFrame } from '../src/index.ts'
+import { PROTOCOL_VERSION, ProtocolError, hostAuthMessage, isSupportedProtocol, parseHostFrame, parseHubFrame, rotateKeyMessage } from '../src/index.ts'
 
 test('hello frames round-trip', () => {
   const hello = { t: 'hello', protocol: PROTOCOL_VERSION, hostId: 'h1', name: 'desk', plugin: { version: '0.1.0' }, dsh: { version: '0.2.1-alpha.2' }, operations: ['status'], ceiling: { level: 'view' }, killSwitch: false }
@@ -30,4 +30,13 @@ test('protocol version support', () => {
   assert.equal(isSupportedProtocol(PROTOCOL_VERSION), true)
   assert.equal(isSupportedProtocol(PROTOCOL_VERSION + 1), false)
   assert.equal(isSupportedProtocol('1'), false)
+})
+
+test('key rotation frames parse and the signed message binds the new key', () => {
+  assert.equal(parseHubFrame(JSON.stringify({ t: 'rotate-key', nonce: 'n1', issuedAt: 5 })).t, 'rotate-key')
+  assert.equal(parseHubFrame(JSON.stringify({ t: 'rotate-key-commit', nonce: 'n1', publicKey: 'k' })).t, 'rotate-key-commit')
+  assert.throws(() => parseHubFrame(JSON.stringify({ t: 'rotate-key', nonce: 'n1' })), ProtocolError)
+  assert.equal(parseHostFrame(JSON.stringify({ t: 'rotate-key-proof', nonce: 'n1', publicKey: 'k', signature: 's', newSignature: 'z' })).t, 'rotate-key-proof')
+  assert.throws(() => parseHostFrame(JSON.stringify({ t: 'rotate-key-proof', nonce: 'n1', publicKey: 'k', signature: 's' })), ProtocolError)
+  assert.equal(rotateKeyMessage('https://hub', 'h1', 'n1', 5, 'KEY'), 'remora-rotate-key/v1\nhttps://hub\nh1\nn1\n5\nKEY')
 })

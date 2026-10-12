@@ -67,3 +67,11 @@ export const REQUIRES_CONFIRMATION: ReadonlySet<string> = new Set(
  * collects a confirmation when the owner answers on the hub's own page.
  */
 export const CONFIRMATION_UNLESS_ALLOWED: ReadonlySet<string> = new Set(['approval.respond'])
+
+/**
+ * Hub maintenance the owner approves on the hub for every call (passkey
+ * re-authentication, checked by the hub; nothing a DSH host could verify is
+ * at stake). A client's call is parked like a REQUIRES_CONFIRMATION one and
+ * answered through confirmation.get.
+ */
+export const OWNER_APPROVED_OPERATIONS: ReadonlySet<string> = new Set(['audit.export', 'hub.export', 'host.rotate-key'])

@@ -85,7 +85,16 @@ export interface EventFrame {
   events: HostEvent[]
 }
 
-export type HostFrame = HelloFrame | AuthFrame | ResponseFrame | EventFrame
+/** The new public key, signed over rotateKeyMessage(...) by the current key and by the new one. */
+export interface RotateKeyProofFrame {
+  t: 'rotate-key-proof'
+  nonce: string
+  publicKey: string
+  signature: string
+  newSignature: string
+}
+
+export type HostFrame = HelloFrame | AuthFrame | ResponseFrame | EventFrame | RotateKeyProofFrame
 
 // hub -> host ---------------------------------------------------------------
 
@@ -132,7 +141,37 @@ export interface OwnerCredentialsFrame {
   credentials: OwnerCredential[]
 }
 
-export type HubFrame = ChallengeFrame | ReadyFrame | RequestFrame | CloseFrame | OwnerCredentialsFrame
+/**
+ * Key rotation, after the owner approved it on the hub (host.rotate-key):
+ *
+ *   hub  -> rotate-key { nonce, issuedAt }
+ *   host -> rotate-key-proof { nonce, publicKey, signature (current key), newSignature (new key) }
+ *           both over rotateKeyMessage(...)
+ *   hub  -> rotate-key-commit { nonce, publicKey }   (the hub now also accepts the new key)
+ *
+ * The host then reconnects with the new key; the hub drops the old key on the
+ * first handshake signed by the new one. A handshake signed by the old key
+ * before that cancels the rotation. The host keeps its old key until the new
+ * one got through, and goes back to it if the hub refuses the new one.
+ */
+export interface RotateKeyFrame {
+  t: 'rotate-key'
+  nonce: string
+  issuedAt: number
+}
+
+export interface RotateKeyCommitFrame {
+  t: 'rotate-key-commit'
+  nonce: string
+  publicKey: string
+}
+
+export type HubFrame = ChallengeFrame | ReadyFrame | RequestFrame | CloseFrame | OwnerCredentialsFrame | RotateKeyFrame | RotateKeyCommitFrame
+
+/** The bytes both the current and the new host key sign to rotate. */
+export function rotateKeyMessage(origin: string, hostId: string, nonce: string, issuedAt: number, publicKey: string): string {
+  return ['remora-rotate-key/v1', origin, hostId, nonce, String(issuedAt), publicKey].join('\n')
+}
 
 /**
  * The exact bytes a host signs during the handshake. Binding the hub origin,
@@ -143,8 +182,8 @@ export function hostAuthMessage(origin: string, hostId: string, nonce: string, i
   return ['remora-host-auth/v1', origin, hostId, nonce, String(issuedAt)].join('\n')
 }
 
-const HOST_FRAME_TYPES = new Set(['hello', 'auth', 'response', 'event'])
-const HUB_FRAME_TYPES = new Set(['challenge', 'ready', 'request', 'close', 'owner-credentials'])
+const HOST_FRAME_TYPES = new Set(['hello', 'auth', 'response', 'event', 'rotate-key-proof'])
+const HUB_FRAME_TYPES = new Set(['challenge', 'ready', 'request', 'close', 'owner-credentials', 'rotate-key', 'rotate-key-commit'])
 
 function parseObject(text: string): Record<string, unknown> {
   let value: unknown
@@ -179,6 +218,7 @@ export function parseHostFrame(text: string): HostFrame {
     if (typeof frame.ok !== 'boolean') throw new ProtocolError('invalid_request', 'frame.ok must be a boolean')
   }
   if (frame.t === 'event' && !Array.isArray(frame.events)) throw new ProtocolError('invalid_request', 'frame.events must be an array')
+  if (frame.t === 'rotate-key-proof') { requireString(frame, 'nonce'); requireString(frame, 'publicKey'); requireString(frame, 'signature'); requireString(frame, 'newSignature') }
   return frame as unknown as HostFrame
 }
 
@@ -190,6 +230,11 @@ export function parseHubFrame(text: string): HubFrame {
     requireString(frame, 'nonce'); requireString(frame, 'origin')
     if (typeof frame.issuedAt !== 'number') throw new ProtocolError('invalid_request', 'frame.issuedAt must be a number')
   }
+  if (frame.t === 'rotate-key') {
+    requireString(frame, 'nonce')
+    if (typeof frame.issuedAt !== 'number') throw new ProtocolError('invalid_request', 'frame.issuedAt must be a number')
+  }
+  if (frame.t === 'rotate-key-commit') { requireString(frame, 'nonce'); requireString(frame, 'publicKey') }
   if (frame.t === 'request') {
     requireString(frame, 'id'); requireString(frame, 'op')
     if (typeof frame.deadline !== 'number') throw new ProtocolError('invalid_request', 'frame.deadline must be a number')

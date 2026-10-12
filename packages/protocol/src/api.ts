@@ -24,7 +24,7 @@
  */
 import type { RemoraError } from './errors.ts'
 import type { AttentionKind, TaskState } from './operations.ts'
-import type { Grant } from './permissions.ts'
+import type { DenialLayer, Grant } from './permissions.ts'
 
 // --- shared shapes ------------------------------------------------------
 
@@ -448,6 +448,65 @@ export interface ConfirmationInfo {
 }
 export interface ConfirmationGetParams { confirmationId: string; timeoutMs?: number }
 
+// --- hub maintenance (OWNER_APPROVED_OPERATIONS) ------------------------------
+
+/** One row of an audit log: who did what, where, with which outcome. Never content. */
+export interface AuditRecord {
+  seq: number
+  at: number
+  /** Client id, `owner`, `host` or `hub`. */
+  actor: string
+  actorName: string
+  operation: string
+  hostId: string | null
+  outcome: 'ok' | 'denied' | 'error'
+  /** For denials: the layer that refused. */
+  layer: DenialLayer | null
+  /** Denial reason or error code. */
+  reason: string | null
+  prevHash: string
+  hash: string
+}
+export interface AuditLogExport {
+  /** `hub`, or the host id. */
+  log: string
+  name: string
+  /** Oldest first. The hub keeps the newest rows of each log (10,000). */
+  records: AuditRecord[]
+}
+export interface AuditExportResult {
+  exportedAt: number
+  hubOrigin: string
+  logs: AuditLogExport[]
+}
+
+export interface HubExportResult {
+  format: 'remora-hub-export/v1'
+  exportedAt: number
+  hubOrigin: string
+  hubVersion: string
+  settings: { allowOtherClients: boolean; dynamicClientRegistration: boolean }
+  hosts: { hostId: string; name: string; publicKeyFingerprint: string; pairedAt: number; revokedAt: number | null }[]
+  clients: {
+    clientId: string; name: string; kind: string; createdAt: number; lastUsedAt: number | null; revokedAt: number | null
+    grants: { hostId: string; level: string; overrides: Record<string, boolean>; fullAccessExpiresAt: number | null }[]
+  }[]
+  personalTokens: { id: string; name: string; scopes: string[]; createdAt: number; expiresAt: number; lastUsedAt: number | null; revokedAt: number | null }[]
+  passkeys: { credentialId: string; label: string; algorithm: number; createdAt: number; lastUsedAt: number | null }[]
+  pushDevices: { label: string; types: string[]; createdAt: number; lastSentAt: number | null }[]
+}
+
+export interface HostRotateKeyParams { hostId: string }
+export interface HostRotateKeyResult {
+  hostId: string
+  /** First 16 hex characters of the SHA-256 of the new raw public key (as shown when pairing). */
+  publicKeyFingerprint: string
+  rotatedAt: number
+}
+
+/** Confirmation ids of hub maintenance start with this; the others start with the host id. */
+export const HUB_CONFIRMATION_PREFIX = 'hub-'
+
 export interface OperationParams {
   'status': StatusParams
   'hosts.list': HostsListParams
@@ -482,6 +541,9 @@ export interface OperationParams {
   'schedule.delete': ScheduleDeleteParams
   'terminal.run': TerminalRunParams
   'confirmation.get': ConfirmationGetParams
+  'audit.export': Record<string, never>
+  'hub.export': Record<string, never>
+  'host.rotate-key': HostRotateKeyParams
 }
 
 export interface OperationResults {
@@ -519,6 +581,10 @@ export interface OperationResults {
   /** From the DSH host; clients receive a ConfirmationInfo carrying it as `result`. */
   'terminal.run': TerminalRunOutput
   'confirmation.get': ConfirmationInfo
+  /** Clients receive a ConfirmationInfo carrying these as `result` once the owner approved. */
+  'audit.export': AuditExportResult
+  'hub.export': HubExportResult
+  'host.rotate-key': HostRotateKeyResult
 }
 
 /**
@@ -526,6 +592,9 @@ export interface OperationResults {
  * ledger and ask the host only for the result of a finished task.
  */
 export const HUB_OPERATIONS: ReadonlySet<string> = new Set(['status', 'hosts.list'])
+
+/** Hub maintenance the hub answers itself once the owner approved the call (no host involved). */
+export const HUB_MAINTENANCE_OPERATIONS: ReadonlySet<string> = new Set(['audit.export', 'hub.export'])
 
 /** Operations the hub resolves to a host through its task ledger (no hostId needed). */
 export const TASK_LEDGER_OPERATIONS: ReadonlySet<string> = new Set(['task.get', 'task.wait', 'task.resubmit'])

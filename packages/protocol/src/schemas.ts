@@ -100,6 +100,9 @@ export const INPUT_SCHEMAS: Readonly<Record<OperationId, ObjectSchema>> = {
   'schedule.delete': obj({ hostId, sessionId, scheduleId: str('Schedule id from dsh_schedules_list.', 200) }, ['sessionId', 'scheduleId']),
   'terminal.run': obj({ hostId, command: str('Shell command (run with the host\'s default shell: sh -c on macOS/Linux, cmd /c on Windows).', 8000), cwdWorkspaceId: workspaceId, timeoutMs: int('Kill the command after this many milliseconds (default 60000).', 1000, 600_000) }, ['command', 'cwdWorkspaceId']),
   'confirmation.get': obj({ confirmationId: str('Confirmation id from a pending result.', 64), timeoutMs: int('How long to wait for the outcome, at most 25000.', 0, 25_000) }, ['confirmationId']),
+  'audit.export': obj({}),
+  'hub.export': obj({}),
+  'host.rotate-key': obj({ hostId }, ['hostId']),
 }
 
 export interface ValidationIssue { path: string; message: string }

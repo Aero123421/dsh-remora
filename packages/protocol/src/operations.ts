@@ -107,6 +107,13 @@ export const OPERATIONS = [
     description: 'Run a shell command in a workspace folder on the DSH host. Needs full remote access, and the owner confirms every command on the Remora hub with a passkey: the result is a pending confirmation whose confirmUrl you give the user; then call dsh_confirmation_get with its confirmationId for the output.' },
   { id: 'confirmation.get', tool: 'dsh_confirmation_get', level: 'view', scope: 'dsh.read', phase: 'P2', readOnly: true, destructive: false,
     description: 'Get the state of an operation waiting for the owner\'s passkey confirmation (such as dsh_terminal_run), waiting up to 25 seconds for it to finish, and its result once confirmed. The hub keeps the result for one hour.' },
+  // --- Hub maintenance: HTTP API and CLI only; the owner approves each call on the hub with a passkey ---
+  { id: 'audit.export', level: 'view', scope: 'dsh.admin', phase: 'P2', readOnly: true, destructive: false,
+    description: 'Export the hub\'s and every host\'s audit log (who did what and when, never content) to verify its hash chains outside the hub. The owner approves each export on the hub with a passkey.' },
+  { id: 'hub.export', level: 'view', scope: 'dsh.admin', phase: 'P2', readOnly: true, destructive: false,
+    description: 'Export the hub\'s settings (hosts, clients and their grants, personal-token, passkey and notification-device metadata) without any secret. The owner approves each export on the hub with a passkey.' },
+  { id: 'host.rotate-key', level: 'view', scope: 'dsh.admin', phase: 'P2', readOnly: false, destructive: false,
+    description: 'Replace a DSH host\'s key: the host makes a new key, proves it with the old and the new key, and reconnects with it. The owner approves each rotation on the hub with a passkey.' },
 ] as const satisfies readonly OperationSpec[]
 
 export type OperationId = (typeof OPERATIONS)[number]['id']
