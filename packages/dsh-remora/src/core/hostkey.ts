@@ -9,8 +9,10 @@
  * service is available the key is written to `host-key.json` (0600) in the
  * plugin's data directory instead.
  *
- * Rotating the key means pairing again: a new key is generated for every
- * pairing and only replaces the old one once the hub approved it.
+ * A new key is generated for every pairing and only replaces the old one
+ * once the hub approved it. `host.rotate-key` replaces the key in place: the
+ * old key stays in a second slot (`previous`) until the new one got through a
+ * handshake, so a rotation interrupted at any point never locks the host out.
  */
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, type KeyObject } from 'node:crypto'
 import { readFile, rm } from 'node:fs/promises'
@@ -26,6 +28,9 @@ export interface CredentialsLike {
 }
 
 export const HOST_KEY_RECORD = 'dsh-remora/host-key'
+export const PREVIOUS_KEY_RECORD = 'dsh-remora/host-key-previous'
+
+export type KeySlot = 'current' | 'previous'
 
 export class HostKey {
   readonly privateKey: KeyObject
@@ -83,11 +88,19 @@ export function publicKeyBytes(publicKey: string): Uint8Array {
 /** Where the active host key is kept. */
 export class HostKeyStore {
   private readonly credentials: CredentialsLike | undefined
-  private readonly filePath: string
+  private readonly dataDir: string
 
   constructor(dataDir: string, credentials: CredentialsLike | undefined) {
     this.credentials = credentials
-    this.filePath = join(dataDir, 'host-key.json')
+    this.dataDir = dataDir
+  }
+
+  private record(slot: KeySlot): string {
+    return slot === 'current' ? HOST_KEY_RECORD : PREVIOUS_KEY_RECORD
+  }
+
+  private file(slot: KeySlot): string {
+    return join(this.dataDir, slot === 'current' ? 'host-key.json' : 'host-key-previous.json')
   }
 
   /** `credentials` (DSH credential store) or `file` (0600 file in the data directory). */
@@ -95,32 +108,35 @@ export class HostKeyStore {
     return this.credentials ? 'credentials' : 'file'
   }
 
-  async load(): Promise<HostKey | null> {
+  async load(slot: KeySlot = 'current'): Promise<HostKey | null> {
     if (this.credentials) {
-      const record = await this.credentials.readRecord(HOST_KEY_RECORD)
+      const record = await this.credentials.readRecord(this.record(slot))
       if (record === undefined) return null
-      if (record.kind !== 'grant') throw new Error(`${HOST_KEY_RECORD} holds an unexpected record kind`)
+      if (record.kind !== 'grant') throw new Error(`${this.record(slot)} holds an unexpected record kind`)
       return HostKey.fromPayload(record.payload)
     }
     try {
-      return HostKey.fromPayload(JSON.parse(await readFile(this.filePath, 'utf8')))
+      return HostKey.fromPayload(JSON.parse(await readFile(this.file(slot), 'utf8')))
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       throw error
     }
   }
 
-  async save(key: HostKey): Promise<void> {
+  async save(key: HostKey, slot: KeySlot = 'current'): Promise<void> {
     const payload = key.toPayload()
     if (this.credentials) {
-      await this.credentials.modifyRecord(HOST_KEY_RECORD, async () => ({ kind: 'grant', payload }))
+      await this.credentials.modifyRecord(this.record(slot), async () => ({ kind: 'grant', payload }))
       return
     }
-    await writeAtomic(this.filePath, `${JSON.stringify(payload)}\n`)
+    await writeAtomic(this.file(slot), `${JSON.stringify(payload)}\n`)
   }
 
-  async delete(): Promise<void> {
-    if (this.credentials) await this.credentials.deleteRecord(HOST_KEY_RECORD)
-    await rm(this.filePath, { force: true })
+  /** Without `slot`, both keys. */
+  async delete(slot?: KeySlot): Promise<void> {
+    for (const one of slot ? [slot] : (['current', 'previous'] as const)) {
+      if (this.credentials) await this.credentials.deleteRecord(this.record(one))
+      await rm(this.file(one), { force: true })
+    }
   }
 }

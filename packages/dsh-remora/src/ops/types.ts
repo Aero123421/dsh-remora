@@ -17,7 +17,7 @@ import type {
 import type { HostContext } from '../dsh.ts'
 
 /** Operations answered by the hub itself never reach the plugin. */
-export type HostOperationId = Exclude<OperationId, 'status' | 'hosts.list' | 'confirmation.get'>
+export type HostOperationId = Exclude<OperationId, 'status' | 'hosts.list' | 'confirmation.get' | 'audit.export' | 'hub.export' | 'host.rotate-key'>
 
 export interface SessionScopeInput {
   sessionId: string

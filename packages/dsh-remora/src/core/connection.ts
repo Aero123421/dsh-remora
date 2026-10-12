@@ -17,7 +17,7 @@
  */
 import {
   KEEPALIVE_PING, KEEPALIVE_PONG, PROTOCOL_VERSION, hostAuthMessage, hostSocketPath, parseHubFrame,
-  type CloseFrame, type HelloFrame, type HostFrame, type OwnerCredential, type RequestFrame,
+  type CloseFrame, type HelloFrame, type HostFrame, type OwnerCredential, type RequestFrame, type RotateKeyCommitFrame, type RotateKeyFrame,
 } from '@dsh-remora/protocol'
 import { systemClock, type Clock } from './events.ts'
 import type { HostKey } from './hostkey.ts'
@@ -58,6 +58,14 @@ export interface HubLinkDeps {
   onReady: () => void
   onRequest: (frame: RequestFrame) => void
   onOwnerCredentials: (credentials: OwnerCredential[]) => void
+  /** Key rotation frames (host.rotate-key), after `ready`. */
+  onRotateKey?: (frame: RotateKeyFrame) => void
+  onRotateKeyCommit?: (frame: RotateKeyCommitFrame) => void
+  /**
+   * The hub refused the handshake's signature. Returns true when another key
+   * will be tried (a rotation in flight), so the retry need not wait.
+   */
+  onAuthFailed?: () => boolean
   /** `protocol_mismatch` and `revoked` stop reconnecting. */
   onFatal: (reason: CloseFrame['reason']) => void
   onStatus?: (status: LinkStatus) => void
@@ -222,6 +230,12 @@ export class HubLink {
         case 'owner-credentials':
           if (this.current.state === 'connected' && Array.isArray(frame.credentials)) this.deps.onOwnerCredentials(frame.credentials)
           return
+        case 'rotate-key':
+          if (this.current.state === 'connected') this.deps.onRotateKey?.(frame)
+          return
+        case 'rotate-key-commit':
+          if (this.current.state === 'connected') this.deps.onRotateKeyCommit?.(frame)
+          return
       }
     })
     socket.addEventListener('close', event => {
@@ -239,6 +253,7 @@ export class HubLink {
       this.deps.onFatal(reason)
       return
     }
+    if (reason === 'auth_failed' && this.deps.onAuthFailed?.()) { this.drop(reason, 0); return }
     this.drop(reason, SLOW_RETRY_MS)
   }
 

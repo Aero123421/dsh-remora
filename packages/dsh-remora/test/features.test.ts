@@ -17,7 +17,7 @@ test('operations are offered only when implemented and every service is present'
 test('every operation a host serves is implemented; hub-only ones are never offered', () => {
   const available = new Set(detectFeatures(() => true).available)
   for (const spec of OPERATIONS) {
-    const hubOnly = spec.id === 'hosts.list' || spec.id === 'confirmation.get'
+    const hubOnly = ['hosts.list', 'confirmation.get', 'audit.export', 'hub.export'].includes(spec.id)
     assert.equal(available.has(spec.id), !hubOnly, spec.id)
   }
 })

@@ -129,6 +129,9 @@ export const ja = {
   'op.schedule.create': 'スケジュールの作成',
   'op.schedule.delete': 'スケジュールの削除',
   'op.confirmation.get': 'パスキー確認の結果',
+  'op.audit.export': '監査ログの書き出し（ハブで毎回承認）',
+  'op.hub.export': 'ハブ設定の書き出し（ハブで毎回承認）',
+  'op.host.rotate-key': 'ホスト鍵の更新（ハブで毎回承認）',
 
   'scope.hint': 'ここで決まるのは「どのセッションを外から触れるか」だけです。エージェントが触れるファイルは DSH のサンドボックスと権限プリセットが決めます。',
   'scope.workspaces': 'ワークスペース',
@@ -368,6 +371,9 @@ export const en: Record<CopyKey, string> = {
   'op.schedule.create': 'Create schedules',
   'op.schedule.delete': 'Delete schedules',
   'op.confirmation.get': 'Passkey confirmation results',
+  'op.audit.export': 'Export the audit log (approved on the hub each time)',
+  'op.hub.export': 'Export the hub settings (approved on the hub each time)',
+  'op.host.rotate-key': 'Rotate the host key (approved on the hub each time)',
 
   'scope.hint': 'This only decides which sessions clients can reach. Which files the agent can touch is decided by DSH\'s sandbox and permission preset.',
   'scope.workspaces': 'Workspaces',

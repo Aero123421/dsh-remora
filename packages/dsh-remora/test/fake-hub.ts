@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type Server } from 'node:http'
 import { createPublicKey, verify, type KeyObject } from 'node:crypto'
 import { WebSocketServer, type WebSocket } from 'ws'
 import {
-  KEEPALIVE_PING, KEEPALIVE_PONG, hostAuthMessage, pairPollMessage, parseHostFrame, unpairMessage,
+  KEEPALIVE_PING, KEEPALIVE_PONG, hostAuthMessage, pairPollMessage, parseHostFrame, rotateKeyMessage, unpairMessage,
   type HostFrame, type HubFrame, type OwnerCredential,
 } from '@dsh-remora/protocol'
 
@@ -31,6 +31,10 @@ export class FakeHub {
   readonly options: FakeHubOptions
   readonly hostId = 'host_test1'
   publicKey: string | null = null
+  /** A key proved during a rotation, accepted until a handshake decides (like the real hub). */
+  nextKey: string | null = null
+  /** Rotation handshakes seen: which key each one used. */
+  readonly keysUsed: ('current' | 'next')[] = []
   pollSignaturesValid = true
   polls = 0
   /** Set when the host removed itself with a valid signature. */
@@ -113,9 +117,12 @@ export class FakeHub {
       const frame = parseHostFrame(text)
       if (frame.t === 'hello') { stage = 'hello'; this.hellos.push(frame); return }
       if (frame.t === 'auth') {
-        const valid = stage === 'hello' && this.publicKey !== null && frame.nonce === nonce
-          && verify(null, Buffer.from(hostAuthMessage(this.origin, this.hostId, nonce, issuedAt)), ed25519Key(this.publicKey), Buffer.from(frame.signature, 'base64url'))
-        if (!valid || this.rejectAuth) { this.authFailures++; this.send({ t: 'close', reason: 'auth_failed' }, ws); ws.close(4001); return }
+        const message = Buffer.from(hostAuthMessage(this.origin, this.hostId, nonce, issuedAt))
+        const signedBy = (key: string | null) => key !== null && verify(null, message, ed25519Key(key), Buffer.from(frame.signature, 'base64url'))
+        const current = stage === 'hello' && frame.nonce === nonce && signedBy(this.publicKey)
+        const next = !current && stage === 'hello' && frame.nonce === nonce && signedBy(this.nextKey)
+        if ((!current && !next) || this.rejectAuth) { this.authFailures++; this.send({ t: 'close', reason: 'auth_failed' }, ws); ws.close(4001); return }
+        if (next) { this.publicKey = this.nextKey; this.nextKey = null; this.keysUsed.push('next') } else if (this.nextKey) { this.nextKey = null; this.keysUsed.push('current') }
         stage = 'ready'
         this.socket = ws
         this.send({ t: 'ready', connectionId: `conn-${this.connections}` }, ws)
@@ -124,6 +131,28 @@ export class FakeHub {
       if (stage === 'ready') this.received.push(frame)
     })
     ws.on('close', () => { if (this.socket === ws) this.socket = null })
+  }
+
+  /** Ask the host for a new key, check its proof like the hub does, and accept it (hub side of host.rotate-key). */
+  async rotate(options: { forgetNext?: boolean } = {}): Promise<string> {
+    const nonce = `rotate-${Date.now()}`
+    const issuedAt = Date.now()
+    this.send({ t: 'rotate-key', nonce, issuedAt })
+    const started = Date.now()
+    let proof: Extract<HostFrame, { t: 'rotate-key-proof' }> | undefined
+    while (!proof) {
+      proof = this.received.find((frame): frame is Extract<HostFrame, { t: 'rotate-key-proof' }> => frame.t === 'rotate-key-proof' && frame.nonce === nonce)
+      if (Date.now() - started > 3000) throw new Error('no rotate-key-proof')
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    const message = Buffer.from(rotateKeyMessage(this.origin, this.hostId, nonce, issuedAt, proof.publicKey))
+    const ok = verify(null, message, ed25519Key(this.publicKey as string), Buffer.from(proof.signature, 'base64url'))
+      && verify(null, message, ed25519Key(proof.publicKey), Buffer.from(proof.newSignature, 'base64url'))
+    if (!ok) throw new Error('the rotation proof does not verify')
+    // forgetNext: as if the hub dropped the new key before the host came back (it must fall back to the old one).
+    this.nextKey = options.forgetNext ? null : proof.publicKey
+    this.send({ t: 'rotate-key-commit', nonce, publicKey: proof.publicKey })
+    return proof.publicKey
   }
 
   send(frame: HubFrame, ws: WebSocket | null = this.socket): void {

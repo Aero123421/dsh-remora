@@ -47,7 +47,7 @@ export interface DispatchDeps {
   log?: (message: string, error?: unknown) => void
 }
 
-const HUB_ONLY: ReadonlySet<string> = new Set(['status', 'hosts.list', 'confirmation.get'])
+const HUB_ONLY: ReadonlySet<string> = new Set(['status', 'hosts.list', 'confirmation.get', 'audit.export', 'hub.export', 'host.rotate-key'])
 
 const DENIAL_MESSAGES: Readonly<Record<DenialLayer, string>> = {
   dsh: 'Refused by the permission ceiling set on the DSH host (Remora settings tab).',

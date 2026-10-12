@@ -74,7 +74,7 @@ test('pair, connect, dispatch with permission checks, events, kill switch and pa
     assert.equal(adapter.started(), 1)
     const hello = hub.hellos[0] as { name: string; operations: string[]; ceiling: Grant; killSwitch: boolean }
     assert.deepEqual(hello.ceiling, { level: 'view' })
-    assert.deepEqual([...hello.operations].sort(), ['approval.respond', 'session.get', 'session.read', 'sessions.list', 'task.get', 'task.start', 'terminal.run'])
+    assert.deepEqual([...hello.operations].sort(), ['approval.respond', 'host.rotate-key', 'session.get', 'session.read', 'sessions.list', 'task.get', 'task.start', 'terminal.run'])
 
     const full: Grant = { level: 'full', fullAccessExpiresAt: Date.now() + 60_000 }
     hub.send(request('r1', 'sessions.list', {}, full, ['dsh.read']))
@@ -290,6 +290,53 @@ test('approvals need the owner\'s passkey unless this PC allows them from MCP an
     const audit = await rpc<{ entries: { action: string; outcome: string; reason?: string }[] }>(host.routes, 'audit')
     assert.ok(audit.ok && audit.value.entries.some(e => e.action === 'approval.respond' && e.outcome === 'denied' && e.reason === 'confirmation-failed'))
     assert.ok(audit.ok && audit.value.entries.some(e => e.action === 'approvals-from-remote:on,answer-wait:5m' || e.action === 'answer-wait:5m,approvals-from-remote:on'))
+  } finally {
+    host.dispose()
+    await core.dispose()
+    await hub.close()
+    await cleanup()
+  }
+})
+
+test('host key rotation: the new key proves itself, survives a restart, and a refused new key falls back to the old one', async () => {
+  const { dir, cleanup } = await tempDir()
+  const hub = new FakeHub({ port: PORT + 9, owner: [makePasskey('es256').credential] })
+  await hub.listen()
+  let host = fakeHost()
+  let core = apply(host.ctx, undefined, { dataDir: dir, createAdapter: fakeAdapter().create })
+  try {
+    await core.ready
+    assert.ok((await rpc(host.routes, 'pairing-start', { hubUrl: hub.origin })).ok)
+    await until(() => core.internals.link.connected, 8000, 'first connection')
+    const first = hub.publicKey
+    const connections = hub.connections
+
+    const rotated = await hub.rotate()
+    await until(() => hub.publicKey === rotated && core.internals.link.connected && hub.connections > connections, 5000, 'reconnected with the new key')
+    assert.notEqual(rotated, first)
+    assert.deepEqual(hub.keysUsed, ['next'])
+    await until(() => core.internals.keys().previous === null, 3000, 'previous key dropped')
+    assert.equal(core.internals.pairing().paired?.publicKey, rotated)
+    const audit = await rpc<{ entries: { action: string; outcome: string }[] }>(host.routes, 'audit')
+    assert.ok(audit.ok && ['rotate-key-proposed', 'rotate-key-committed', 'rotate-key-finished'].every(action => audit.value.entries.some(entry => entry.action === action)))
+
+    // After a restart the stored key is the new one.
+    host.dispose()
+    await core.dispose()
+    host = fakeHost()
+    core = apply(host.ctx, undefined, { dataDir: dir, createAdapter: fakeAdapter().create })
+    await core.ready
+    await until(() => core.internals.link.connected, 8000, 'connection after restart')
+    assert.equal(core.internals.keys().current, rotated)
+
+    // The hub drops the new key before the host comes back: the host goes back to the key that works.
+    const failures = hub.authFailures
+    const abandoned = await hub.rotate({ forgetNext: true })
+    await until(() => hub.authFailures > failures && core.internals.link.connected, 8000, 'fell back to the old key')
+    assert.equal(hub.publicKey, rotated)
+    assert.equal(core.internals.keys().current, rotated)
+    await until(() => core.internals.keys().previous === null, 3000, 'the refused key is forgotten')
+    assert.notEqual(core.internals.pairing().paired?.publicKey, abandoned)
   } finally {
     host.dispose()
     await core.dispose()

@@ -7,10 +7,13 @@ import { homedir, hostname } from 'node:os'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import {
-  ENDPOINTS, OPERATIONS, PROTOCOL_VERSION, canonicalJson, unpairMessage,
+  ENDPOINTS, OPERATIONS, PROTOCOL_VERSION, canonicalJson, rotateKeyMessage, unpairMessage,
   type UnpairRequest,
-  type Grant, type HostEvent, type OperationId, type OwnerCredential, type PermissionLevel, type RequestFrame,
+  type Grant, type HostEvent, type OperationId, type OwnerCredential, type PermissionLevel, type RequestFrame, type RotateKeyCommitFrame, type RotateKeyFrame,
 } from '@dsh-remora/protocol'
+
+/** Operations the hub answers itself, or that are not request frames: never advertised as served operations. */
+const NOT_ADVERTISED: ReadonlySet<string> = new Set(['status', 'hosts.list', 'confirmation.get', 'audit.export', 'hub.export', 'host.rotate-key'])
 import type { HostContext } from '../dsh.ts'
 import { PLUGIN_VERSION } from '../dsh.ts'
 import { detectFeatures, type FeatureReport } from '../features.ts'
@@ -20,7 +23,7 @@ import { readCatalog, type Catalog } from './catalog.ts'
 import { HubLink, type LinkStatus, type SocketLike } from './connection.ts'
 import { Dispatcher } from './dispatch.ts'
 import { EventQueue, systemClock, type Clock } from './events.ts'
-import { HostKeyStore, type CredentialsLike, type HostKey } from './hostkey.ts'
+import { HostKey, HostKeyStore, type CredentialsLike } from './hostkey.ts'
 import { InstanceLock } from './lock.ts'
 import { PairingClient, type ApprovedPairing, type FetchLike, type PairingView } from './pairing.ts'
 import { ceilingAllows, fullAccessActive, wideningReasons } from './permissions.ts'
@@ -143,6 +146,12 @@ export class RemoraCore {
   private auditLog!: AuditLog
   private keyStore!: HostKeyStore
   private hostKey: HostKey | null = null
+  /** During a key rotation: the other key, kept until one of the two got through a handshake. */
+  private previousKey: HostKey | null = null
+  /** A proved new key waiting for the hub's commit. */
+  private pendingRotation: { nonce: string; key: HostKey } | null = null
+  /** Handshakes refused since the last swap of the two keys (fast retry only once). */
+  private keySwaps = 0
   private scope!: SettingsScopePolicy
   private tasks!: FileTaskStore
   private workspaceCreations!: FileWorkspaceCreationStore
@@ -193,10 +202,16 @@ export class RemoraCore {
     if (this.pairingDoc.value.paired) {
       try {
         this.hostKey = await this.keyStore.load()
+        this.previousKey = await this.keyStore.load('previous')
       } catch (error) {
         this.ctx.logger.warn('Remora: could not read the host key', error)
       }
-      if (this.hostKey && this.hostKey.publicKey !== this.pairingDoc.value.paired.publicKey) {
+      const pinned = this.pairingDoc.value.paired.publicKey
+      if (this.hostKey && this.hostKey.publicKey !== pinned && this.previousKey?.publicKey === pinned) {
+        // Stopped in the middle of a rotation, after the new key was stored: go on with it.
+        const current = this.hostKey
+        await this.pairingDoc.update(state => (state.paired ? { ...state, paired: { ...state.paired, publicKey: current.publicKey } } : state))
+      } else if (this.hostKey && this.hostKey.publicKey !== pinned) {
         this.ctx.logger.warn('Remora: the stored host key does not match the pairing; pair again')
         this.hostKey = null
       }
@@ -223,6 +238,9 @@ export class RemoraCore {
       onReady: () => this.onLinkReady(),
       onRequest: frame => { void this.onRequest(frame) },
       onOwnerCredentials: list => { void this.onOwnerCredentials(list) },
+      onRotateKey: frame => this.onRotateKey(frame),
+      onRotateKeyCommit: frame => { void this.onRotateKeyCommit(frame) },
+      onAuthFailed: () => this.onAuthFailed(),
       onFatal: reason => { void this.onFatal(reason) },
       ...(this.options.createSocket ? { createSocket: this.options.createSocket } : {}),
       clock: this.clock,
@@ -326,6 +344,13 @@ export class RemoraCore {
 
   private onLinkReady(): void {
     this.audit({ kind: 'connection', action: 'connected', outcome: 'ok' })
+    this.keySwaps = 0
+    if (this.previousKey) {
+      // The key in use got through: the other one is no longer needed.
+      this.previousKey = null
+      this.keyStore.delete('previous').catch(error => this.ctx.logger.warn('Remora: could not delete the previous host key', error))
+      this.audit({ kind: 'connection', action: 'rotate-key-finished', outcome: 'ok' })
+    }
     if (!this.adapterStarted && this.adapter) {
       this.adapterStarted = true
       try { this.adapter.start() } catch (error) { this.ctx.logger.warn('Remora: adapter start failed', error) }
@@ -351,6 +376,64 @@ export class RemoraCore {
     this.audit({ kind: 'connection', action: 'owner-credentials-changed', outcome: 'ok' })
   }
 
+  // --- host key rotation (host.rotate-key, approved by the owner on the hub) -------------------
+
+  /** Make a new key and prove it with the current one and itself. Nothing is stored until the hub commits. */
+  private onRotateKey(frame: RotateKeyFrame): void {
+    const paired = this.pairingDoc.value.paired
+    const key = this.hostKey
+    // One rotation at a time: a kept previous key means the last one has not finished.
+    if (!paired || !key || this.previousKey) return
+    const next = HostKey.generate(this.clock.now())
+    const message = rotateKeyMessage(paired.hubOrigin, paired.hostId, frame.nonce, frame.issuedAt, next.publicKey)
+    this.pendingRotation = { nonce: frame.nonce, key: next }
+    this.link.send({ t: 'rotate-key-proof', nonce: frame.nonce, publicKey: next.publicKey, signature: key.sign(message), newSignature: next.sign(message) })
+    this.audit({ kind: 'connection', action: 'rotate-key-proposed', outcome: 'ok' })
+  }
+
+  /** The hub accepted the new key: store both keys (old one first), then reconnect with the new one. */
+  private async onRotateKeyCommit(frame: RotateKeyCommitFrame): Promise<void> {
+    const pending = this.pendingRotation
+    const old = this.hostKey
+    if (!pending || !old || pending.nonce !== frame.nonce || pending.key.publicKey !== frame.publicKey) return
+    this.pendingRotation = null
+    try {
+      await this.keyStore.save(old, 'previous')
+      await this.keyStore.save(pending.key)
+      await this.pairingDoc.update(state => (state.paired ? { ...state, paired: { ...state.paired, publicKey: pending.key.publicKey } } : state))
+    } catch (error) {
+      this.ctx.logger.warn('Remora: could not store the new host key; keeping the old one', error)
+      await this.keyStore.save(old).catch(() => undefined)
+      await this.pairingDoc.update(state => (state.paired ? { ...state, paired: { ...state.paired, publicKey: old.publicKey } } : state)).catch(() => undefined)
+      this.audit({ kind: 'connection', action: 'rotate-key-committed', outcome: 'error' })
+      return
+    }
+    this.previousKey = old
+    this.hostKey = pending.key
+    this.audit({ kind: 'connection', action: 'rotate-key-committed', outcome: 'ok' })
+    this.link.reconnect()
+  }
+
+  /**
+   * The hub refused the handshake. With two keys (a rotation in flight), try
+   * the other one: the hub may have dropped the new key, or already the old.
+   */
+  private onAuthFailed(): boolean {
+    const other = this.previousKey
+    const current = this.hostKey
+    if (!other || !current) return false
+    this.hostKey = other
+    this.previousKey = current
+    this.keySwaps++
+    void (async () => {
+      await this.keyStore.save(other)
+      await this.keyStore.save(current, 'previous')
+      await this.pairingDoc.update(state => (state.paired ? { ...state, paired: { ...state.paired, publicKey: other.publicKey } } : state))
+    })().catch(error => this.ctx.logger.warn('Remora: could not store the swapped host keys', error))
+    this.audit({ kind: 'connection', action: 'rotate-key-swapped', outcome: 'error', reason: 'auth-failed' })
+    return this.keySwaps <= 1
+  }
+
   private async onFatal(reason: string): Promise<void> {
     this.audit({ kind: 'connection', action: reason, outcome: 'error' })
     if (reason === 'revoked') await this.pairingDoc.update(current => ({ ...current, revoked: true }))
@@ -373,7 +456,10 @@ export class RemoraCore {
     await this.stopLink('idle', null)
     this.lastUnpair = null
     await this.keyStore.save(key)
+    await this.keyStore.delete('previous')
     this.hostKey = key
+    this.previousKey = null
+    this.pendingRotation = null
     await this.pairingDoc.update(() => ({
       paired: { ...approved, publicKey: key.publicKey, pairedAt: this.clock.now() },
       pendingCredentials: null,
@@ -403,6 +489,8 @@ export class RemoraCore {
     await this.stopLink('idle', null)
     await this.keyStore.delete()
     this.hostKey = null
+    this.previousKey = null
+    this.pendingRotation = null
     this.adapterStarted = false
     await this.pairingDoc.reset()
     this.audit({ kind: 'settings', action: 'unpaired', outcome: this.lastUnpair.hub === 'removed' ? 'ok' : 'error', reason: `hub:${this.lastUnpair.hub}`, local })
@@ -654,7 +742,9 @@ export class RemoraCore {
   // --- reads ----------------------------------------------------------------------
 
   private operationIds(): string[] {
-    return this.features().available.filter(id => id !== 'status' && id !== 'hosts.list' && id !== 'confirmation.get')
+    const served = this.features().available.filter(id => !NOT_ADVERTISED.has(id))
+    // Served by the connection itself (rotate-key frames), whatever DSH offers.
+    return this.hostKey ? [...served, 'host.rotate-key'] : served
   }
 
   private features(): FeatureReport {
@@ -782,6 +872,9 @@ export class RemoraCore {
 
   /** @internal */
   get internals() {
-    return { link: this.link, events: this.events, dispatcher: this.dispatcher, tasks: this.tasks, scope: this.scope, settings: () => this.settingsDoc.value, pairing: () => this.pairingDoc.value }
+    return {
+      link: this.link, events: this.events, dispatcher: this.dispatcher, tasks: this.tasks, scope: this.scope, settings: () => this.settingsDoc.value, pairing: () => this.pairingDoc.value,
+      keys: () => ({ current: this.hostKey?.publicKey ?? null, previous: this.previousKey?.publicKey ?? null }),
+    }
   }
 }

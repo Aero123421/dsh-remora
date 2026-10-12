@@ -43,6 +43,11 @@ export const SERVICE_REQUIREMENTS: Readonly<Record<OperationId, readonly string[
   'terminal.run': ['workspaceRegistry', 'subprocess'],
   // Answered by the hub from its confirmation ledger; never offered by a host.
   'confirmation.get': [],
+  // Hub maintenance the hub answers itself.
+  'audit.export': [],
+  'hub.export': [],
+  // Served by the connection (rotate-key frames), not by DSH: core/remora.ts.
+  'host.rotate-key': [],
 }
 
 /**
@@ -61,6 +66,8 @@ export const IMPLEMENTED: ReadonlySet<OperationId> = new Set<OperationId>([
   'workspace.create', 'model.select', 'command.run', 'approval.respond',
   // P2
   'sessions.search', 'session.fork', 'job.stop', 'schedules.list', 'schedule.create', 'schedule.delete', 'terminal.run',
+  // Served by the connection itself.
+  'host.rotate-key',
 ])
 
 export interface FeatureReport {
