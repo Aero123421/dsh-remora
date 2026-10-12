@@ -15,6 +15,7 @@ import type { ErrorCode, RemoraError } from '@dsh-remora/protocol'
  * | 7    | hub or DSH host unreachable / unavailable / rate limited |
  * | 8    | timed out while waiting |
  * | 64   | usage error (bad arguments or invalid parameters) |
+ * | 130  | interrupted while waiting (Ctrl-C; the task keeps running) |
  */
 export const EXIT = {
   ok: 0,

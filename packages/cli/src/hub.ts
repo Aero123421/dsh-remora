@@ -40,11 +40,28 @@ export class Hub {
 
   async token(audience: Audience, forceRefresh = false): Promise<string> {
     if (this.staticToken) return this.staticToken
-    const tokens = this.tokens
-    if (!tokens) throw notLoggedIn()
+    if (!this.tokens) throw notLoggedIn()
     const key = this.key(audience)
-    const current = tokens.access[key]
-    if (!forceRefresh && current && (current.expiresAt === null || current.expiresAt - EXPIRY_MARGIN_MS > this.ctx.now())) return current.token
+    const fresh = (t: StoredTokens) => {
+      const current = t.access[key]
+      return current && (current.expiresAt === null || current.expiresAt - EXPIRY_MARGIN_MS > this.ctx.now()) ? current.token : null
+    }
+    if (!forceRefresh) {
+      const token = fresh(this.tokens)
+      if (token) return token
+    }
+    // Another remora process (e.g. a long-running `remora mcp`) may have
+    // refreshed — and rotated the refresh token — since we loaded it.
+    if (this.store) {
+      const latest = await this.store.load(this.url)
+      if (latest && latest.refreshToken !== this.tokens.refreshToken) {
+        const used = this.tokens.access[key]?.token
+        this.tokens = latest
+        const token = fresh(latest)
+        if (token && token !== used) return token
+      }
+    }
+    const tokens = this.tokens
     const response = await refresh(this.ctx, tokens, tokens.resources[audience])
     tokens.access[key] = toAccess(this.ctx, response)
     if (response.refresh_token) tokens.refreshToken = response.refresh_token

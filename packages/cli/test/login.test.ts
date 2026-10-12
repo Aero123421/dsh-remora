@@ -146,3 +146,20 @@ test('expired access tokens refresh automatically, and a 401 triggers one refres
     await hub.stop()
   }
 })
+
+test('a second process that rotated the refresh token does not log the first one out', async () => {
+  const hub = await new FakeHub(18113).start()
+  try {
+    const t = await testCtx()
+    await seedLogin(t, hub)
+    const first = await openHub(t.ctx, undefined)
+    const second = await openHub(t.ctx, undefined)
+    const rotated = await second.token('api', true)
+    assert.equal(await first.token('api', true), rotated, 'reuses the token the other process just obtained')
+    hub.validAccess.clear()
+    const again = await first.token('api', true)
+    assert.ok(hub.validAccess.has(again), 'refreshes with the rotated refresh token')
+  } finally {
+    await hub.stop()
+  }
+})

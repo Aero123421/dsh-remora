@@ -150,6 +150,12 @@ async function waitFor(cmd: Cmd, hub: Hub, first: TaskInfo, options: WaitOptions
     lastState = info.state
   }
   report()
+  // Ctrl-C stops waiting, not the task.
+  const onInterrupt = () => {
+    ctx.err(`${progress ? '\n' : ''}待機をやめました。タスクは続いています: remora tasks wait ${info.taskId}`)
+    process.exit(130)
+  }
+  process.once('SIGINT', onInterrupt)
   try {
     for (;;) {
       if (done(info)) return { info, timedOut: false }
@@ -169,6 +175,7 @@ async function waitFor(cmd: Cmd, hub: Hub, first: TaskInfo, options: WaitOptions
       if (!done(info) && info.state !== 'needs_attention' && ctx.now() - callStarted < 1000) await ctx.sleep(2000)
     }
   } finally {
+    process.off('SIGINT', onInterrupt)
     if (progress) ctx.errWrite('\n')
   }
 }

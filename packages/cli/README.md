@@ -56,6 +56,7 @@ claude mcp add remora -- remora mcp        # Claude Code
 | 7 | ハブやホストに届かない、回数制限 |
 | 8 | 待機の打ち切り（`--timeout`） |
 | 64 | 使い方の誤り、入力の検証エラー（送信前に `validateParams` で検査） |
+| 130 | 待機中の Ctrl-C（タスクは続行） |
 
 ## 設定とトークン
 
