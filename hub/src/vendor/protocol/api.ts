@@ -209,8 +209,19 @@ export interface SessionGetResult {
   recentTurns: TurnPreview[]
   queueLength: number
   attention: AttentionItem[]
+  /** Background jobs the session started (e.g. long-running commands), newest last. */
+  jobs?: JobInfo[]
   hasLiveClient: boolean
   untrusted: true
+}
+
+export interface JobInfo {
+  jobId: string
+  /** e.g. `bash`. */
+  kind: string
+  /** What runs, e.g. the command line. Redacted; untrusted. */
+  label: string
+  status: 'running' | 'stopping' | 'completed' | 'failed' | 'killed' | string
 }
 
 export interface TranscriptItem {
@@ -339,6 +350,105 @@ export interface CommandRunResult { accepted: boolean; output: string | null; un
 /** Placements are needed by clients to call workspace.create; returned alongside workspaces by the host. */
 export interface PlacementsListResult { placements: PlacementInfo[] }
 
+// --- P2 ------------------------------------------------------------------
+
+export interface SessionsSearchParams extends HostRef { query: string; workspaceId?: string; sessionId?: string; limit?: number }
+export interface SearchHit {
+  sessionId: string
+  /** Session title. Untrusted. */
+  title: string
+  workspaceId: string | null
+  /** Where the words matched. */
+  role: 'title' | 'user' | 'assistant'
+  /** Turn of the matching message (null for a title match). */
+  turn: number | null
+  at: number | null
+  /** Text around the match, redacted. Untrusted. */
+  snippet: string
+}
+export interface SessionsSearchResult {
+  hits: SearchHit[]
+  /** Sessions whose text was searched. */
+  scanned: number
+  /** True when the search stopped early (time or size budget); narrow it with workspaceId or sessionId. */
+  partial: boolean
+  untrusted: true
+}
+
+export interface SessionForkParams extends HostRef { sessionId: string; atTurn?: number; title?: string }
+export interface SessionForkResult { session: SessionSummary; forkedFrom: string }
+
+export interface JobStopParams extends HostRef { jobId: string }
+export interface JobStopResult { stopped: boolean; status: string }
+
+/** When a scheduled prompt is due. Exactly one member. */
+export type ScheduleWhen =
+  | { afterSeconds: number }
+  | { at: string }
+  | { everySeconds: number }
+  | { daily: { time: string; timeZone: string } }
+  | { weekly: { time: string; timeZone: string; weekdays: number[] } }
+  | { cron: { expression: string; timeZone: string } }
+
+export interface ScheduleInfo {
+  scheduleId: string
+  sessionId: string
+  /** Untrusted. */
+  title: string
+  /** The prompt it sends; only with the dsh.content scope. Untrusted. */
+  prompt?: string
+  kind: 'after' | 'at' | 'every' | 'daily' | 'weekly' | 'cron'
+  /** The rule in words, e.g. "daily 09:00 Asia/Tokyo". */
+  rule: string
+  /** Next (or, once inactive, the final) due time, epoch ms. */
+  nextAt: number | null
+  status: 'active' | 'inactive'
+  lastDeliveredAt: number | null
+}
+export interface SchedulesListParams extends HostRef { sessionId?: string }
+export interface SchedulesListResult { schedules: ScheduleInfo[] }
+export interface ScheduleCreateParams extends HostRef { sessionId: string; title: string; prompt: string; when: ScheduleWhen; idempotencyKey: string }
+export interface ScheduleCreateResult { schedule: ScheduleInfo }
+export interface ScheduleDeleteParams extends HostRef { sessionId: string; scheduleId: string }
+export interface ScheduleDeleteResult { deleted: boolean }
+
+export interface TerminalRunParams extends HostRef { command: string; cwdWorkspaceId: string; timeoutMs?: number }
+/** What the DSH host returns for terminal.run once the owner confirmed it. */
+export interface TerminalRunOutput {
+  exitCode: number | null
+  /** Set when the command died from a signal (including the timeout). */
+  signal: string | null
+  timedOut: boolean
+  /** Redacted, at most 64 KB each (the tail when longer). Untrusted. */
+  stdout: string
+  stderr: string
+  truncated: boolean
+  durationMs: number
+  untrusted: true
+}
+
+export type ConfirmationState = 'pending' | 'running' | 'done' | 'failed' | 'denied' | 'expired'
+/**
+ * An operation waiting for (or finished after) the owner's passkey
+ * confirmation on the hub. Clients receive this from operations that need
+ * the passkey on every call (terminal.run) and from confirmation.get.
+ */
+export interface ConfirmationInfo {
+  confirmationId: string
+  hostId: string
+  operation: string
+  state: ConfirmationState
+  /** The hub page where the owner reviews and confirms it. */
+  confirmUrl?: string
+  createdAt: number
+  expiresAt: number
+  /** The host's result once `done` (e.g. TerminalRunOutput). */
+  result?: unknown
+  /** Why it `failed`. */
+  error?: RemoraError
+}
+export interface ConfirmationGetParams { confirmationId: string; timeoutMs?: number }
+
 export interface OperationParams {
   'status': StatusParams
   'hosts.list': HostsListParams
@@ -365,9 +475,14 @@ export interface OperationParams {
   'model.select': ModelSelectParams
   'command.run': CommandRunParams
   'approval.respond': AttentionRespondParams
-  'terminal.run': HostRef & { command: string; cwdWorkspaceId: string; timeoutMs?: number }
-  'job.stop': HostRef & { jobId: string }
-  'schedule.manage': HostRef & { action: 'list' | 'create' | 'delete'; scheduleId?: string; spec?: unknown }
+  'sessions.search': SessionsSearchParams
+  'session.fork': SessionForkParams
+  'job.stop': JobStopParams
+  'schedules.list': SchedulesListParams
+  'schedule.create': ScheduleCreateParams
+  'schedule.delete': ScheduleDeleteParams
+  'terminal.run': TerminalRunParams
+  'confirmation.get': ConfirmationGetParams
 }
 
 export interface OperationResults {
@@ -396,9 +511,15 @@ export interface OperationResults {
   'model.select': ModelSelectResult
   'command.run': CommandRunResult
   'approval.respond': AttentionRespondResult
-  'terminal.run': { exitCode: number | null; output: string; truncated: boolean; untrusted: true }
-  'job.stop': { stopped: boolean }
-  'schedule.manage': { schedules: unknown[] }
+  'sessions.search': SessionsSearchResult
+  'session.fork': SessionForkResult
+  'job.stop': JobStopResult
+  'schedules.list': SchedulesListResult
+  'schedule.create': ScheduleCreateResult
+  'schedule.delete': ScheduleDeleteResult
+  /** From the DSH host; clients receive a ConfirmationInfo carrying it as `result`. */
+  'terminal.run': TerminalRunOutput
+  'confirmation.get': ConfirmationInfo
 }
 
 /**
@@ -409,3 +530,6 @@ export const HUB_OPERATIONS: ReadonlySet<string> = new Set(['status', 'hosts.lis
 
 /** Operations the hub resolves to a host through its task ledger (no hostId needed). */
 export const TASK_LEDGER_OPERATIONS: ReadonlySet<string> = new Set(['task.get', 'task.wait', 'task.resubmit'])
+
+/** Answered from the hub's confirmation ledger of the host named in the confirmation id; never sent to a host. */
+export const CONFIRMATION_LEDGER_OPERATIONS: ReadonlySet<string> = new Set(['confirmation.get'])

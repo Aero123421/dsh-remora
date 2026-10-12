@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { CONFIRMATION_UNLESS_ALLOWED, OPERATIONS, findOperationByTool, remoraRequestId, type OperationSpec } from '../src/index.ts'
+import { CONFIRMATION_UNLESS_ALLOWED, OPERATIONS, REQUIRES_CONFIRMATION, findOperationByTool, remoraRequestId, type OperationSpec } from '../src/index.ts'
 
 const all = OPERATIONS as readonly OperationSpec[]
 
@@ -31,8 +31,12 @@ test('approvals are a request-level tool guarded by the DSH-side switch', () => 
   assert.ok(CONFIRMATION_UNLESS_ALLOWED.has('approval.respond'))
 })
 
-test('dangerous operations are not exposed as MCP tools yet', () => {
-  for (const op of all.filter(op => op.level === 'full')) assert.equal(op.tool, undefined, op.id)
+test('full-access operations need the owner\'s passkey on every call', () => {
+  const full = all.filter(op => op.level === 'full').map(op => op.id)
+  assert.deepEqual(full, ['terminal.run'])
+  for (const id of full) assert.ok(REQUIRES_CONFIRMATION.has(id), id)
+  assert.equal(findOperationByTool('dsh_terminal_run')?.id, 'terminal.run')
+  assert.equal(findOperationByTool('dsh_confirmation_get')?.id, 'confirmation.get')
 })
 
 test('the P0 MCP surface matches the design', () => {

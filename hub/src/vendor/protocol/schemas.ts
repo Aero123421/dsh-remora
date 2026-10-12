@@ -47,6 +47,20 @@ const target: JsonSchema = {
   ],
 }
 
+const timeZone = str('IANA time zone, e.g. Asia/Tokyo or UTC.', 64)
+const clock = { type: 'string', pattern: '^([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$', description: 'Local time HH:mm or HH:mm:ss.' } as const
+const when: JsonSchema = {
+  description: 'When the prompt is due: exactly one of these shapes.',
+  oneOf: [
+    obj({ afterSeconds: int('Once, this many seconds from now.', 1, 366 * 24 * 3600) }, ['afterSeconds']),
+    obj({ at: { type: 'string', minLength: 20, maxLength: 40, pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T', description: 'Once, at this RFC 3339 instant with an offset, e.g. 2026-10-13T09:00:00+09:00.' } }, ['at']),
+    obj({ everySeconds: int('Repeatedly, every this many seconds (at least 60).', 60, 366 * 24 * 3600) }, ['everySeconds']),
+    obj({ daily: obj({ time: clock, timeZone }, ['time', 'timeZone']) }, ['daily']),
+    obj({ weekly: obj({ time: clock, timeZone, weekdays: { type: 'array', items: int('ISO weekday: 1 = Monday … 7 = Sunday.', 1, 7), maxItems: 7, description: 'Days of the week.' } }, ['time', 'timeZone', 'weekdays']) }, ['weekly']),
+    obj({ cron: obj({ expression: str('Five-field cron expression: minute hour day-of-month month day-of-week.', 100), timeZone }, ['expression', 'timeZone']) }, ['cron']),
+  ],
+}
+
 const answer = obj({
   optionId: str('Id of the chosen option.', 200),
   text: str('Free-text answer.', 20_000),
@@ -79,9 +93,14 @@ export const INPUT_SCHEMAS: Readonly<Record<OperationId, ObjectSchema>> = {
   'model.select': obj({ hostId, sessionId, provider: str('Provider name.', 100), model: str('Model name.', 200), effort: str('Effort level, e.g. low / medium / high.', 32) }, ['sessionId', 'model']),
   'command.run': obj({ hostId, sessionId, command: { type: 'string', minLength: 2, maxLength: 64, pattern: '^/[a-z0-9][a-z0-9-]*$', description: 'Slash command, e.g. /compact.' }, args: str('Arguments after the command.', 4000) }, ['sessionId', 'command']),
   'approval.respond': obj({ hostId, sessionId, attentionId: str('Approval id.', 200), answer }, ['sessionId', 'attentionId', 'answer']),
-  'terminal.run': obj({ hostId, command: str('Shell command.', 8000), cwdWorkspaceId: workspaceId, timeoutMs: int('Timeout.', 1000, 600_000) }, ['command', 'cwdWorkspaceId']),
-  'job.stop': obj({ hostId, jobId: str('Background job id.', 200) }, ['jobId']),
-  'schedule.manage': obj({ hostId, action: { type: 'string', enum: ['list', 'create', 'delete'] }, scheduleId: str('Schedule id.', 200), spec: {} }, ['action']),
+  'sessions.search': obj({ hostId, query: str('Words to find (all must appear in the same message or title; case-insensitive).', 200), workspaceId, sessionId, limit: int('Most hits to return.', 1, 50) }, ['query']),
+  'session.fork': obj({ hostId, sessionId, atTurn: int('Copy up to the end of this turn (1 = first). Default: the last finished turn.', 1, 1_000_000), title: str('Title for the new session.') }, ['sessionId']),
+  'job.stop': obj({ hostId, jobId: str('Background job id from dsh_session_get.', 200) }, ['jobId']),
+  'schedules.list': obj({ hostId, sessionId }),
+  'schedule.create': obj({ hostId, sessionId, title: str('Name of the scheduled prompt.', 120), prompt: str('What the agent should do when it is due.', 20_000), when, idempotencyKey }, ['sessionId', 'title', 'prompt', 'when', 'idempotencyKey']),
+  'schedule.delete': obj({ hostId, sessionId, scheduleId: str('Schedule id from dsh_schedules_list.', 200) }, ['sessionId', 'scheduleId']),
+  'terminal.run': obj({ hostId, command: str('Shell command (run with the host\'s default shell: sh -c on macOS/Linux, cmd /c on Windows).', 8000), cwdWorkspaceId: workspaceId, timeoutMs: int('Kill the command after this many milliseconds (default 60000).', 1000, 600_000) }, ['command', 'cwdWorkspaceId']),
+  'confirmation.get': obj({ confirmationId: str('Confirmation id from a pending result.', 64), timeoutMs: int('How long to wait for the outcome, at most 25000.', 0, 25_000) }, ['confirmationId']),
 }
 
 export interface ValidationIssue { path: string; message: string }

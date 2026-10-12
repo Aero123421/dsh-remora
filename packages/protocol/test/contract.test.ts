@@ -34,6 +34,24 @@ test('patterns guard folder names, git URLs and slash commands', () => {
   assert.ok(validateParams('task.wait', { taskId: 't', timeoutMs: 60_000 }).length > 0)
 })
 
+test('schedules take exactly one timing shape', () => {
+  const base = { sessionId: 's', title: 'Daily check', prompt: 'Check CI', idempotencyKey: 'k' }
+  assert.deepEqual(validateParams('schedule.create', { ...base, when: { daily: { time: '09:00', timeZone: 'Asia/Tokyo' } } }), [])
+  assert.deepEqual(validateParams('schedule.create', { ...base, when: { weekly: { time: '18:30:00', timeZone: 'UTC', weekdays: [1, 5] } } }), [])
+  assert.deepEqual(validateParams('schedule.create', { ...base, when: { at: '2026-10-13T09:00:00+09:00' } }), [])
+  assert.deepEqual(validateParams('schedule.create', { ...base, when: { cron: { expression: '0 9 * * 1-5', timeZone: 'Asia/Tokyo' } } }), [])
+  assert.ok(validateParams('schedule.create', { ...base, when: { afterSeconds: 60, everySeconds: 60 } }).length > 0)
+  assert.ok(validateParams('schedule.create', { ...base, when: { everySeconds: 30 } }).length > 0)
+  assert.ok(validateParams('schedule.create', { ...base, when: { daily: { time: '25:00', timeZone: 'UTC' } } }).length > 0)
+  assert.ok(validateParams('schedule.create', { ...base, when: { weekly: { time: '09:00', timeZone: 'UTC', weekdays: [0] } } }).length > 0)
+  assert.ok(validateParams('schedule.create', { ...base, idempotencyKey: undefined, when: { afterSeconds: 60 } }).length > 0)
+  assert.deepEqual(validateParams('terminal.run', { command: 'git status', cwdWorkspaceId: 'w1', timeoutMs: 5000 }), [])
+  assert.ok(validateParams('terminal.run', { command: 'ls' }).length > 0)
+  assert.deepEqual(validateParams('confirmation.get', { confirmationId: 'h-1', timeoutMs: 25_000 }), [])
+  assert.deepEqual(validateParams('sessions.search', { query: 'migration plan', limit: 10 }), [])
+  assert.deepEqual(validateParams('session.fork', { sessionId: 's', atTurn: 3, title: 'Try B' }), [])
+})
+
 test('base64url and canonical JSON', async () => {
   const bytes = new Uint8Array([0, 1, 250, 251, 252, 253, 254, 255])
   assert.deepEqual(fromBase64Url(toBase64Url(bytes)), bytes)
@@ -51,6 +69,8 @@ test('confirmation challenges bind every field', async () => {
     assert.notEqual(await confirmationChallenge({ ...subject, ...change }), challenge)
   }
   assert.ok(REQUIRES_CONFIRMATION.has('terminal.run'))
+  assert.ok(!REQUIRES_CONFIRMATION.has('job.stop'))
+  assert.ok(!REQUIRES_CONFIRMATION.has('schedule.create'))
   assert.ok(!REQUIRES_CONFIRMATION.has('approval.respond'))
   assert.ok(!REQUIRES_CONFIRMATION.has('task.start'))
 })
