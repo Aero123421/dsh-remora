@@ -403,6 +403,8 @@ export interface ScheduleInfo {
   nextAt: number | null
   status: 'active' | 'inactive'
   lastDeliveredAt: number | null
+  /** The client that created it through Remora. Such schedules go away with the kill switch and unpairing. */
+  createdBy?: string
 }
 export interface SchedulesListParams extends HostRef { sessionId?: string }
 export interface SchedulesListResult { schedules: ScheduleInfo[] }

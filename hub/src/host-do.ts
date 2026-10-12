@@ -822,7 +822,7 @@ export class HostDO extends DurableObject<Env> {
       if (row.state === 'pending') {
         this.sql.exec("UPDATE confirmations SET state = 'expired', params = '{}', updated_at = ? WHERE id = ?", now, row.id)
       } else {
-        this.sql.exec("UPDATE confirmations SET state = 'failed', error = ?, updated_at = ? WHERE id = ?", JSON.stringify(err('unavailable', 'The DSH host did not report the outcome in time.')), now, row.id)
+        this.sql.exec("UPDATE confirmations SET state = 'failed', error = ?, updated_at = ? WHERE id = ?", JSON.stringify(err('unavailable', 'The DSH host did not report the outcome in time (for example, it went offline). The operation may still have run: check on that machine before asking again.')), now, row.id)
       }
       this.notify(`c:${row.id}`)
     }

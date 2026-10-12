@@ -127,11 +127,11 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 | `sessions.search` | `sessions.search` で `task.complete` の nonce を探すと、そのセッションの依頼（`user`）と返答（`assistant`）の両方が見つかり、ありえない語を足すと 0 件 |
 | `session.fork` | `task.complete` のターンまでを `session.fork` で写すと、同じワークスペースに指定したタイトルで新しいセッションができ、`session.read` でそのターンで終わっている |
 | `job.stop` | モックが `bash` を `run_in_background: true` で呼び、`sleep` するジョブを残す。そのタスクは終わらずに動き続け、`session.get` の `jobs` に実行中で出て、`job.output` に目印が出る。`job.stop` で止まり（2 回目は `stopped: false`）、タスクは `completed` になる（DSH がジョブの終了を伝えて続きのターンが入ることがある） |
-| `schedule.create` | 毎日のスケジュールを作る（同じ冪等キーでは同じものが返る）と `schedules.list` に依頼文つきで出て、`schedule.delete` で消える。2 秒後の 1 回きりのスケジュールは、DSH が依頼として届けてモックの返答のターンができる |
+| `schedule.create` | 毎日のスケジュールを作る（同じ冪等キーでは同じものが返る）と `schedules.list` に依頼文つきで出て、`schedule.delete` で消える。2 秒後の 1 回きりのスケジュールは、DSH が依頼として届けてモックの返答のターンができる。最後に 1 時間ごとのものを 1 つ残す（`createdBy` 付き） |
 | `terminal.run` | 「依頼できる」のトークンからの `terminal.run` は 403 で断られる。Remora タブで上限を「リモート全権」にする（確認ダイアログ）と、ハブのホスト画面にターミナルが出る。コマンドを送ると `/confirm/<ホスト>/<ID>` に移り、コマンドが表示され、パスキーで確認すると、出力（目印とワークスペースのフォルダ）がその画面に出る。2 つ目は「拒否する」で拒否済みになる。最後に上限を「依頼できる」に戻す |
 | `maintenance.audit` | ハブの設定画面で `dsh.read`・`dsh.admin` の個人トークンを発行し、HTTP API の `audit.export` を呼ぶと `pending`（`/confirm/hub/<ID>`）で返る。承認前の `confirmation.get` には結果が無い。そのページでパスキーを使って承認すると `done` になり、受け取ったハブとホストの監査ログのハッシュ連鎖が、ハブの外（`packages/protocol/src/audit.ts`）で計算し直して正しい |
 | `maintenance.rotate-key` | ハブのホスト画面の「ホスト鍵の更新」をパスキーの再確認つきで押すと、実際のプラグインが新しい鍵を証明してつなぎ直し、`msg=key-rotated` になる。DSH の Remora タブは再び「Connected」になり、そのあとタスクが完了する。古い鍵のファイルは残らない |
-| `kill-switch.enforced` | DSH 側で緊急停止を入れると `task.start` が 403（`denied`、層は dsh）で拒否され、切ると再接続してタスクがまた完了する |
+| `kill-switch.enforced` | DSH 側で緊急停止を入れると `task.start` が 403（`denied`、層は dsh）で拒否され、切ると再接続してタスクがまた完了する。`schedule.create` で残しておいた Remora 経由のスケジュールは消えている |
 
 ハブは `http://localhost:8788` として使います。WebAuthn は IP アドレスを RP ID にできないためです。ハブの状態は一時ディレクトリに置くので、毎回オーナー未登録の状態から始まります。`wrangler dev` には `WRANGLER_SEND_METRICS=false` と `CLOUDFLARE_CF_FETCH_ENABLED=false`（`Request.cf` を取りに行かない）を渡します。
 

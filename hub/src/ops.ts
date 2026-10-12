@@ -222,7 +222,10 @@ export function confirmations(env: Env, hostId: string) {
 async function approvalInfo(env: Env, row: ApprovalRecord, origin: string | undefined): Promise<ConfirmationInfo> {
   const info: ConfirmationInfo = { confirmationId: row.id, hostId: '', operation: row.operation, state: row.state, createdAt: row.createdAt, expiresAt: row.expiresAt }
   if (origin) info.confirmUrl = `${origin}/confirm/hub/${row.id}`
-  if (row.state === 'done' && row.decidedAt !== null && Date.now() - row.decidedAt < APPROVAL_RESULT_MS) info.result = await maintenanceResult(env, row.operation, origin ?? '')
+  // Built when collected, at most a few times within the hour (each build reads every log).
+  if (row.state === 'done' && row.decidedAt !== null && Date.now() - row.decidedAt < APPROVAL_RESULT_MS && (await hubStub(env).claimApprovalResult(row.id, row.clientId))) {
+    info.result = await maintenanceResult(env, row.operation, origin ?? '')
+  }
   return info
 }
 

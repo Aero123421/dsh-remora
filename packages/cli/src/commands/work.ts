@@ -166,8 +166,8 @@ export function whenOf(cmd: Cmd): ScheduleWhen {
 }
 
 function scheduleRows(list: readonly ScheduleInfo[]): string[] {
-  return table(['スケジュール ID', 'セッション', '名前', 'いつ', '次回', '状態'], list.map(s => [
-    s.scheduleId, s.sessionId, s.title, s.rule, fmtTime(s.nextAt), s.status === 'active' ? '有効' : '終了',
+  return table(['スケジュール ID', 'セッション', '名前', 'いつ', '次回', '状態', '作成'], list.map(s => [
+    s.scheduleId, s.sessionId, s.title, s.rule, fmtTime(s.nextAt), s.status === 'active' ? '有効' : '終了', s.createdBy ? `${s.createdBy}（Remora 経由）` : 'DSH',
   ]), 40)
 }
 
@@ -189,6 +189,7 @@ export const schedules: CommandDef = {
     '--daily、--weekly、--cron の時刻は --tz（既定はこの PC のタイムゾーン）で読みます。',
     'プロンプトを省くと標準入力から読みます。時間になると DSH がそのセッションに依頼として送ります（その PC で DSH Web が動いているときだけ）。',
     '依頼できる権限が必要です。ls で依頼文も見るには dsh.content スコープが必要です。',
+    'Remora 経由で作ったスケジュールは 1 ホスト 20 件までで、DSH 側で緊急停止を入れるかペアリングを解除すると削除されます。',
   ],
   flags: { host: 'string', session: 'string', title: 'string', after: 'string', at: 'string', every: 'string', daily: 'string', weekly: 'string', cron: 'string', tz: 'string', key: 'string' },
   async run(cmd) {

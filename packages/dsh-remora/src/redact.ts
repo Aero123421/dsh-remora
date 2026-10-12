@@ -75,6 +75,18 @@ export function redact(text: string): string {
 }
 
 /** Redact and cut to at most `max` characters (UTF-16 units), marking the cut. */
+/**
+ * Output whose head was cut off (a tail kept from a longer stream) can start
+ * in the middle of a secret, past the prefix that redaction recognizes. Drop
+ * that first partial line before redacting (or, without a line break near
+ * the start, the first 256 characters).
+ */
+export function dropPartialHead(text: string): string {
+  const newline = text.indexOf('\n')
+  if (newline >= 0 && newline < 4096) return text.slice(newline + 1)
+  return text.length > 256 ? `…${text.slice(256)}` : ''
+}
+
 export function redactTruncate(text: string, max: number): { text: string; truncated: boolean } {
   const masked = redact(text)
   if (masked.length <= max) return { text: masked, truncated: false }

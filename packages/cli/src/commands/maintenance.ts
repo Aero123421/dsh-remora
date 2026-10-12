@@ -9,7 +9,7 @@
  */
 import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
-import { verifyAuditRecords, type AuditExportResult, type AuditLogExport, type HostRotateKeyResult, type HubExportResult } from '@dsh-remora/protocol'
+import { AUDIT_KEPT_ROWS, verifyAuditRecords, type AuditExportResult, type AuditLogExport, type HostRotateKeyResult, type HubExportResult } from '@dsh-remora/protocol'
 import { bool, str } from '../args.ts'
 import { hostParam, hubOf, printJson, type Cmd, type CommandDef } from '../command.ts'
 import { asConfirmation, showConfirmUrl, unsettledExit, waitForConfirmation, waitLimit } from '../confirm.ts'
@@ -57,7 +57,7 @@ async function loadAnchors(cmd: Cmd): Promise<Anchors> {
   }
 }
 
-export type AnchorCheck = 'none' | 'ok' | 'mismatch' | 'truncated' | 'pruned'
+export type AnchorCheck = 'none' | 'ok' | 'mismatch' | 'truncated' | 'pruned' | 'missing'
 
 export interface LogCheck {
   log: string
@@ -81,7 +81,8 @@ export async function checkLog(log: AuditLogExport, anchor: { seq: number; hash:
     const pinned = records.find(record => record.seq === anchor.seq)
     if (pinned) check = pinned.hash === anchor.hash ? 'ok' : 'mismatch'
     else if (last === null || anchor.seq > last) check = 'truncated'
-    else check = 'pruned'
+    // The hub drops old rows only once a log holds its full quota; fewer rows means rows were removed.
+    else check = records.length >= AUDIT_KEPT_ROWS ? 'pruned' : 'mismatch'
   }
   return { log: log.log, name: log.name, records: records.length, first, last, brokenAt, anchor: check }
 }
@@ -92,6 +93,7 @@ const ANCHOR_TEXT: Readonly<Record<AnchorCheck, string>> = {
   mismatch: '前回の確認位置と食い違い',
   truncated: '前回より短くなっている',
   pruned: '前回の確認位置は保存期間外',
+  missing: 'ログごと無くなっている',
 }
 
 export const audit: CommandDef = {
@@ -136,7 +138,11 @@ export const audit: CommandDef = {
     const anchors = useAnchors ? await loadAnchors(cmd) : {}
     const pinned = anchors[hubKey] ?? {}
     const checks = await Promise.all(exported.logs.map(log => checkLog(log, pinned[log.log])))
-    const bad = checks.filter(check => check.brokenAt !== null || check.anchor === 'mismatch' || check.anchor === 'truncated')
+    // A log checked before must still be there.
+    for (const [log, anchor] of Object.entries(pinned)) {
+      if (!exported.logs.some(item => item.log === log)) checks.push({ log, name: log, records: 0, first: null, last: null, brokenAt: null, anchor: anchor ? 'missing' : 'none' })
+    }
+    const bad = checks.filter(check => check.brokenAt !== null || check.anchor === 'mismatch' || check.anchor === 'truncated' || check.anchor === 'missing')
     if (useAnchors && bad.length === 0) {
       const now = cmd.ctx.now()
       const next = { ...pinned }

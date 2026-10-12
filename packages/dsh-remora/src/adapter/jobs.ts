@@ -6,7 +6,7 @@
 import type { JobInfo, OperationParams, OperationResults } from '@dsh-remora/protocol'
 import type { OperationContext } from '../ops/types.ts'
 import { OperationError } from '../ops/types.ts'
-import { redactLine, redactTruncate } from '../redact.ts'
+import { dropPartialHead, redactLine, redactTruncate } from '../redact.ts'
 import type { DshJobs, DshJobView } from './dsh-types.ts'
 import { SERVICES } from './dsh-types.ts'
 import { denied, fromDsh, notFound, unavailable } from './errors.ts'
@@ -52,10 +52,9 @@ export function createJobs(rt: Runtime) {
       }
     }
     if (!view) throw notFound(`job ${jobId} not found`)
-    if (view.owner !== undefined) {
-      const row = rows.find(item => item.sessionId === view!.owner)
-      if (!row || !rt.canAccess(row)) throw denied(`job ${jobId} belongs to a session outside Remora's reach`)
-    }
+    // Only jobs of a session in scope: a job no session owns is outside any workspace scope.
+    const row = view.owner === undefined ? undefined : rows.find(item => item.sessionId === view!.owner)
+    if (!row || !rt.canAccess(row)) throw denied(`job ${jobId} does not belong to a session Remora may reach`)
     return { jobs, view, owner }
   }
 
@@ -66,7 +65,8 @@ export function createJobs(rt: Runtime) {
       const tail = params.tailBytes ?? 64_000
       const from = Math.max(view.output.earliest, view.output.total - tail)
       const read = jobs.readAt(params.jobId, from, owner)
-      const output = read.chunks.map(chunk => chunk.text).join('')
+      const joined = read.chunks.map(chunk => chunk.text).join('')
+      const output = from > 0 || read.lossy ? dropPartialHead(joined) : joined
       const bounded = redactTruncate(output, tail)
       return {
         output: bounded.text,

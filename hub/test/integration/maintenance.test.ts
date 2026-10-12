@@ -86,6 +86,11 @@ describe('hub maintenance the owner approves on the hub', () => {
     expect(text).not.toContain(token)
     expect(text).not.toContain(host.publicKey)
     expect(text).not.toContain('"publicKey"')
+    // Built at most three times per approval.
+    for (let i = 0; i < 2; i++) expect(((await api(token, 'confirmation.get', { confirmationId: parked.confirmationId })).body as unknown as ConfirmationInfo).result).toBeDefined()
+    const spent = (await api(token, 'confirmation.get', { confirmationId: parked.confirmationId })).body as unknown as ConfirmationInfo
+    expect(spent.state).toBe('done')
+    expect(spent.result).toBeUndefined()
 
     // Refused: the client learns it, and nothing is handed out.
     const second = (await api(token, 'hub.export')).body as unknown as ConfirmationInfo

@@ -182,7 +182,7 @@ table.grants select { width: auto; min-width: 160px; }
 .countdown { font-variant-numeric: tabular-nums; font-weight: 600; color: #f2c97a; }
 .countdown.expired { color: #ff9b9b; }
 .attention-item.kind-approval, .attention-item.kind-confirmation { border-color: rgba(226, 91, 91, 0.45); }
-.command { white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(0, 0, 0, 0.35); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 0; }
+.command { unicode-bidi: isolate; direction: ltr; white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(0, 0, 0, 0.35); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 0; }
 .hits .snippet { margin: 4px 0 0; }
 .weekdays { display: flex; flex-wrap: wrap; gap: 4px 12px; }
 .confirm-preview { margin-top: 10px; }

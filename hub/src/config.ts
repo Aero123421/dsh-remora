@@ -1,3 +1,4 @@
+import { AUDIT_KEPT_ROWS } from './vendor/protocol/index.ts'
 /**
  * Settings that come from secrets and variables (never from wrangler.jsonc,
  * so the upstream-sync pull request never conflicts), plus fixed limits.
@@ -36,7 +37,7 @@ export function hubOrigin(request: Request, env: Env): string {
 /** The client id the owner UI acts as. Its tasks are visible to the owner only. */
 export const OWNER_CLIENT_ID = 'hub-ui'
 /** Audit rows kept per log (hub and each host); older rows are dropped. */
-export const AUDIT_MAX_ROWS = 10_000
+export const AUDIT_MAX_ROWS = AUDIT_KEPT_ROWS
 
 export const SESSION_COOKIE = '__Host-remora_sid'
 /** Sessions end after this long without a request. */

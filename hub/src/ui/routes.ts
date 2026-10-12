@@ -443,7 +443,7 @@ async function schedulesSection(env: Env, hostId: string, sessionId: string, bas
   const schedules = listed.ok ? (listed.result as { schedules: ScheduleInfo[] }).schedules : []
   const canDelete = live.operations.includes('schedule.delete')
   const item = (schedule: ScheduleInfo) => h`<li><span class="badge${schedule.status === 'active' ? ' ok' : ''}">${schedule.status === 'active' ? '有効' : '終了'}</span> <strong class="untrusted">${schedule.title}</strong> <span class="mono">${schedule.rule}</span>
-  <span class="muted">${schedule.nextAt ? `次回 ${dateTime(schedule.nextAt)}` : ''}${schedule.lastDeliveredAt ? ` ・ 前回 ${dateTime(schedule.lastDeliveredAt)}` : ''}</span>
+  <span class="muted">${schedule.nextAt ? `次回 ${dateTime(schedule.nextAt)}` : ''}${schedule.lastDeliveredAt ? ` ・ 前回 ${dateTime(schedule.lastDeliveredAt)}` : ''}${schedule.createdBy ? ` ・ ${schedule.createdBy} が Remora 経由で作成` : ''}</span>
   ${schedule.prompt ? h`<p class="untrusted pre muted">${schedule.prompt}</p>` : ''}
   ${canDelete ? h`<form method="post" action="${base}/schedule-delete" class="inline"><input type="hidden" name="scheduleId" value="${schedule.scheduleId}"><button type="submit" class="small">削除</button></form>` : ''}</li>`
   const form = live.operations.includes('schedule.create') ? h`<form method="post" action="${base}/schedule-create" class="stack">
@@ -699,7 +699,7 @@ async function confirmPage(env: Env, url: URL, origin: string, hostId: string, c
   if (!item) return notFound()
   const params = item.params
   const crumbs = h`<p class="crumbs"><a href="/">ホーム</a> / <a href="/hosts/${hostId}">${host.name}</a> / パスキーでの確認</p>`
-  const requester = item.clientId === OWNER_CLIENT_ID ? 'ハブの画面（あなた）' : item.clientName
+  const requester = item.clientId === OWNER_CLIENT_ID ? 'ハブの画面（あなた）' : `${visibleText(item.clientName).text}（${item.clientId}）`
   const command = typeof params.command === 'string' ? visibleText(params.command) : null
   let workspace: Raw = h`<span class="mono">${String(params.cwdWorkspaceId ?? '')}</span>`
   if (item.state === 'pending' && live.online && typeof params.cwdWorkspaceId === 'string') {
@@ -711,7 +711,7 @@ async function confirmPage(env: Env, url: URL, origin: string, hostId: string, c
   <dt>操作</dt><dd>${CONFIRM_LABEL[item.operation] ?? item.operation} <span class="muted mono">${item.operation}</span></dd>
   <dt>依頼したもの</dt><dd>${requester}</dd>
   <dt>ホスト</dt><dd>${host.name} <span class="muted mono">${hostId}</span></dd>
-  ${command ? h`<dt>コマンド</dt><dd><pre class="command untrusted" data-testid="hub-confirm-command">${command.text}</pre>${command.hidden ? h`<p class="flash error" data-testid="hub-confirm-hidden">見えない文字（制御文字・文字の向きを変える文字・幅のない文字）が含まれています。⟦U+…⟧ の位置にあります。意図したものでなければ実行しないでください。</p>` : ''}</dd>` : ''}
+  ${command ? h`<dt>コマンド</dt><dd><pre class="command untrusted" dir="ltr" data-testid="hub-confirm-command">${command.text}</pre>${command.hidden ? h`<p class="flash error" data-testid="hub-confirm-hidden">見えない文字（制御文字・文字の向きを変える文字・幅のない文字）が含まれています。⟦U+…⟧ の位置にあります。意図したものでなければ実行しないでください。</p>` : ''}</dd>` : ''}
   ${params.cwdWorkspaceId !== undefined ? h`<dt>場所</dt><dd>${workspace}</dd>` : ''}
   ${typeof params.timeoutMs === 'number' ? h`<dt>タイムアウト</dt><dd>${Math.round(params.timeoutMs / 1000)} 秒</dd>` : ''}
   <dt>状態</dt><dd><span class="state ${item.state}" data-testid="hub-confirm-state">${CONFIRMATION_STATE[item.state] ?? item.state}</span> <span class="muted">${dateTime(item.createdAt)}</span></dd>
@@ -784,7 +784,7 @@ async function hubApprovalPage(env: Env, url: URL, id: string): Promise<Response
   if (!row) return notFound()
   const facts = h`<dl class="facts">
   <dt>操作</dt><dd>${CONFIRM_LABEL[row.operation] ?? row.operation} <span class="muted mono">${row.operation}</span></dd>
-  <dt>依頼したもの</dt><dd>${row.clientName}</dd>
+  <dt>依頼したもの</dt><dd>${visibleText(row.clientName).text}（${row.clientId}）</dd>
   <dt>状態</dt><dd><span class="state ${row.state}" data-testid="hub-confirm-state">${CONFIRMATION_STATE[row.state] ?? row.state}</span> <span class="muted">${dateTime(row.createdAt)}</span></dd>
 </dl>`
   const path = confirmPath('hub', id)

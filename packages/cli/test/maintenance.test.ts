@@ -78,6 +78,22 @@ test('audit verify: approved on the hub, recomputed here, pinned for next time; 
   await seedLogin(shorter, hub, { scope: ADMIN })
   assert.equal(await main(['audit', 'verify'], shorter.ctx), EXIT.failure)
   assert.match(shorter.stdout(), /前回より短くなっている/)
+
+  // Rows up to the pinned one dropped and the rest re-chained: far below the hub's quota, so not "pruned".
+  exported = { ...exported, logs: [{ log: 'hub', name: 'hub', records: await chain(4, 9) }, { log: 'h-1', name: '自宅 PC', records: await chain(3) }] }
+  const dropped = await testCtx()
+  Object.assign(dropped.ctx.env, t.ctx.env)
+  await seedLogin(dropped, hub, { scope: ADMIN })
+  assert.equal(await main(['audit', 'verify', '--json'], dropped.ctx), EXIT.failure)
+  assert.equal(JSON.parse(dropped.stdout()).logs[0].anchor, 'mismatch')
+
+  // A log checked before that is gone.
+  exported = { ...exported, logs: [{ log: 'hub', name: 'hub', records: await chain(8) }] }
+  const gone = await testCtx()
+  Object.assign(gone.ctx.env, t.ctx.env)
+  await seedLogin(gone, hub, { scope: ADMIN })
+  assert.equal(await main(['audit', 'verify'], gone.ctx), EXIT.failure)
+  assert.match(gone.stdout(), /h-1\s+h-1\s+0\s+-\s+正常\s+ログごと無くなっている/)
 })
 
 test('audit verify --file checks a saved export without the hub; refused and missing-scope requests say why', async () => {

@@ -128,6 +128,21 @@ export interface AnswerPolicy {
   linked(): boolean
 }
 
+/** A scheduled prompt created through Remora, so the kill switch and unpairing can take it away. */
+export interface RemoteScheduleRecord {
+  scheduleId: string
+  sessionId: string
+  clientId: string
+  clientName: string
+  createdAt: number
+}
+
+export interface RemoteScheduleStore {
+  list(): RemoteScheduleRecord[]
+  put(record: RemoteScheduleRecord): Promise<void>
+  remove(scheduleIds: readonly string[]): Promise<void>
+}
+
 export interface AdapterDeps {
   scope: ScopePolicy
   tasks: TaskStore
@@ -135,6 +150,8 @@ export interface AdapterDeps {
   answers?: AnswerPolicy
   /** Durable workspace.create ledger. Without it the adapter keeps one in memory. */
   workspaceCreations?: WorkspaceCreationStore
+  /** Durable list of schedules created through Remora. Without it the adapter keeps one in memory. */
+  remoteSchedules?: RemoteScheduleStore
   /** Queue an event for the hub. The core sends task completion and attention changes at once and batches the rest (≥ 30 s). */
   emit(event: HostEvent): void
   logger: HostContext['logger']
@@ -148,6 +165,8 @@ export interface Adapter {
   start(): void
   /** The settings tab changed something the adapter reads through its deps (answer policy, kill switch). */
   settingsChanged?(): void
+  /** Delete every schedule created through Remora (kill switch, unpairing). Resolves with how many went. */
+  removeRemoteSchedules?(): Promise<number>
   dispose(): void
 }
 

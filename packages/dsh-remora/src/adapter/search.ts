@@ -9,7 +9,7 @@
 import type { OperationParams, OperationResults, SearchHit } from '@dsh-remora/protocol'
 import type { OperationContext } from '../ops/types.ts'
 import { OperationError } from '../ops/types.ts'
-import { redactLine } from '../redact.ts'
+import { redact, redactLine } from '../redact.ts'
 import { contentText } from './events.ts'
 import { hasContent, type Runtime } from './runtime.ts'
 
@@ -67,7 +67,9 @@ export function createSearch(rt: Runtime) {
         scanned++
         const base = { sessionId: row.sessionId, title: redactLine(row.title || 'New session', 200), workspaceId: row.workspace?.id ?? null }
         const found: SearchHit[] = []
-        if (row.title && matches(row.title)) found.push({ ...base, role: 'title', turn: null, at: row.summary.updatedAt ?? null, snippet: snippet(row.title, words) })
+        // Match and cut snippets on redacted text only: a query must not find, or start a window inside, a secret.
+        const title = redact(row.title ?? '')
+        if (title && matches(title)) found.push({ ...base, role: 'title', turn: null, at: row.summary.updatedAt ?? null, snippet: snippet(title, words) })
         let events
         try {
           events = await rt.events(row.sessionId, context.signal)
@@ -87,7 +89,9 @@ export function createSearch(rt: Runtime) {
             role = 'assistant'
             text = contentText(event.data?.message?.content)
           }
-          if (role !== null && text !== '' && matches(text)) found.push({ ...base, role, turn, at: event.time, snippet: snippet(text, words) })
+          if (role === null || text === '') continue
+          const masked = redact(text)
+          if (matches(masked)) found.push({ ...base, role, turn, at: event.time, snippet: snippet(masked, words) })
         }
         hits.push(...found)
       }

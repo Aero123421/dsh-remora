@@ -143,8 +143,14 @@ export const ATTENTION_LABEL: Readonly<Record<string, string>> = {
   confirmation: 'パスキーでの確認待ち',
 }
 
-/** Characters that change how text looks without showing up: controls, bidi overrides, zero-width marks. */
-const INVISIBLE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u200B-\u200F\u2028-\u202E\u2060-\u2069\uFEFF]/g
+/**
+ * Characters that change how text looks without showing up: controls (but
+ * tab and newline), format characters (bidi marks and overrides, zero-width
+ * marks, tag characters…), separators other than the plain space, private
+ * use and unassigned code points, variation selectors, combining grapheme
+ * joiner and the blank fillers.
+ */
+const INVISIBLE = /(?![\t\n])[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000\u034F\u115F\u1160\u17B4\u17B5\u180B-\u180F\u3164\uFE00-\uFE0F\uFFA0\u{E0100}-\u{E01EF}]/gu
 
 /**
  * Text the owner must judge before confirming it (a command): every

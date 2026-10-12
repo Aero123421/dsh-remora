@@ -12,7 +12,7 @@
 import type { OperationParams, OperationResults } from '@dsh-remora/protocol'
 import type { OperationContext } from '../ops/types.ts'
 import { OperationError } from '../ops/types.ts'
-import { redactTruncate } from '../redact.ts'
+import { dropPartialHead, redactTruncate } from '../redact.ts'
 import type { DshSubprocess } from './dsh-types.ts'
 import { SERVICES } from './dsh-types.ts'
 import { fromDsh, unavailable } from './errors.ts'
@@ -65,8 +65,9 @@ export function createTerminal(rt: Runtime) {
         if (context.signal.aborted) throw error
         throw fromDsh(error, 'the command could not be run')
       }
-      const out = redactTruncate(stdout.text, OUTPUT_MAX_BYTES)
-      const errText = redactTruncate(stderr.text, OUTPUT_MAX_BYTES)
+      // A stream longer than the buffer keeps its tail, which may start inside a secret.
+      const out = redactTruncate(stdout.lossy ? dropPartialHead(stdout.text) : stdout.text, OUTPUT_MAX_BYTES)
+      const errText = redactTruncate(stderr.lossy ? dropPartialHead(stderr.text) : stderr.text, OUTPUT_MAX_BYTES)
       return {
         exitCode: outcome.exitCode,
         signal: outcome.signal,

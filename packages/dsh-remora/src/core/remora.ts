@@ -35,6 +35,7 @@ import {
 } from './settings.ts'
 import { JsonDocument, remoraDataDir, resolveDshHome } from './storage.ts'
 import { FileWorkspaceCreationStore, workspaceCreationsSpec } from './workspace-creations.ts'
+import { FileRemoteScheduleStore, remoteSchedulesSpec } from './remote-schedules.ts'
 import { FileTaskStore } from './tasks.ts'
 import { readQuestionModes, switchToTimed, type QuestionModeReport } from './question-mode.ts'
 import { checkForUpdate, downloadVerified, type UpdateCheck } from './updates.ts'
@@ -152,9 +153,12 @@ export class RemoraCore {
   private pendingRotation: { nonce: string; key: HostKey } | null = null
   /** Handshakes refused since the last swap of the two keys (fast retry only once). */
   private keySwaps = 0
+  /** Key store writes, one at a time. */
+  private keyWrites: Promise<void> = Promise.resolve()
   private scope!: SettingsScopePolicy
   private tasks!: FileTaskStore
   private workspaceCreations!: FileWorkspaceCreationStore
+  private remoteSchedules!: FileRemoteScheduleStore
   private events!: EventQueue
   private dispatcher!: Dispatcher
   private link!: HubLink
@@ -194,6 +198,7 @@ export class RemoraCore {
     this.confirmationsDoc = await JsonDocument.open(dir, confirmationsSpec)
     const tasksDoc = await JsonDocument.open(dir, tasksSpec)
     const creationsDoc = await JsonDocument.open(dir, workspaceCreationsSpec)
+    this.remoteSchedules = new FileRemoteScheduleStore(await JsonDocument.open(dir, remoteSchedulesSpec))
     this.auditLog = await AuditLog.open(dir, { now: () => this.clock.now() })
     const adopted = adoptNewOperations(this.settingsDoc.value)
     if (adopted !== this.settingsDoc.value) await this.settingsDoc.update(() => adopted)
@@ -211,10 +216,11 @@ export class RemoraCore {
         // Stopped in the middle of a rotation, after the new key was stored: go on with it.
         const current = this.hostKey
         await this.pairingDoc.update(state => (state.paired ? { ...state, paired: { ...state.paired, publicKey: current.publicKey } } : state))
-      } else if (this.hostKey && this.hostKey.publicKey !== pinned) {
+      } else if (this.hostKey && this.hostKey.publicKey !== pinned && !this.previousKey) {
         this.ctx.logger.warn('Remora: the stored host key does not match the pairing; pair again')
         this.hostKey = null
       }
+      // Two stored keys and neither pinned: keep both; the first handshake that gets through decides.
     }
     this.scope = new SettingsScopePolicy({
       settings: () => this.settingsDoc.value,
@@ -280,6 +286,7 @@ export class RemoraCore {
       scope: this.scope,
       tasks: this.tasks,
       workspaceCreations: this.workspaceCreations,
+      remoteSchedules: this.remoteSchedules,
       answers: {
         waitMs: () => this.settingsDoc.value.remoteAnswerWaitMs,
         approvalsFromRemote: () => this.settingsDoc.value.approvalsFromRemote,
@@ -305,6 +312,7 @@ export class RemoraCore {
     this.link?.stop('idle')
     this.events?.dispose()
     try { this.adapter?.dispose() } catch (error) { this.ctx.logger.warn('Remora: adapter dispose failed', error) }
+    await this.keyWrites
     await this.lock?.release()
   }
 
@@ -345,10 +353,17 @@ export class RemoraCore {
   private onLinkReady(): void {
     this.audit({ kind: 'connection', action: 'connected', outcome: 'ok' })
     this.keySwaps = 0
-    if (this.previousKey) {
-      // The key in use got through: the other one is no longer needed.
+    const working = this.hostKey
+    if (this.previousKey && working) {
+      // The key in use got through: store it as the current key, then forget the other one.
+      // Swaps only happen in memory, so until here both keys stay on disk.
       this.previousKey = null
-      this.keyStore.delete('previous').catch(error => this.ctx.logger.warn('Remora: could not delete the previous host key', error))
+      this.writeKeys(async () => {
+        const stored = await this.keyStore.load()
+        if (stored?.publicKey !== working.publicKey) await this.keyStore.save(working)
+        await this.keyStore.delete('previous')
+        await this.pairingDoc.update(state => (state.paired ? { ...state, paired: { ...state.paired, publicKey: working.publicKey } } : state))
+      })
       this.audit({ kind: 'connection', action: 'rotate-key-finished', outcome: 'ok' })
     }
     if (!this.adapterStarted && this.adapter) {
@@ -398,9 +413,12 @@ export class RemoraCore {
     if (!pending || !old || pending.nonce !== frame.nonce || pending.key.publicKey !== frame.publicKey) return
     this.pendingRotation = null
     try {
-      await this.keyStore.save(old, 'previous')
-      await this.keyStore.save(pending.key)
-      await this.pairingDoc.update(state => (state.paired ? { ...state, paired: { ...state.paired, publicKey: pending.key.publicKey } } : state))
+      // The old key first: whatever happens next, the key the hub accepts stays on disk.
+      await this.writeKeys(async () => {
+        await this.keyStore.save(old, 'previous')
+        await this.keyStore.save(pending.key)
+        await this.pairingDoc.update(state => (state.paired ? { ...state, paired: { ...state.paired, publicKey: pending.key.publicKey } } : state))
+      }, true)
     } catch (error) {
       this.ctx.logger.warn('Remora: could not store the new host key; keeping the old one', error)
       await this.keyStore.save(old).catch(() => undefined)
@@ -422,16 +440,29 @@ export class RemoraCore {
     const other = this.previousKey
     const current = this.hostKey
     if (!other || !current) return false
+    // In memory only: both keys stay on disk until one gets through (onLinkReady).
     this.hostKey = other
     this.previousKey = current
     this.keySwaps++
-    void (async () => {
-      await this.keyStore.save(other)
-      await this.keyStore.save(current, 'previous')
-      await this.pairingDoc.update(state => (state.paired ? { ...state, paired: { ...state.paired, publicKey: other.publicKey } } : state))
-    })().catch(error => this.ctx.logger.warn('Remora: could not store the swapped host keys', error))
     this.audit({ kind: 'connection', action: 'rotate-key-swapped', outcome: 'error', reason: 'auth-failed' })
     return this.keySwaps <= 1
+  }
+
+  private async removeRemoteSchedules(reason: string): Promise<void> {
+    if (this.remoteSchedules.list().length === 0 || !this.adapter?.removeRemoteSchedules) return
+    try {
+      const removed = await this.adapter.removeRemoteSchedules()
+      this.audit({ kind: 'settings', action: 'remote-schedules-removed', outcome: 'ok', reason: `${reason}:${removed}` })
+    } catch (error) {
+      this.ctx.logger.warn('Remora: could not remove the schedules created through Remora', error)
+    }
+  }
+
+  /** Run key store writes one at a time. With `rethrow`, the caller sees a failure; otherwise it is logged. */
+  private writeKeys(write: () => Promise<void>, rethrow = false): Promise<void> {
+    const run = this.keyWrites.then(write)
+    this.keyWrites = run.catch(error => { if (!rethrow) this.ctx.logger.warn('Remora: could not store the host keys', error) })
+    return rethrow ? run : this.keyWrites
   }
 
   private async onFatal(reason: string): Promise<void> {
@@ -487,6 +518,7 @@ export class RemoraCore {
     this.pairing.reset()
     this.lastUnpair = { at: this.clock.now(), hub: await this.unpairAtHub() }
     await this.stopLink('idle', null)
+    await this.removeRemoteSchedules('unpaired')
     await this.keyStore.delete()
     this.hostKey = null
     this.previousKey = null
@@ -612,6 +644,8 @@ export class RemoraCore {
       await this.saveSettings({ ...previous, killSwitch: true }, local, 'kill-switch:on')
       this.events.flush()
       await this.stopLink('stopped', 'kill-switch')
+      // Remote control stops here, including prompts scheduled through Remora for later.
+      await this.removeRemoteSchedules('kill-switch')
     } else {
       await this.saveSettings({ ...previous, killSwitch: false }, local, 'kill-switch:off')
       await this.startLink()

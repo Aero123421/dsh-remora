@@ -36,6 +36,7 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
   const reads = createReads(rt)
   const actions = createActions(rt, answerer)
   const workspaces = createWorkspaceCreate(rt, { ...DEFAULT_CLONE_LIMITS, ...options.clone })
+  const { removeRemote, ...schedules } = createSchedules(rt)
   // The core builds the adapter while it initialises, before (and whether or not)
   // the hub link comes up: clones interrupted by a crash or restart are cleaned up
   // here, so their folders do not linger and their records do not stay `cloning`.
@@ -45,7 +46,7 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
     ...reads,
     ...actions,
     ...createJobs(rt),
-    ...createSchedules(rt),
+    ...schedules,
     ...createSearch(rt),
     ...createTerminal(rt),
     ...workspaces.handlers,
@@ -65,6 +66,7 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
       answerer.start()
     },
     settingsChanged: () => answerer.settingsChanged(),
+    removeRemoteSchedules: removeRemote,
     dispose: () => {
       answerer.dispose()
       watcher.dispose()
@@ -80,6 +82,6 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
 }
 
 export const createAdapter: CreateAdapter = (ctx, deps) => {
-  const { handlers, has, start, settingsChanged, dispose } = buildAdapter(ctx, deps)
-  return { handlers, has, start, settingsChanged, dispose }
+  const { handlers, has, start, settingsChanged, removeRemoteSchedules, dispose } = buildAdapter(ctx, deps)
+  return { handlers, has, start, settingsChanged, removeRemoteSchedules, dispose }
 }

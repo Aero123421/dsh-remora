@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { MASK, redact, redactLine, redactTruncate } from '../src/redact.ts'
+import { MASK, dropPartialHead, redact, redactLine, redactTruncate } from '../src/redact.ts'
 
 const cases: [string, string, string][] = [
   ['OpenAI key', 'use sk-abcdefghijklmnopqrstuvwx1234 now', `use sk-${MASK} now`],
@@ -67,4 +67,10 @@ test('redactTruncate and redactLine bound the length', () => {
   assert.deepEqual(redactTruncate('abc', 4), { text: 'abc', truncated: false })
   assert.equal(redactLine('a\n  b\tc', 120), 'a b c')
   assert.equal(redactLine('x'.repeat(200)).length, 120)
+})
+
+test('a tail cut out of longer output loses its first, partial line before redaction', () => {
+  assert.equal(dropPartialHead('abcdefghijklmnopqrstuvwx1234 now\nnext line\n'), 'next line\n')
+  assert.equal(dropPartialHead('x'.repeat(5000)), `…${'x'.repeat(4744)}`)
+  assert.equal(dropPartialHead('short'), '')
 })

@@ -6,7 +6,7 @@
  * workspace. Reads and deletion never wake a session.
  */
 import type { OperationParams, OperationResults, ScheduleInfo, ScheduleWhen } from '@dsh-remora/protocol'
-import type { OperationContext } from '../ops/types.ts'
+import type { OperationContext, RemoteScheduleRecord, RemoteScheduleStore } from '../ops/types.ts'
 import { OperationError } from '../ops/types.ts'
 import { redactLine, redactTruncate } from '../redact.ts'
 import type { DshSchedule, DshScheduleCatalogEntry, DshScheduleCreateRequest } from './dsh-types.ts'
@@ -20,6 +20,17 @@ type Result<Op extends keyof OperationResults> = OperationResults[Op]
 const WEEKDAYS = ['', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 /** How long a create's idempotency key is remembered. */
 const IDEMPOTENCY_MS = 24 * 60 * 60_000
+/** Active schedules created through Remora on one host, at most. */
+export const REMOTE_SCHEDULES_MAX = 20
+
+function memorySchedules(): RemoteScheduleStore {
+  let records: RemoteScheduleRecord[] = []
+  return {
+    list: () => records.map(record => ({ ...record })),
+    put: async record => { records = [...records.filter(item => item.scheduleId !== record.scheduleId), { ...record }] },
+    remove: async ids => { records = records.filter(item => !ids.includes(item.scheduleId)) },
+  }
+}
 
 function seconds(value: number): string {
   if (value % 86_400 === 0) return `${value / 86_400} d`
@@ -48,8 +59,9 @@ function epoch(value: string | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
-export function scheduleInfo(entry: DshScheduleCatalogEntry, withPrompt: boolean): ScheduleInfo {
+export function scheduleInfo(entry: DshScheduleCatalogEntry, withPrompt: boolean, createdBy?: string): ScheduleInfo {
   return {
+    ...(createdBy ? { createdBy: redactLine(createdBy, 80) } : {}),
     scheduleId: entry.id,
     sessionId: entry.sessionId,
     title: redactLine(entry.title, 120),
@@ -98,6 +110,8 @@ function scheduleError(error: unknown, fallback: string): OperationError {
 export function createSchedules(rt: Runtime) {
   /** `<clientId>\0<key>` → schedule id and when it was created. */
   const created = new Map<string, { scheduleId: string; sessionId: string; at: number }>()
+  const remote = rt.deps.remoteSchedules ?? memorySchedules()
+  const createdBy = (id: string) => remote.list().find(record => record.scheduleId === id)?.clientName
 
   function service(): DshSchedule {
     const schedule = rt.get<DshSchedule>(SERVICES.schedule)
@@ -119,7 +133,7 @@ export function createSchedules(rt: Runtime) {
       const reachable = new Set((await rt.catalog(context.signal)).filter(row => rt.canAccess(row)).map(row => row.sessionId))
       const schedules = (await catalog())
         .filter(entry => reachable.has(entry.sessionId) && (params.sessionId === undefined || entry.sessionId === params.sessionId))
-        .map(entry => scheduleInfo(entry, hasContent(context)))
+        .map(entry => scheduleInfo(entry, hasContent(context), createdBy(entry.id)))
         .sort((a, b) => (a.status === b.status ? (a.nextAt ?? Infinity) - (b.nextAt ?? Infinity) : a.status === 'active' ? -1 : 1))
       return { schedules }
     },
@@ -136,7 +150,13 @@ export function createSchedules(rt: Runtime) {
       const earlier = created.get(key)
       if (earlier) {
         const existing = (await catalog()).find(entry => entry.id === earlier.scheduleId)
-        if (existing) return { schedule: scheduleInfo(existing, hasContent(context)) }
+        if (existing) return { schedule: scheduleInfo(existing, hasContent(context), createdBy(existing.id)) }
+      }
+      // Remote schedules outlive the call that made them: keep their number bounded.
+      const catalogue = await catalog()
+      const live = new Set(catalogue.filter(entry => entry.status === 'active').map(entry => entry.id))
+      if (remote.list().filter(record => live.has(record.scheduleId)).length >= REMOTE_SCHEDULES_MAX) {
+        throw new OperationError('conflict', `${REMOTE_SCHEDULES_MAX} scheduled prompts created through Remora are already active on this host; delete some first`)
       }
       const request = createRequest(params.title.trim(), params.prompt, params.when)
       let record
@@ -146,7 +166,8 @@ export function createSchedules(rt: Runtime) {
         throw scheduleError(error, 'creating the automation task failed')
       }
       created.set(key, { scheduleId: record.id, sessionId: row.sessionId, at: now })
-      return { schedule: scheduleInfo({ ...record, sessionId: row.sessionId, status: 'active' }, hasContent(context)) }
+      await remote.put({ scheduleId: record.id, sessionId: row.sessionId, clientId: context.actor.clientId, clientName: context.actor.clientName, createdAt: now })
+      return { schedule: scheduleInfo({ ...record, sessionId: row.sessionId, status: 'active' }, hasContent(context), context.actor.clientName) }
     },
 
     async 'schedule.delete'(params: Params<'schedule.delete'>, context: OperationContext): Promise<Result<'schedule.delete'>> {
@@ -157,7 +178,25 @@ export function createSchedules(rt: Runtime) {
       } catch (error) {
         throw scheduleError(error, 'deleting the automation task failed')
       }
+      await remote.remove([params.scheduleId])
       return { deleted: outcome.deleted }
+    },
+
+    /** Kill switch or unpairing: take away every schedule created through Remora. */
+    async removeRemote(): Promise<number> {
+      const records = remote.list()
+      if (records.length === 0) return 0
+      const schedule = rt.get<DshSchedule>(SERVICES.schedule)
+      let removed = 0
+      for (const record of records) {
+        try {
+          if ((await schedule?.delete({ sessionId: record.sessionId, id: record.scheduleId }, AbortSignal.timeout(10_000)))?.deleted) removed++
+        } catch {
+          // already gone, or the session went away
+        }
+      }
+      await remote.remove(records.map(record => record.scheduleId))
+      return removed
     },
   }
 }

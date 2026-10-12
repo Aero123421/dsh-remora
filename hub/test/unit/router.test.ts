@@ -41,3 +41,8 @@ test('visibleText shows controls, bidi overrides and zero-width marks; keeps tab
   assert.deepEqual(visibleText('a\u202eb\u200bc\u0007d\r'), { text: 'a⟦U+202E⟧b⟦U+200B⟧c⟦U+0007⟧d⟦U+000D⟧', hidden: true })
   assert.equal(visibleText('\u2066x\u2069\ufeff').text, '⟦U+2066⟧x⟦U+2069⟧⟦U+FEFF⟧')
 })
+
+test('visibleText also marks bidi marks, tag characters, odd spaces and fillers, but not ordinary Japanese', () => {
+  assert.equal(visibleText('a؜b\u{E0041}c　d eㅤf️').text, 'a⟦U+061C⟧b⟦U+E0041⟧c⟦U+3000⟧d⟦U+00A0⟧e⟦U+3164⟧f⟦U+FE0F⟧')
+  assert.deepEqual(visibleText('git commit -m "日本語のメッセージ・テスト"'), { text: 'git commit -m "日本語のメッセージ・テスト"', hidden: false })
+})

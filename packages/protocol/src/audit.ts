@@ -10,6 +10,9 @@ import { canonicalJson, sha256 } from './encoding.ts'
 
 export const AUDIT_GENESIS_HASH = '0'.repeat(64)
 
+/** The hub keeps the newest rows of each log, at least this many (it prunes every 50 appends). */
+export const AUDIT_KEPT_ROWS = 10_000
+
 export type AuditFields = Omit<AuditRecord, 'seq' | 'prevHash' | 'hash'>
 
 const hex = (bytes: Uint8Array) => [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')

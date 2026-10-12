@@ -463,7 +463,11 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
     const { body: left } = await state.api('schedules.list', { hostId, sessionId })
     if (left.schedules.some(item => item.scheduleId === daily.schedule.scheduleId)) throw new Error('the deleted schedule is still listed')
     const onceNow = left.schedules.find(item => item.scheduleId === once.schedule.scheduleId)
-    return `daily listed with its prompt, then deleted; one-shot ${once.schedule.scheduleId} ran as a turn (now ${onceNow ? onceNow.status : 'gone from the list'})`
+    // One left in place: the kill switch must take it away (kill-switch.enforced checks).
+    const { body: kept } = await state.api('schedule.create', { hostId, sessionId, title: 'Remora E2E hourly', prompt: 'Remora E2E hourly', when: { everySeconds: 3600 }, idempotencyKey: randomUUID() })
+    if (kept.schedule.createdBy === undefined) throw new Error(`a schedule made through Remora does not say by whom: ${JSON.stringify(kept)}`)
+    state.remoteSchedule = kept.schedule.scheduleId
+    return `daily listed with its prompt, then deleted; one-shot ${once.schedule.scheduleId} ran as a turn (now ${onceNow ? onceNow.status : 'gone from the list'}); an hourly one left for the kill switch (by ${kept.schedule.createdBy})`
   })
 
   await r.step('terminal.run', 'Terminal: a "request" token is refused; with full access the owner runs a command and confirms it with the passkey on the hub', { needs: ['task.complete', 'hub.owner'], timeoutMs: 180_000, onFailure: failShot('terminal') }, async () => {
@@ -607,7 +611,13 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
     const { body: started } = await state.api('task.start', { hostId: state.host.hostId, target: state.target, prompt: `Remora E2E after resume nonce=${nonce}`, idempotencyKey: randomUUID() })
     const task = await waitTask(state.api, started.taskId, value => TERMINAL.has(value) || value === 'needs_attention')
     if (task.state !== 'completed' || !task.result?.reply?.includes(`${REPLY_PREFIX} ${nonce}`)) throw new Error(`after resume: ${JSON.stringify(task)}`)
-    return `refused: ${refused}; after resume a task completed again`
+    let schedules = ''
+    if (state.remoteSchedule) {
+      const { body } = await state.api('schedules.list', { hostId: state.host.hostId })
+      if (body.schedules.some(item => item.scheduleId === state.remoteSchedule)) throw new Error('the schedule made through Remora survived the kill switch')
+      schedules = '; the schedule made through Remora is gone'
+    }
+    return `refused: ${refused}; after resume a task completed again${schedules}`
   })
 
   return state

@@ -49,10 +49,10 @@ DSH のサンドボックスが制限するのはファイルの書き込みだ�
 
 操作の一覧、必要な権限、MCP のツール名と説明文は `packages/protocol/src/operations.ts` にある。中核ツールの名前と説明文は固定し、版ごとに変えない。
 
-- 会話の検索（`sessions.search`、`dsh.content`）: DSH Web は全文検索の索引をオフで出荷している（`session-query-sqlite` が `openAt: never`）ため、プラグインが範囲内のセッションのログを `inspect`（セッションを起こさない読み取り）で新しい順に読む。1 回 300 セッション・8 秒・1 セッション 5 件まで。途中で止めたら `partial`。
+- 会話の検索（`sessions.search`、`dsh.content`）: DSH Web は全文検索の索引をオフで出荷している（`session-query-sqlite` が `openAt: never`）ため、プラグインが範囲内のセッションのログを `inspect`（セッションを起こさない読み取り）で新しい順に読む。1 回 300 セッション・8 秒・1 セッション 5 件まで。途中で止めたら `partial`。照合も抜き出しも伏せ字にした文で行う（検索語で秘密を当てたり、抜き出しの窓を秘密の途中から始めたりできないように）。先頭を切った出力（ジョブ・ターミナルの末尾）は、最初の不完全な行を捨ててから伏せる。
 - フォーク（`session.fork`）: 指定ターンの `turn/end` までを `sessionController.fork` で写す。移行はしない（`allowMigration: false`）。
 - ジョブ（`session.get` の `jobs`、`job.output`、`job.stop`）: `ctx.jobs` の、範囲内のセッションが持つジョブだけ。止めるときは理由に「Remora 経由」とクライアント名を残す。
-- スケジュール（`schedules.list`／`schedule.create`／`schedule.delete`）: DSH の自動タスク（`ctx.schedule`）。時間になると依頼としてターンを始めるので、作るときはタスク投入と同じ条件（範囲内・通常のセッション・アーカイブでない・信頼済みで準備済みのワークスペース）。冪等キーは 24 時間覚える。
+- スケジュール（`schedules.list`／`schedule.create`／`schedule.delete`）: DSH の自動タスク（`ctx.schedule`）。時間になると依頼としてターンを始めるので、作るときはタスク投入と同じ条件（範囲内・通常のセッション・アーカイブでない・信頼済みで準備済みのワークスペース）。冪等キーは 24 時間覚える。Remora 経由で作ったものは作ったクライアントと一緒にプラグインのデータに記録し（1 ホスト 20 件まで）、緊急停止とペアリング解除で削除する。呼んだクライアントが取り消されても DSH の中で動き続けるため。
 - ターミナル（`terminal.run`、リモート全権・`dsh.admin`）: `ctx.subprocess` で、ワークスペースのフォルダ（realpath）でシェルを 1 回起動する（macOS・Linux は既定のシェルで `-c`、Windows は `cmd.exe /d /s /c`）。子プロセスは DSH が資格情報らしい環境変数を除いた環境で動く。既定 60 秒・最長 10 分で止め、出力は各 64 KB まで、伏せ字を通して返す。
 
 ### パスキーで毎回確認する操作
@@ -68,7 +68,7 @@ DSH のサンドボックスが制限するのはファイルの書き込みだ�
 
 `OWNER_APPROVED_OPERATIONS`（`audit.export`、`hub.export`、`host.rotate-key`）は HTTP API だけの操作で（MCP のツールにはしない）、`dsh.admin` が要る。DSH 側で検証できるものが無いので、承認はハブでのパスキーの再確認（`session.fresh`）で行う。
 
-- `audit.export`・`hub.export`: ハブの Durable Object に保留し（`approvals`、10 分、1 クライアント 5 件まで）、オーナーが `/confirm/hub/<ID>` で承認すると、依頼したクライアントが `confirmation.get` で 1 時間だけ結果を受け取れる。結果は保存せず、受け取りのたびに作る。監査ログのハッシュの定義は `packages/protocol/src/audit.ts` にあり、CLI はそれでハブの外で計算し直す。
+- `audit.export`・`hub.export`: ハブの Durable Object に保留し（`approvals`、10 分、1 クライアント 5 件まで）、オーナーが `/confirm/hub/<ID>` で承認すると、依頼したクライアントが `confirmation.get` で結果を受け取れる（承認から 1 時間・3 回まで）。結果は保存せず、受け取りのたびに作る。監査ログのハッシュの定義は `packages/protocol/src/audit.ts` にあり、CLI はそれでハブの外で計算し直す。CLI は各ログの最後の行を「確認位置」として覚え、次回その行が同じハッシュで残っているかを見る。残っていないとき、そのログが 10,000 行（ハブが古い行を消し始める数）に満たなければ改ざんとみなす。
 - `host.rotate-key`: ホストの Durable Object に保留し、承認されると `rotate-key` フレームを送る。ホストは新しい鍵を作り、`rotateKeyMessage(...)` に古い鍵と新しい鍵の両方で署名して返す。ハブは両方を確かめて新しい鍵を「次の鍵」として持ち、`rotate-key-commit` を返す。ホストは両方の鍵を保存してから新しい鍵でつなぎ直し、ハブはその握手で次の鍵を正式な鍵にする（ハブ全体の Durable Object の記録も更新）。古い鍵で握手してきたら次の鍵を捨てる（更新の取り消し）。ホストは握手を断られたらもう一方の鍵で試し直すので、途中で止まっても締め出されない。
 
 ## 要対応と完了判定

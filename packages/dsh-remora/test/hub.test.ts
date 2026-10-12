@@ -315,8 +315,7 @@ test('host key rotation: the new key proves itself, survives a restart, and a re
     await until(() => hub.publicKey === rotated && core.internals.link.connected && hub.connections > connections, 5000, 'reconnected with the new key')
     assert.notEqual(rotated, first)
     assert.deepEqual(hub.keysUsed, ['next'])
-    await until(() => core.internals.keys().previous === null, 3000, 'previous key dropped')
-    assert.equal(core.internals.pairing().paired?.publicKey, rotated)
+    await until(() => core.internals.keys().previous === null && core.internals.pairing().paired?.publicKey === rotated, 3000, 'previous key dropped')
     const audit = await rpc<{ entries: { action: string; outcome: string }[] }>(host.routes, 'audit')
     assert.ok(audit.ok && ['rotate-key-proposed', 'rotate-key-committed', 'rotate-key-finished'].every(action => audit.value.entries.some(entry => entry.action === action)))
 
@@ -336,6 +335,7 @@ test('host key rotation: the new key proves itself, survives a restart, and a re
     assert.equal(hub.publicKey, rotated)
     assert.equal(core.internals.keys().current, rotated)
     await until(() => core.internals.keys().previous === null, 3000, 'the refused key is forgotten')
+    await until(() => core.internals.pairing().paired?.publicKey === rotated, 3000, 'the working key is pinned again')
     assert.notEqual(core.internals.pairing().paired?.publicKey, abandoned)
   } finally {
     host.dispose()

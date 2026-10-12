@@ -27,8 +27,9 @@ export const PUSH_RATE: readonly [number, number] = [30, 600]
 
 /** Hub maintenance requests one client may have waiting for the owner at once. */
 export const APPROVALS_PENDING_PER_CLIENT = 5
-/** An approved export can be fetched for this long; then only the outcome remains. */
+/** An approved export can be fetched for this long, and at most APPROVAL_RESULT_FETCHES times; then only the outcome remains. */
 export const APPROVAL_RESULT_MS = 60 * 60_000
+export const APPROVAL_RESULT_FETCHES = 3
 
 /** A hub maintenance request (audit.export, hub.export) parked for the owner. */
 export interface ApprovalRecord {
@@ -157,7 +158,8 @@ const SCHEMA = `
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     decided_at INTEGER,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    fetches INTEGER NOT NULL DEFAULT 0
   );
   ${AUDIT_SCHEMA}
 `
@@ -220,7 +222,7 @@ export class HubDO extends DurableObject<Env> {
     ctx.blockConcurrencyWhile(async () => {
       this.sql.exec(SCHEMA)
       // Columns added after the first release.
-      for (const statement of ['ALTER TABLE pairings ADD COLUMN source TEXT', 'ALTER TABLE pairings ADD COLUMN last_seen_at INTEGER']) {
+      for (const statement of ['ALTER TABLE pairings ADD COLUMN source TEXT', 'ALTER TABLE pairings ADD COLUMN last_seen_at INTEGER', 'ALTER TABLE approvals ADD COLUMN fetches INTEGER NOT NULL DEFAULT 0']) {
         try {
           this.sql.exec(statement)
         } catch {
@@ -908,6 +910,15 @@ export class HubDO extends DurableObject<Env> {
     })
     this.settleApprovals()
     return visible(this.approvalRow(id))
+  }
+
+  /** Count one delivery of an approved request's result. False once it is spent or too old. */
+  async claimApprovalResult(id: string, clientId: string): Promise<boolean> {
+    const row = this.sql.exec<{ state: string; decided_at: number | null; fetches: number; client_id: string }>('SELECT state, decided_at, fetches, client_id FROM approvals WHERE id = ?', id).toArray()[0]
+    if (!row || row.client_id !== clientId || row.state !== 'done' || row.decided_at === null) return false
+    if (Date.now() - row.decided_at >= APPROVAL_RESULT_MS || row.fetches >= APPROVAL_RESULT_FETCHES) return false
+    this.sql.exec('UPDATE approvals SET fetches = fetches + 1 WHERE id = ?', id)
+    return true
   }
 
   async pendingApprovals(): Promise<ApprovalRecord[]> {
