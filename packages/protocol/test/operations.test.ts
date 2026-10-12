@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { OPERATIONS, findOperationByTool, remoraRequestId, type OperationSpec } from '../src/index.ts'
+import { CONFIRMATION_UNLESS_ALLOWED, OPERATIONS, findOperationByTool, remoraRequestId, type OperationSpec } from '../src/index.ts'
 
 const all = OPERATIONS as readonly OperationSpec[]
 
@@ -16,18 +16,19 @@ test('tool names follow the MCP naming rule and the dsh_ prefix', () => {
   }
 })
 
-test('read-only tools never need more than view, and destructive ones need full', () => {
+test('read-only tools never need more than view, and destructive ones need full or a confirmation', () => {
   for (const op of all) {
     if (op.readOnly) assert.equal(op.level, 'view', op.id)
-    if (op.destructive) assert.equal(op.level, 'full', op.id)
+    if (op.destructive) assert.ok(op.level === 'full' || CONFIRMATION_UNLESS_ALLOWED.has(op.id), op.id)
     assert.ok(!(op.readOnly && op.destructive), op.id)
   }
 })
 
-test('approvals are answered with a passkey confirmation, never through an MCP tool', () => {
+test('approvals are a request-level tool guarded by the DSH-side switch', () => {
   const approval = all.find(op => op.id === 'approval.respond')
-  assert.equal(approval?.tool, undefined)
+  assert.equal(approval?.tool, 'dsh_approval_respond')
   assert.equal(approval?.level, 'request')
+  assert.ok(CONFIRMATION_UNLESS_ALLOWED.has('approval.respond'))
 })
 
 test('dangerous operations are not exposed as MCP tools yet', () => {

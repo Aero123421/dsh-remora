@@ -57,7 +57,13 @@ export async function confirmationChallenge(subject: ConfirmationSubject): Promi
 }
 
 /** Operations that need a passkey confirmation in addition to an unexpired full grant. */
-export const REQUIRES_CONFIRMATION: ReadonlySet<string> = new Set([
-  'approval.respond',
-  ...(OPERATIONS as readonly { id: string; level: string }[]).filter(op => op.level === 'full').map(op => op.id),
-])
+export const REQUIRES_CONFIRMATION: ReadonlySet<string> = new Set(
+  (OPERATIONS as readonly { id: string; level: string }[]).filter(op => op.level === 'full').map(op => op.id),
+)
+
+/**
+ * Needs a passkey confirmation unless the DSH settings tab allows it from
+ * MCP and CLI. The DSH host decides (it knows the setting); the hub always
+ * collects a confirmation when the owner answers on the hub's own page.
+ */
+export const CONFIRMATION_UNLESS_ALLOWED: ReadonlySet<string> = new Set(['approval.respond'])

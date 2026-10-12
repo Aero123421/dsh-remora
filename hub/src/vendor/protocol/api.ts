@@ -126,8 +126,10 @@ export interface AttentionItem {
   answerable: boolean
   /**
    * How it can be answered:
-   * - `remote`: `attention.respond` from any client allowed to request tasks;
-   * - `hub-passkey`: only on the hub's attention page with the owner's passkey (approvals);
+   * - `remote`: from any client allowed to request tasks — `attention.respond`
+   *   for questions and plan reviews, `approval.respond` for approvals when
+   *   the DSH tab allows approvals from MCP and CLI;
+   * - `hub-passkey`: approvals, only on the hub's attention page with the owner's passkey;
    * - `dsh-web`: only in DSH Web (e.g. Remora's remote answering is turned off).
    */
   answerVia?: 'remote' | 'hub-passkey' | 'dsh-web'

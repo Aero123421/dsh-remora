@@ -78,11 +78,13 @@ export const OPERATIONS = [
   { id: 'command.run', tool: 'dsh_command_run', level: 'request', scope: 'dsh.tasks', phase: 'P1', readOnly: false, destructive: false,
     description: 'Run a slash command in a session. Each command is allowed separately on the DSH side.' },
 
-  // Approvals: any client that may request tasks can see them, but answering
-  // always needs the owner's passkey on the hub (see REQUIRES_CONFIRMATION).
-  // Not an MCP tool: AI clients get a link to the hub's approval page instead.
-  { id: 'approval.respond', level: 'request', scope: 'dsh.tasks', phase: 'P1', readOnly: false, destructive: false,
-    description: 'Answer a pending approval. Requires a passkey confirmation on the hub, verified by the DSH host.' },
+  // Approvals of DSH's own "may this tool run with more permission?" prompts.
+  // By default only the owner answers them, on the hub with a passkey
+  // (verified by the DSH host). When the DSH settings tab turns on
+  // "allow approvals from MCP and CLI", any client with the request level may
+  // answer them with this tool, without a passkey.
+  { id: 'approval.respond', tool: 'dsh_approval_respond', level: 'request', scope: 'dsh.tasks', phase: 'P1', readOnly: false, destructive: true,
+    description: 'Allow once or reject a pending DSH approval (attention kind "approval"). Ask the user first. Works only when the DSH owner allowed approvals from MCP and CLI; otherwise the result gives a hub link where the owner approves with a passkey.' },
 
   // --- P2: dangerous, off by default, full access only --------------------
   { id: 'terminal.run', level: 'full', scope: 'dsh.admin', phase: 'P2', readOnly: false, destructive: true,
