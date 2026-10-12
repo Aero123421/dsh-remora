@@ -2,7 +2,7 @@
 import { HTTP_STATUS_FOR_ERROR, type HttpErrorBody, type RemoraError } from './vendor/protocol/index.ts'
 
 export const SECURITY_HEADERS: Readonly<Record<string, string>> = {
-  'content-security-policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+  'content-security-policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
   'x-content-type-options': 'nosniff',
   // `no-referrer` would make browsers send `Origin: null` on form posts, defeating the Origin check.
   'referrer-policy': 'same-origin',

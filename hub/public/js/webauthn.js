@@ -183,7 +183,7 @@
           const json = credentialJson(credential)
           const assertion = { credentialId: json.id, authenticatorData: json.response.authenticatorData, clientDataJSON: json.response.clientDataJSON, signature: json.response.signature, userHandle: json.response.userHandle || null }
           await post('/ops/confirmed', { hostId, operation, params: signed || params, requestId, issuedAt, assertion })
-          location.reload()
+          location.assign(form.getAttribute('data-done') || location.href)
         } catch (error) {
           say(form, explain(error), 'error')
         }

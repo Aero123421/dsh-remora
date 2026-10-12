@@ -322,3 +322,31 @@ export async function eventually<T>(check: () => Promise<T>, timeoutMs = 3000): 
   }
   throw last
 }
+
+/** Sign the CLI in with authorization code + PKCE and return an access token for `resource`. */
+export async function cliToken(owner: Owner, resource: string, scopes = ['dsh.read', 'dsh.content', 'dsh.tasks']): Promise<string> {
+  const verifier = toBase64Url(crypto.getRandomValues(new Uint8Array(32)))
+  const challenge = toBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))))
+  const redirectUri = 'http://127.0.0.1:53111/callback'
+  const query = new URLSearchParams({ response_type: 'code', client_id: 'remora-cli', redirect_uri: redirectUri, scope: scopes.join(' '), state: 's', code_challenge: challenge, code_challenge_method: 'S256', resource })
+  const page = await (await owner.browser.fetch(`/oauth/authorize?${query}`)).text()
+  const handle = /name="handle" value="([^"]+)"/.exec(page)?.[1]
+  if (!handle) throw new Error('no consent handle')
+  await reauth(owner)
+  const approved = await owner.browser.postForm('/oauth/authorize', { handle, decision: 'approve', scope: scopes })
+  const code = new URL(approved.headers.get('location') as string).searchParams.get('code') as string
+  const token = await hubFetch('/oauth/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri, client_id: 'remora-cli', code_verifier: verifier, resource }).toString() })
+  return ((await token.json()) as { access_token: string }).access_token
+}
+
+let rpc = 0
+/** Call one MCP tool (modern, stateless form) and return the JSON-RPC result. */
+export async function mcpTool(token: string, name: string, args: Record<string, unknown> = {}): Promise<{ isError: boolean; structuredContent: Record<string, unknown>; content: { text: string }[] }> {
+  const response = await hubFetch('/mcp', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'mcp-protocol-version': '2026-07-28', 'mcp-method': 'tools/call', 'mcp-name': name },
+    body: JSON.stringify({ jsonrpc: '2.0', id: ++rpc, method: 'tools/call', params: { name, arguments: args, _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } } }),
+  })
+  const body = (await response.json()) as { result: { isError: boolean; structuredContent: Record<string, unknown>; content: { text: string }[] } }
+  return body.result
+}

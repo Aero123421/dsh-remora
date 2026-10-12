@@ -3,6 +3,7 @@
  * validate, resolve the host, attach the caller's grant, pre-check, relay to
  * the host Durable Object (or answer hub operations here).
  */
+import { stampAnswerUrls } from './attention.ts'
 import { FREE_TIER, RATE_LIMITS } from './config.ts'
 import type { ExecuteResult, HostLive } from './host-do.ts'
 import { denied } from './host-do.ts'
@@ -25,6 +26,11 @@ export interface Caller {
 export interface RunOptions {
   confirmation?: Confirmation
   requestId?: string
+  /**
+   * The hub origin. When set, every attention item in the result gets its
+   * `answerUrl`, and approval refusals carry the link to the hub page.
+   */
+  origin?: string
 }
 
 const err = (code: RemoraError['code'], message: string, extra: Partial<RemoraError> = {}): ExecuteResult => ({ ok: false, error: { code, message, ...extra } })
@@ -54,6 +60,19 @@ export function finalParams(op: string, params: Record<string, unknown>, hostId:
 }
 
 export async function runOperation(env: Env, caller: Caller, op: string, rawParams: unknown, options: RunOptions = {}): Promise<ExecuteResult> {
+  const outcome = await runOperationInner(env, caller, op, rawParams, options)
+  return options.origin ? withAnswerLinks(outcome, options.origin) : outcome
+}
+
+/**
+ * Attention items leave the hub with the URL of the hub page that answers
+ * them (approval refusals get theirs in HostDO, which knows the host id).
+ */
+function withAnswerLinks(outcome: ExecuteResult, origin: string): ExecuteResult {
+  return outcome.ok ? { ok: true, result: stampAnswerUrls(outcome.result, origin) } : outcome
+}
+
+async function runOperationInner(env: Env, caller: Caller, op: string, rawParams: unknown, options: RunOptions): Promise<ExecuteResult> {
   const spec = findOperation(op)
   if (!spec) return err('not_found', `Unknown operation: ${op}`)
   const params = (rawParams ?? {}) as Record<string, unknown>
@@ -96,6 +115,7 @@ export async function runOperation(env: Env, caller: Caller, op: string, rawPara
     grant,
     ...(options.requestId ? { requestId: options.requestId } : {}),
     ...(options.confirmation ? { confirmation: options.confirmation } : {}),
+    ...(options.origin ? { origin: options.origin } : {}),
   })
 }
 

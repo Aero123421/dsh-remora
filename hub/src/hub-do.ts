@@ -10,11 +10,17 @@
 import { DurableObject } from 'cloudflare:workers'
 import { AUDIT_SCHEMA, appendAudit, listAudit, type AuditEntry, type AuditRow } from './audit.ts'
 import { CHALLENGE_TTL_MS, DEVICE_CODE_TTL_MS, DEVICE_POLL_INTERVAL_S, FULL_ACCESS_MS, RECOVERY_CODE_COUNT, REAUTH_WINDOW_MS, SESSION_IDLE_MS, SESSION_MAX_MS } from './config.ts'
-import type { CallContext, ClientKind, ClientRecord, ClientWithGrants, DeviceInfo, DevicePoll, GrantLevel, GrantSetting, HostRecord, HubState, MeterTotals, OwnerCredential, PairingInfo, PasskeyRecord, PersonalTokenRecord } from './types.ts'
+import { PUSH_TYPES, type CallContext, type ClientKind, type ClientRecord, type ClientWithGrants, type DeviceInfo, type DevicePoll, type GrantLevel, type GrantSetting, type HostRecord, type HubState, type MeterTotals, type OwnerCredential, type PairingInfo, type PasskeyRecord, type PersonalTokenRecord, type PushDevice, type PushEvent, type PushOutcome, type PushType } from './types.ts'
+import { buildPushRequest, generateVapidKeys, type VapidKeys } from './webpush.ts'
 import { base32, parseJson, randomBytes, randomCode, randomToken, sha256Hex, utcDay, verifyEd25519 } from './util.ts'
 import { PAIRING_POLL_INTERVAL_MS, PAIRING_TTL_MS, USER_CODE_ALPHABET, pairPollMessage, type Grant, type PairPollResponse, type PairStartRequest } from './vendor/protocol/index.ts'
 
 export const HUB_OBJECT_NAME = 'hub'
+
+/** Devices that can receive notifications. */
+export const PUSH_MAX_DEVICES = 20
+/** Per device: at most this many pushes per window (seconds); more are dropped. */
+export const PUSH_RATE: readonly [number, number] = [30, 600]
 
 export const PAIRING_MAX_PER_SOURCE = 3
 export const PAIRING_SOFT_CAP = 20
@@ -111,6 +117,17 @@ const SCHEMA = `
   );
   CREATE TABLE IF NOT EXISTS rate (key TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (key, window_start));
   CREATE TABLE IF NOT EXISTS meter (day TEXT PRIMARY KEY, worker INTEGER NOT NULL, durable INTEGER NOT NULL, kv INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id TEXT PRIMARY KEY,
+    endpoint TEXT NOT NULL UNIQUE,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    label TEXT NOT NULL,
+    types TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_sent_at INTEGER,
+    last_error TEXT
+  );
   ${AUDIT_SCHEMA}
 `
 
@@ -203,6 +220,7 @@ export class HubDO extends DurableObject<Env> {
       hosts: this.count('SELECT COUNT(*) AS n FROM hosts WHERE revoked_at IS NULL'),
       allowOtherClients: this.meta('allow_other_clients') === '1',
       recoveryCodesLeft: this.count('SELECT COUNT(*) AS n FROM recovery_codes WHERE used_at IS NULL'),
+      pushDevices: this.count('SELECT COUNT(*) AS n FROM push_subscriptions'),
     }
   }
 
@@ -678,6 +696,121 @@ export class HubDO extends DurableObject<Env> {
     }
     this.sql.exec('UPDATE device_codes SET last_poll_at = ? WHERE hash = ?', now, hash)
     return { status: 'pending' }
+  }
+
+  // --- Web Push -----------------------------------------------------------------
+
+  private async vapidKeys(): Promise<VapidKeys> {
+    const stored = parseJson<VapidKeys | null>(this.meta('vapid_keys'), null)
+    if (stored) return stored
+    const keys = await generateVapidKeys()
+    this.setMeta('vapid_keys', JSON.stringify(keys))
+    return keys
+  }
+
+  /** The applicationServerKey browsers subscribe with. Generated once. */
+  async vapidPublicKey(): Promise<string> {
+    return (await this.vapidKeys()).publicKey
+  }
+
+  /** Store a device's subscription (one per endpoint); re-subscribing updates its keys. */
+  async pushSubscribe(input: { endpoint: string; p256dh: string; auth: string; label: string }): Promise<{ id: string } | { error: string }> {
+    const existing = this.sql.exec<{ id: string }>('SELECT id FROM push_subscriptions WHERE endpoint = ?', input.endpoint).toArray()[0]
+    if (existing) {
+      this.sql.exec('UPDATE push_subscriptions SET p256dh = ?, auth = ?, label = ?, last_error = NULL WHERE id = ?', input.p256dh, input.auth, input.label, existing.id)
+      return { id: existing.id }
+    }
+    if (this.count('SELECT COUNT(*) AS n FROM push_subscriptions') >= PUSH_MAX_DEVICES) return { error: 'too-many-devices' }
+    const id = base32(randomBytes(10))
+    this.sql.exec(
+      'INSERT INTO push_subscriptions (id, endpoint, p256dh, auth, label, types, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      id, input.endpoint, input.p256dh, input.auth, input.label, JSON.stringify(PUSH_TYPES), Date.now(),
+    )
+    await this.audit({ actor: 'owner', actorName: 'オーナー', operation: 'push.subscribe', hostId: null, outcome: 'ok', layer: null, reason: null })
+    return { id }
+  }
+
+  async pushUnsubscribe(by: { id?: string; endpoint?: string }): Promise<boolean> {
+    const removed = by.id !== undefined
+      ? this.sql.exec('DELETE FROM push_subscriptions WHERE id = ?', by.id).rowsWritten
+      : this.sql.exec('DELETE FROM push_subscriptions WHERE endpoint = ?', by.endpoint ?? '').rowsWritten
+    if (removed > 0) await this.audit({ actor: 'owner', actorName: 'オーナー', operation: 'push.remove', hostId: null, outcome: 'ok', layer: null, reason: null })
+    return removed > 0
+  }
+
+  async pushSetTypes(id: string, types: PushType[]): Promise<void> {
+    const allowed = types.filter(type => PUSH_TYPES.includes(type))
+    this.sql.exec('UPDATE push_subscriptions SET types = ? WHERE id = ?', JSON.stringify(allowed), id)
+  }
+
+  async listPushDevices(): Promise<PushDevice[]> {
+    return this.sql.exec<{ id: string; endpoint: string; label: string; types: string; created_at: number; last_sent_at: number | null; last_error: string | null }>('SELECT id, endpoint, label, types, created_at, last_sent_at, last_error FROM push_subscriptions ORDER BY created_at')
+      .toArray()
+      .map(row => ({ id: row.id, endpoint: row.endpoint, label: row.label, types: parseJson<PushType[]>(row.types, []), createdAt: row.created_at, lastSentAt: row.last_sent_at, lastError: row.last_error }))
+  }
+
+  /**
+   * Send one notification per device for a batch of events (one batch per
+   * host frame or hub action), honouring each device's switches and a
+   * per-device rate limit. Outbound only: 404/410 drop the subscription.
+   */
+  async notify(events: PushEvent[], origin: string | null): Promise<PushOutcome> {
+    const outcome: PushOutcome = { sent: 0, dropped: 0, removed: 0, failed: 0 }
+    // The call that delivered this batch is itself a Durable Object request.
+    await this.meterAdd({ worker: 0, durable: 0, kv: 0 })
+    if (events.length === 0) return outcome
+    const rows = this.sql.exec<{ id: string; endpoint: string; p256dh: string; auth: string; types: string }>('SELECT id, endpoint, p256dh, auth, types FROM push_subscriptions').toArray()
+    if (rows.length === 0) return outcome
+    const keys = await this.vapidKeys()
+    const subject = origin && origin.startsWith('https://') ? origin : 'mailto:remora-hub@localhost'
+    const [max, window] = PUSH_RATE
+    await Promise.all(rows.map(async row => {
+      const types = parseJson<string[]>(row.types, [])
+      const wanted = events.filter(event => event.type === 'test' || types.includes(event.type))
+      if (wanted.length === 0) return
+      if (!this.hitSync(`push:${row.id}`, max, window)) {
+        outcome.dropped++
+        return
+      }
+      const first = wanted[0] as PushEvent
+      const payload = {
+        v: 1,
+        kind: first.kind,
+        host: first.host,
+        title: first.title,
+        url: wanted.length > 1 ? (wanted.some(event => event.type === 'attention') ? '/attention' : '/') : first.url,
+        count: wanted.length,
+        ...(typeof first.expiresAt === 'number' ? { expiresAt: first.expiresAt } : {}),
+        tag: wanted.length > 1 ? 'remora-batch' : `${first.kind}:${first.hostId ?? ''}:${first.url}`,
+      }
+      const urgent = wanted.some(event => event.type === 'attention')
+      const ttl = urgent
+        ? Math.max(60, Math.min(3600, Math.floor(((typeof first.expiresAt === 'number' ? first.expiresAt : Date.now() + 3_600_000) - Date.now()) / 1000)))
+        : first.type === 'hosts' ? 3600 : 86_400
+      try {
+        const request = await buildPushRequest(row, payload, keys, subject, {
+          ttl,
+          urgency: urgent ? 'high' : 'normal',
+          ...(first.type === 'hosts' && wanted.length === 1 && first.hostId ? { topic: `host${first.hostId}`.slice(0, 32) } : {}),
+        })
+        const response = await fetch(request, { signal: AbortSignal.timeout(10_000) })
+        if (response.status === 404 || response.status === 410) {
+          this.sql.exec('DELETE FROM push_subscriptions WHERE id = ?', row.id)
+          outcome.removed++
+          await this.audit({ actor: 'hub', actorName: 'ハブ', operation: 'push.expired', hostId: null, outcome: 'ok', layer: null, reason: String(response.status) })
+        } else if (response.ok) {
+          this.sql.exec('UPDATE push_subscriptions SET last_sent_at = ?, last_error = NULL WHERE id = ?', Date.now(), row.id)
+          outcome.sent++
+        } else {
+          this.sql.exec('UPDATE push_subscriptions SET last_error = ? WHERE id = ?', `HTTP ${response.status}`, row.id)
+          outcome.failed++
+        }
+      } catch (error) {
+        this.sql.exec('UPDATE push_subscriptions SET last_error = ? WHERE id = ?', error instanceof Error ? error.message.slice(0, 120) : 'error', row.id)
+        outcome.failed++
+      }
+    }))
+    return outcome
   }
 
   // --- audit --------------------------------------------------------------------
