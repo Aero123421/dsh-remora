@@ -1,0 +1,33 @@
+/** Encoding helpers that behave the same in Node 22 and Cloudflare Workers. */
+
+export function toBase64Url(bytes: Uint8Array): string {
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
+}
+
+export function fromBase64Url(text: string): Uint8Array {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('not base64url')
+  const padded = text.replaceAll('-', '+').replaceAll('_', '/') + '==='.slice((text.length + 3) % 4)
+  const binary = atob(padded)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+/** JSON with object keys sorted at every level and no whitespace: the same value always gives the same bytes. */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    if (typeof value === 'number' && !Number.isFinite(value)) throw new Error('non-finite number')
+    if (value === undefined) throw new Error('undefined is not JSON')
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item ?? null)).join(',')}]`
+  const entries = Object.entries(value as Record<string, unknown>).filter(([, item]) => item !== undefined).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(',')}}`
+}
+
+export async function sha256(data: string | Uint8Array): Promise<Uint8Array> {
+  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
+}

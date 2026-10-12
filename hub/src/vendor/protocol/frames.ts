@@ -5,8 +5,12 @@
  * keepalive, which is a fixed text pair the hub answers with
  * `setWebSocketAutoResponse` so the Durable Object is never woken for it.
  */
+import type { AttentionItem } from './api.ts'
+import type { Confirmation } from './confirmation.ts'
 import { ProtocolError, type RemoraError } from './errors.ts'
-import type { AttentionKind, TaskState } from './operations.ts'
+import type { TaskState } from './operations.ts'
+import type { OwnerCredential } from './pairing.ts'
+import type { Grant } from './permissions.ts'
 
 export const KEEPALIVE_PING = 'remora:ping'
 export const KEEPALIVE_PONG = 'remora:pong'
@@ -25,10 +29,15 @@ export interface HelloFrame {
   t: 'hello'
   protocol: number
   hostId: string
+  /** Display name set on the DSH settings tab. */
+  name: string
   plugin: { version: string }
   dsh: { version: string | null }
-  /** Operation ids the plugin can serve on this DSH (feature detection result). */
+  /** Operation ids the plugin can serve on this DSH (feature detection ∩ implemented). */
   operations: string[]
+  /** Current DSH-side ceiling, so the hub can fail early and explain denials. The plugin still decides. */
+  ceiling: Grant
+  killSwitch: boolean
 }
 
 export interface AuthFrame {
@@ -51,18 +60,22 @@ export interface TaskEvent {
   taskId: string
   state: TaskState
   sessionId?: string
+  updatedAt: number
+  error?: RemoraError
 }
 
+/** The full current attention list of one session (replaces what the hub had for it). `detail` is never sent here. */
 export interface AttentionEvent {
   kind: 'attention'
   sessionId: string
-  items: { id: string; kind: AttentionKind; title: string }[]
+  items: Omit<AttentionItem, 'detail'>[]
 }
 
 export interface HostStatusEvent {
   kind: 'host-status'
-  fullAccess: boolean
+  ceiling: Grant
   killSwitch: boolean
+  operations: string[]
 }
 
 export type HostEvent = TaskEvent | AttentionEvent | HostStatusEvent
@@ -90,12 +103,20 @@ export interface ReadyFrame {
 
 export interface RequestFrame {
   t: 'request'
+  /** Unique per request; also the requestId bound into confirmations. */
   id: string
   op: string
   params: unknown
   actor: Actor
+  /** OAuth scopes of the calling token. */
   scopes: string[]
+  /** The calling client's grant on this host, as set on the hub. */
+  grant: Grant
   idempotencyKey?: string
+  /** For `task.start`, `task.steer` and `task.resubmit`: the hub-assigned task id. */
+  taskId?: string
+  /** Present for operations in REQUIRES_CONFIRMATION. */
+  confirmation?: Confirmation
   /** Epoch milliseconds after which the hub no longer waits for the response. */
   deadline: number
 }
@@ -105,7 +126,13 @@ export interface CloseFrame {
   reason: 'protocol_mismatch' | 'auth_failed' | 'duplicate_connection' | 'revoked'
 }
 
-export type HubFrame = ChallengeFrame | ReadyFrame | RequestFrame | CloseFrame
+/** Sent after `ready`. The plugin keeps using its pinned credentials and asks the DSH user to confirm any change. */
+export interface OwnerCredentialsFrame {
+  t: 'owner-credentials'
+  credentials: OwnerCredential[]
+}
+
+export type HubFrame = ChallengeFrame | ReadyFrame | RequestFrame | CloseFrame | OwnerCredentialsFrame
 
 /**
  * The exact bytes a host signs during the handshake. Binding the hub origin,
@@ -117,7 +144,7 @@ export function hostAuthMessage(origin: string, hostId: string, nonce: string, i
 }
 
 const HOST_FRAME_TYPES = new Set(['hello', 'auth', 'response', 'event'])
-const HUB_FRAME_TYPES = new Set(['challenge', 'ready', 'request', 'close'])
+const HUB_FRAME_TYPES = new Set(['challenge', 'ready', 'request', 'close', 'owner-credentials'])
 
 function parseObject(text: string): Record<string, unknown> {
   let value: unknown
@@ -144,6 +171,7 @@ export function parseHostFrame(text: string): HostFrame {
     requireString(frame, 'hostId')
     if (typeof frame.protocol !== 'number') throw new ProtocolError('invalid_request', 'frame.protocol must be a number')
     if (!Array.isArray(frame.operations)) throw new ProtocolError('invalid_request', 'frame.operations must be an array')
+    if (typeof frame.ceiling !== 'object' || frame.ceiling === null) throw new ProtocolError('invalid_request', 'frame.ceiling must be an object')
   }
   if (frame.t === 'auth') { requireString(frame, 'nonce'); requireString(frame, 'signature') }
   if (frame.t === 'response') {
@@ -165,6 +193,7 @@ export function parseHubFrame(text: string): HubFrame {
   if (frame.t === 'request') {
     requireString(frame, 'id'); requireString(frame, 'op')
     if (typeof frame.deadline !== 'number') throw new ProtocolError('invalid_request', 'frame.deadline must be a number')
+    if (typeof frame.grant !== 'object' || frame.grant === null) throw new ProtocolError('invalid_request', 'frame.grant must be an object')
   }
   return frame as unknown as HubFrame
 }

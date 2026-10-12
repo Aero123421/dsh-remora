@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { PROTOCOL_VERSION, ProtocolError, hostAuthMessage, isSupportedProtocol, parseHostFrame, parseHubFrame } from '../src/index.ts'
 
 test('hello frames round-trip', () => {
-  const hello = { t: 'hello', protocol: PROTOCOL_VERSION, hostId: 'h1', plugin: { version: '0.1.0' }, dsh: { version: '0.2.1-alpha.2' }, operations: ['status'] }
+  const hello = { t: 'hello', protocol: PROTOCOL_VERSION, hostId: 'h1', name: 'desk', plugin: { version: '0.1.0' }, dsh: { version: '0.2.1-alpha.2' }, operations: ['status'], ceiling: { level: 'view' }, killSwitch: false }
   assert.deepEqual(parseHostFrame(JSON.stringify(hello)), hello)
 })
 
@@ -12,6 +12,8 @@ test('malformed frames are rejected with a protocol error', () => {
     assert.throws(() => parseHostFrame(text), ProtocolError, text)
   }
   assert.throws(() => parseHubFrame('{"t":"request","id":"1","op":"status"}'), ProtocolError)
+  assert.throws(() => parseHubFrame('{"t":"request","id":"1","op":"status","deadline":1}'), ProtocolError)
+  assert.throws(() => parseHostFrame('{"t":"hello","hostId":"h1","protocol":1,"operations":[]}'), ProtocolError)
 })
 
 test('hub frames parse', () => {
