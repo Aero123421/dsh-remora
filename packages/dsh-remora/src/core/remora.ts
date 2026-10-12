@@ -945,7 +945,8 @@ export class RemoraCore {
     return this.auditLog.append(entry).then(() => undefined, error => this.ctx.logger.warn('Remora: audit write failed', error))
   }
 
-  auditEntries(limit = 200): AuditEntry[] {
+  async auditEntries(limit = 200): Promise<AuditEntry[]> {
+    await this.auditLog?.flush()
     return this.auditLog ? this.auditLog.entries().slice(-limit).reverse() : []
   }
 

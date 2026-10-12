@@ -94,7 +94,7 @@ export function createMethods(core: RemoraCore): Record<string, Method> {
   const methods: Record<string, Method> = {
     state: (_, { local }) => core.snapshot(local),
     catalog: () => core.catalog(),
-    audit: () => ({ entries: core.auditEntries(200) }),
+    audit: async () => ({ entries: await core.auditEntries(200) }),
     clients: () => ({ clients: core.clients() }),
     'kill-switch': async (payload, { local }) => {
       await core.setKillSwitch(bool(payload, 'on'), local)
