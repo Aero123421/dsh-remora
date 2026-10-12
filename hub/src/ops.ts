@@ -70,7 +70,7 @@ export async function runOperation(env: Env, caller: Caller, op: string, rawPara
     // Hub operations still honour the token scope.
     const decision = decide({ operation: op, ceiling: { level: 'full' }, hubGrant: { level: 'view' }, tokenScopes: caller.scopes, now: Date.now() })
     if (!decision.allowed) return { ok: false, error: denied(decision.layer, decision.reason, op) }
-    const result = await hubOperation(env, context, op)
+    const result = await hubOperation(env, context, op, caller.kind === 'owner' ? undefined : caller.clientId)
     if (caller.kind === 'client') await hubStub(env).audit({ actor: caller.clientId, actorName: caller.clientName, operation: op, hostId: null, outcome: 'ok', layer: null, reason: null })
     return { ok: true, result }
   }
@@ -115,13 +115,15 @@ function describeHosts(hosts: { hostId: string; name: string }[]): string {
 }
 
 /** Live view of every host the caller may see, one Durable Object call per host. */
-export async function liveHosts(env: Env, context: CallContext): Promise<{ summary: HostSummary; live: HostLive }[]> {
+/** Live view of every host the caller may see. With `clientId`, task lists are that client's only. */
+export async function liveHosts(env: Env, context: CallContext, clientId?: string): Promise<{ summary: HostSummary; live: HostLive }[]> {
   const visible = context.hosts.filter(host => context.grants[host.hostId] !== null)
   return Promise.all(visible.map(async host => {
-    const live = await hostStub(env, host.hostId).summary()
+    const live = await hostStub(env, host.hostId).summary(clientId)
     const summary: HostSummary = {
       hostId: host.hostId,
-      name: live.name || host.name,
+      // The name the owner approved at pairing; a host cannot rename itself.
+      name: host.name,
       online: live.online,
       lastSeenAt: live.lastSeenAt,
       pluginVersion: live.pluginVersion,
@@ -145,8 +147,8 @@ export async function freeTierUsage(env: Env): Promise<StatusResult['freeTier']>
   }
 }
 
-async function hubOperation(env: Env, context: CallContext, op: string): Promise<unknown> {
-  const hosts = await liveHosts(env, context)
+async function hubOperation(env: Env, context: CallContext, op: string, clientId: string | undefined): Promise<unknown> {
+  const hosts = await liveHosts(env, context, clientId)
   if (op === 'hosts.list') return { hosts: hosts.map(entry => entry.summary) }
   const result: StatusResult = {
     hosts: hosts.map(entry => entry.summary),
@@ -162,4 +164,29 @@ export async function revokeHostEverywhere(env: Env, hostId: string, by: 'owner'
   const changed = await hubStub(env).revokeHost(hostId, by)
   if (changed) await hostStub(env, hostId).revoke()
   return changed
+}
+
+/** After a client was revoked or narrowed: fail its parked tasks that are no longer allowed. */
+export async function refreshParked(env: Env, clientId: string, hostIds?: string[]): Promise<void> {
+  const ids = hostIds ?? (await hubStub(env).listHosts()).map(host => host.hostId)
+  await Promise.all(ids.map(hostId => hostStub(env, hostId).refreshParked(clientId)))
+}
+
+const pairedCache = new Map<string, { paired: boolean; until: number }>()
+
+/**
+ * Whether a host id belongs to a paired, unrevoked host. Checked before an
+ * unauthenticated WebSocket upgrade reaches a host Durable Object, so stray
+ * ids never create one. Cached for a minute per isolate (the host object
+ * re-checks revocation itself).
+ */
+export async function isPairedHost(env: Env, hostId: string): Promise<boolean> {
+  const now = Date.now()
+  const cached = pairedCache.get(hostId)
+  if (cached && cached.until > now) return cached.paired
+  const host = await hubStub(env).getHost(hostId)
+  const paired = host !== null && host.revokedAt === null
+  if (pairedCache.size > 1000) pairedCache.clear()
+  pairedCache.set(hostId, { paired, until: now + 60_000 })
+  return paired
 }

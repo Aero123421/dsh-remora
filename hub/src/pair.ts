@@ -29,7 +29,7 @@ export async function pairStart(request: Request, env: Env): Promise<Response> {
   if (!name) return errorResponse({ code: 'invalid_request', message: 'name is required' })
   let started
   try {
-    started = await hubStub(env).pairStart({ publicKey: body.publicKey, name, pluginVersion, protocol: body.protocol })
+    started = await hubStub(env).pairStart({ publicKey: body.publicKey, name, pluginVersion, protocol: body.protocol }, clientIp(request))
   } catch {
     return errorResponse({ code: 'rate_limited', message: 'Too many pending pairings on this hub.' })
   }

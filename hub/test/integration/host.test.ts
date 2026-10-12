@@ -114,6 +114,10 @@ describe('pairing and the host connection', () => {
       return { ok: true, result: {} }
     }
     const stub = hostObject(host.hostId)
+    // Parked tasks are re-checked against the client's current grant on delivery.
+    const hubStub = env.HUB.get(env.HUB.idFromName('hub'))
+    await hubStub.upsertClient({ clientId: 'client-a', name: 'Test client', kind: 'cimd', domain: null, redirectHost: null })
+    await hubStub.setGrant('client-a', host.hostId, 'request', 'request')
     const start = call('task.start', { target: { sessionId: 'sess-1' }, prompt: 'hello', idempotencyKey: 'key-1' })
     const first = await stub.execute(start)
     expect(first.ok).toBe(true)

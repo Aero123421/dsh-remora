@@ -16,6 +16,11 @@ import { PAIRING_POLL_INTERVAL_MS, PAIRING_TTL_MS, USER_CODE_ALPHABET, pairPollM
 
 export const HUB_OBJECT_NAME = 'hub'
 
+export const PAIRING_MAX_PER_SOURCE = 3
+export const PAIRING_SOFT_CAP = 20
+export const PAIRING_HARD_CAP = 100
+export const PAIRING_IDLE_MS = 30_000
+
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS passkeys (
@@ -166,6 +171,14 @@ export class HubDO extends DurableObject<Env> {
     this.sql = ctx.storage.sql
     ctx.blockConcurrencyWhile(async () => {
       this.sql.exec(SCHEMA)
+      // Columns added after the first release.
+      for (const statement of ['ALTER TABLE pairings ADD COLUMN source TEXT', 'ALTER TABLE pairings ADD COLUMN last_seen_at INTEGER']) {
+        try {
+          this.sql.exec(statement)
+        } catch {
+          // already there
+        }
+      }
     })
   }
 
@@ -386,18 +399,29 @@ export class HubDO extends DurableObject<Env> {
 
   // --- pairing --------------------------------------------------------------
 
-  async pairStart(request: PairStartRequest): Promise<{ pairingId: string; userCode: string; expiresAt: number }> {
+  /**
+   * Start a pairing. Pending pairings are capped per source (3) and overall
+   * (100). Past 20 pending, pairings whose host stopped polling for 30 s are
+   * dropped first, so a burst of abandoned requests cannot block a real host
+   * that keeps polling.
+   */
+  async pairStart(request: PairStartRequest, source = 'unknown'): Promise<{ pairingId: string; userCode: string; expiresAt: number }> {
     const now = Date.now()
+    const sourceKey = (await sha256Hex(`remora-pair-source/v1\n${source}`)).slice(0, 32)
     this.sql.exec('DELETE FROM pairings WHERE expires_at < ?', now - PAIRING_TTL_MS)
-    const pending = this.count("SELECT COUNT(*) AS n FROM pairings WHERE status = 'pending' AND expires_at > ?", now)
-    if (pending >= 20) throw new Error('too many pending pairings')
+    const pendingCount = () => this.count("SELECT COUNT(*) AS n FROM pairings WHERE status = 'pending' AND expires_at > ?", now)
+    if (this.count("SELECT COUNT(*) AS n FROM pairings WHERE status = 'pending' AND expires_at > ? AND source = ?", now, sourceKey) >= PAIRING_MAX_PER_SOURCE) throw new Error('too many pending pairings from this source')
+    if (pendingCount() >= PAIRING_SOFT_CAP) {
+      this.sql.exec("UPDATE pairings SET expires_at = ? WHERE status = 'pending' AND COALESCE(last_seen_at, created_at) < ?", now - 1, now - PAIRING_IDLE_MS)
+    }
+    if (pendingCount() >= PAIRING_HARD_CAP) throw new Error('too many pending pairings')
     const pairingId = `p_${randomToken(24)}`
     let userCode = randomCode(USER_CODE_ALPHABET, 8)
     while (this.count('SELECT COUNT(*) AS n FROM pairings WHERE user_code = ?', userCode) > 0) userCode = randomCode(USER_CODE_ALPHABET, 8)
     const expiresAt = now + PAIRING_TTL_MS
     this.sql.exec(
-      "INSERT INTO pairings (pairing_id, user_code, public_key, name, plugin_version, protocol, created_at, expires_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
-      pairingId, userCode, request.publicKey, request.name, request.pluginVersion, request.protocol, now, expiresAt,
+      "INSERT INTO pairings (pairing_id, user_code, public_key, name, plugin_version, protocol, created_at, expires_at, status, source, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+      pairingId, userCode, request.publicKey, request.name, request.pluginVersion, request.protocol, now, expiresAt, sourceKey, now,
     )
     return { pairingId, userCode, expiresAt }
   }
@@ -411,6 +435,7 @@ export class HubDO extends DurableObject<Env> {
     const row = this.sql.exec<{ public_key: string; status: string; expires_at: number; host_id: string | null }>('SELECT public_key, status, expires_at, host_id FROM pairings WHERE pairing_id = ?', pairingId).toArray()[0]
     if (!row) return { status: 'expired' }
     if (!(await verifyEd25519(row.public_key, pairPollMessage(origin, pairingId), signature))) return { status: 'invalid' }
+    this.sql.exec('UPDATE pairings SET last_seen_at = ? WHERE pairing_id = ?', Date.now(), pairingId)
     if (row.status === 'denied') return { status: 'denied' }
     if (row.status === 'approved' && row.host_id) return { status: 'approved', hostId: row.host_id, hubOrigin: origin, rpId: new URL(origin).hostname, owner: await this.ownerCredentials() }
     if (row.expires_at < Date.now()) return { status: 'expired' }
@@ -541,6 +566,16 @@ export class HubDO extends DurableObject<Env> {
     const grants: Record<string, Grant | null> = {}
     for (const host of hosts) grants[host.hostId] = toProtocolGrant(settings.find(setting => setting.hostId === host.hostId))
     return { ok: true, hosts, grants }
+  }
+
+  /** A client's current standing on one host, read when a parked task is finally delivered. */
+  async clientStanding(clientId: string, hostId: string): Promise<{ revoked: boolean; grant: Grant | null }> {
+    const client = this.sql.exec<{ revoked_at: number | null }>('SELECT revoked_at FROM clients WHERE client_id = ?', clientId).toArray()[0]
+    if (client?.revoked_at) return { revoked: true, grant: null }
+    const host = this.sql.exec<{ revoked_at: number | null }>('SELECT revoked_at FROM hosts WHERE host_id = ?', hostId).toArray()[0]
+    if (!host || host.revoked_at) return { revoked: false, grant: null }
+    const setting = this.sql.exec<GrantRow>('SELECT * FROM grants WHERE client_id = ? AND host_id = ?', clientId, hostId).toArray().map(grantFromRow)[0]
+    return { revoked: false, grant: toProtocolGrant(setting) }
   }
 
   // --- personal tokens ---------------------------------------------------------

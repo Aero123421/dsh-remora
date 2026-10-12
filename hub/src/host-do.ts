@@ -11,7 +11,7 @@
 import { stampHostId } from './stamp.ts'
 import { DurableObject } from 'cloudflare:workers'
 import { AUDIT_SCHEMA, appendAudit, listAudit, type AuditRow } from './audit.ts'
-import { PARKED_TASK_TTL_MS, RELAY_TIMEOUT_MS } from './config.ts'
+import { OWNER_CLIENT_ID, PARKED_TASK_TTL_MS, RELAY_TIMEOUT_MS } from './config.ts'
 import { HUB_OBJECT_NAME } from './hub-do.ts'
 import { newTaskId, parseJson, randomToken, verifyEd25519 } from './util.ts'
 import {
@@ -53,7 +53,10 @@ export type ExecuteResult = { ok: true; result: unknown } | { ok: false; error: 
 
 export interface HostLive {
   hostId: string
+  /** The name approved at pairing. */
   name: string | null
+  /** What the host calls itself in its hello, when it reported one. */
+  reportedName: string | null
   online: boolean
   revoked: boolean
   lastSeenAt: number | null
@@ -115,23 +118,39 @@ export class HostDO extends DurableObject<Env> {
   private readonly pending = new Map<string, (frame: ResponseFrame | null) => void>()
   private readonly waiters = new Map<string, Set<() => void>>()
   private messagesSinceFlush = 0
+  /** Parked deliveries this instance has sent and not yet seen answered. */
+  private readonly inFlight = new Set<string>()
+  /**
+   * The schema is created on provision(), not in the constructor, so a stub
+   * for an id that was never paired leaves no storage behind.
+   */
+  private schemaReady = false
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
     this.sql = ctx.storage.sql
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(KEEPALIVE_PING, KEEPALIVE_PONG))
     ctx.blockConcurrencyWhile(async () => {
-      this.sql.exec(SCHEMA)
+      this.schemaReady = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'info'").one().n > 0
+      if (this.schemaReady) this.sql.exec(SCHEMA)
     })
+  }
+
+  private ensureSchema(): void {
+    if (this.schemaReady) return
+    this.sql.exec(SCHEMA)
+    this.schemaReady = true
   }
 
   // --- small storage helpers ----------------------------------------------------
 
   private info(key: string): string | null {
+    if (!this.schemaReady) return null
     return this.sql.exec<{ value: string }>('SELECT value FROM info WHERE key = ?', key).toArray()[0]?.value ?? null
   }
 
   private setInfo(key: string, value: string | null): void {
+    this.ensureSchema()
     if (value === null) this.sql.exec('DELETE FROM info WHERE key = ?', key)
     else this.sql.exec('INSERT INTO info (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value', key, value)
   }
@@ -179,6 +198,7 @@ export class HostDO extends DurableObject<Env> {
   }
 
   async revoke(): Promise<void> {
+    this.ensureSchema()
     this.setInfo('revoked', '1')
     this.setInfo('public_key', null)
     for (const ws of this.ctx.getWebSockets()) {
@@ -274,7 +294,8 @@ export class HostDO extends DurableObject<Env> {
     }
     ws.serializeAttachment({ ...attachment, stage: 'ready', hello: undefined } satisfies Attachment)
     const now = Date.now()
-    this.setInfo('name', hello.name || this.info('name') || '')
+    // The approved name stays the display name; what the host calls itself is shown beside it.
+    this.setInfo('reported_name', hello.name ? hello.name.slice(0, 80) : null)
     this.setInfo('plugin_version', hello.plugin?.version ?? '')
     this.setInfo('dsh_version', hello.dsh?.version ?? '')
     this.setInfo('operations', JSON.stringify(hello.operations))
@@ -289,7 +310,7 @@ export class HostDO extends DurableObject<Env> {
       // The plugin keeps its pinned credentials; it asks again on the next connection.
     }
     await this.audit('host', 'host.connect', 'ok')
-    this.deliverUndelivered(ws)
+    await this.deliverUndelivered(ws)
     await this.scheduleAlarm()
   }
 
@@ -362,6 +383,7 @@ export class HostDO extends DurableObject<Env> {
       return
     }
     // A delivery made while no request was waiting (reconnect or retry).
+    this.inFlight.delete(frame.id)
     const row = this.sql.exec<TaskRow>('SELECT * FROM tasks WHERE delivery_id = ?', frame.id).toArray()[0]
     if (row) this.applyDelivery(row, frame)
   }
@@ -426,17 +448,64 @@ export class HostDO extends DurableObject<Env> {
     })
   }
 
-  private deliverUndelivered(ws: WebSocket): void {
+  private async deliverUndelivered(ws: WebSocket): Promise<void> {
     const rows = this.sql.exec<TaskRow>("SELECT * FROM tasks WHERE delivered = 0 AND params IS NOT NULL AND state = 'parked' ORDER BY created_at").toArray()
     for (const row of rows) {
       // A delivery already in flight from createTask() (it awaits its response in `pending`)
-      // must not be sent twice: onAuthenticated() can reach this point after createTask()
-      // inserted and sent a task while onAuthenticated() awaited the owner credentials.
-      if (this.pending.has(row.delivery_id)) continue
-      const call = parseJson<ExecuteCall | null>(row.frame, null)
-      if (!call) continue
+      // or from an earlier redelivery must not be sent twice.
+      if (this.pending.has(row.delivery_id) || this.inFlight.has(row.delivery_id)) continue
+      this.inFlight.add(row.delivery_id)
+      setTimeout(() => this.inFlight.delete(row.delivery_id), RELAY_TIMEOUT_MS)
+      // The grant may have changed while the task was parked: use the current one.
+      const call = await this.revalidate(row)
+      if (!call || this.pending.has(row.delivery_id)) continue
       this.sendRequest(ws, row.delivery_id, { ...call, params: parseJson(row.params, {}) }, RELAY_TIMEOUT_MS, row.task_id, row.idempotency_key)
     }
+  }
+
+  /**
+   * Re-check a parked task against the client's current standing: revoked
+   * clients, narrowed hub grants and lowered DSH ceilings fail the task.
+   * Returns the call to deliver with the fresh grant, or null when it failed.
+   */
+  private async revalidate(row: TaskRow): Promise<ExecuteCall | null> {
+    const stored = parseJson<ExecuteCall | null>(row.frame, null)
+    if (!stored) return null
+    let grant: Grant | null = stored.grant
+    let refusal: RemoraError | null = null
+    if (stored.actor.clientId === OWNER_CLIENT_ID) {
+      grant = { level: 'full', fullAccessExpiresAt: Date.now() + 60_000 }
+    } else {
+      const standing = await this.hub().clientStanding(stored.actor.clientId, this.hostId ?? '')
+      if (standing.revoked) refusal = { ...denied('hub', 'switched-off', row.op), message: `${row.op} was not delivered: this client was disconnected on the hub while the task was parked.` }
+      else if (!standing.grant) refusal = { ...denied('hub', 'switched-off', row.op), message: `${row.op} was not delivered: this client is blocked on this host.` }
+      else grant = standing.grant
+    }
+    if (!refusal && grant) {
+      const ceiling = this.ceiling()
+      const decision = ceiling ? decide({ operation: row.op, ceiling, hubGrant: grant, tokenScopes: stored.scopes, now: Date.now() }) : { allowed: true as const }
+      if (!decision.allowed) refusal = denied(decision.layer, decision.reason, row.op)
+    }
+    const current = this.taskRow(row.task_id)
+    if (!current || current.state !== 'parked' || current.delivered !== 0) return null
+    if (refusal) {
+      this.sql.exec("UPDATE tasks SET state = 'failed', params = NULL, frame = NULL, expires_at = NULL, updated_at = ?, error = ? WHERE task_id = ?", Date.now(), JSON.stringify(refusal), row.task_id)
+      this.notify(row.task_id)
+      await this.audit(stored.actor, `${row.op}.deliver`, 'denied', { layer: refusal.denial?.layer, reason: refusal.denial?.reason ?? null })
+      return null
+    }
+    const fresh: ExecuteCall = { ...stored, grant: grant as Grant }
+    this.sql.exec('UPDATE tasks SET frame = ? WHERE task_id = ?', JSON.stringify(fresh), row.task_id)
+    return fresh
+  }
+
+  /** Called by the Worker after a client was revoked or its grant on this host changed. */
+  async refreshParked(clientId: string): Promise<number> {
+    if (!this.schemaReady) return 0
+    const rows = this.sql.exec<TaskRow>("SELECT * FROM tasks WHERE client_id = ? AND delivered = 0 AND state = 'parked'", clientId).toArray()
+    let failed = 0
+    for (const row of rows) if (!(await this.revalidate(row))) failed++
+    return failed
   }
 
   // --- the operation entry point ------------------------------------------------------------------
@@ -447,6 +516,7 @@ export class HostDO extends DurableObject<Env> {
    * Every call is audited without its content.
    */
   async execute(call: ExecuteCall): Promise<ExecuteResult> {
+    if (!this.schemaReady) return { ok: false, error: err('gone', 'This host is not paired with the hub.', { fix: 'hub:/' }) }
     const result = await this.executeInner(call)
     const denial = result.ok ? null : result.error.denial
     await this.audit(call.actor, call.op, result.ok ? 'ok' : result.error.code === 'denied' ? 'denied' : 'error', {
@@ -464,6 +534,11 @@ export class HostDO extends DurableObject<Env> {
     if (!decision.allowed) return { ok: false, error: denied(decision.layer, decision.reason, call.op) }
     if (this.info('kill_switch') === '1') {
       return { ok: false, error: err('denied', 'Remote access is stopped with the emergency switch on the DSH host.', { denial: { layer: 'dsh', reason: 'kill-switch' }, fix: 'dsh:settings/remora#kill-switch' }) }
+    }
+    // The ledger is per client: a client only sees and acts on its own tasks (the owner sees all).
+    if (call.actor.clientId !== OWNER_CLIENT_ID && typeof call.params.taskId === 'string') {
+      const owned = this.taskRow(call.params.taskId)
+      if (!owned || owned.client_id !== call.actor.clientId) return { ok: false, error: err('not_found', 'No task with this id is known to the hub for this client.') }
     }
     if (call.op === 'task.get' || call.op === 'task.wait') return this.taskQuery(call)
     const operations = this.operations()
@@ -595,6 +670,7 @@ export class HostDO extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    if (!this.schemaReady) return
     const now = Date.now()
     const expired = this.sql.exec<{ task_id: string }>("SELECT task_id FROM tasks WHERE state = 'parked' AND expires_at IS NOT NULL AND expires_at <= ?", now).toArray()
     for (const { task_id } of expired) {
@@ -605,29 +681,35 @@ export class HostDO extends DurableObject<Env> {
       this.notify(task_id)
     }
     const ws = this.readySockets()[0]
-    if (ws) this.deliverUndelivered(ws)
+    if (ws) await this.deliverUndelivered(ws)
     this.sql.exec('DELETE FROM tasks WHERE updated_at < ? AND state IN (\'completed\', \'failed\', \'cancelled\')', now - RETENTION_MS)
     this.sql.exec('DELETE FROM attention WHERE updated_at < ?', now - RETENTION_MS)
-    this.sql.exec('DELETE FROM audit WHERE at < ? AND seq < (SELECT MAX(seq) - 5000 FROM audit)', now - 90 * 24 * 60 * 60_000)
     const pendingDelivery = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE state = 'parked' AND delivered = 0").one().n
     await this.scheduleAlarm(pendingDelivery > 0 && ws ? 60_000 : undefined)
   }
 
   // --- views for the hub ------------------------------------------------------------------------------
 
-  async summary(): Promise<HostLive> {
+  /** Live view. With `clientId`, running and recent tasks are that client's only. */
+  async summary(clientId?: string): Promise<HostLive> {
+    if (!this.schemaReady) {
+      return { hostId: '', name: null, reportedName: null, online: false, revoked: false, lastSeenAt: null, pluginVersion: null, dshVersion: null, operations: [], ceiling: null, killSwitch: false, running: [], recent: [], attention: [], duplicateConnections: 0, hadTasks: false }
+    }
     const ready = this.readySockets()
     let lastSeen = Number(this.info('last_seen_at') ?? '0') || null
     for (const ws of ready) {
       const ping = this.ctx.getWebSocketAutoResponseTimestamp(ws)
       if (ping && (lastSeen === null || ping.getTime() > lastSeen)) lastSeen = ping.getTime()
     }
-    const running = this.sql.exec<TaskRow>("SELECT * FROM tasks WHERE state IN ('parked', 'accepted', 'running', 'needs_attention') ORDER BY created_at DESC LIMIT 50").toArray().map(row => this.taskFromRow(row))
-    const recent = this.sql.exec<TaskRow>("SELECT * FROM tasks WHERE state IN ('completed', 'failed', 'cancelled') ORDER BY updated_at DESC LIMIT 10").toArray().map(row => this.taskFromRow(row))
+    const mine = clientId === undefined ? '' : ' AND client_id = ?'
+    const bind = clientId === undefined ? [] : [clientId]
+    const running = this.sql.exec<TaskRow>(`SELECT * FROM tasks WHERE state IN ('parked', 'accepted', 'running', 'needs_attention')${mine} ORDER BY created_at DESC LIMIT 50`, ...bind).toArray().map(row => this.taskFromRow(row))
+    const recent = this.sql.exec<TaskRow>(`SELECT * FROM tasks WHERE state IN ('completed', 'failed', 'cancelled')${mine} ORDER BY updated_at DESC LIMIT 10`, ...bind).toArray().map(row => this.taskFromRow(row))
     const attention = this.sql.exec<{ items: string }>('SELECT items FROM attention ORDER BY updated_at DESC').toArray().flatMap(row => parseJson<AttentionItem[]>(row.items, []))
     return {
       hostId: this.hostId ?? '',
       name: this.info('name'),
+      reportedName: this.info('reported_name'),
       online: ready.length > 0,
       revoked: this.info('revoked') === '1',
       lastSeenAt: lastSeen,
@@ -645,10 +727,12 @@ export class HostDO extends DurableObject<Env> {
   }
 
   async recentTasks(limit = 50): Promise<TaskInfo[]> {
+    if (!this.schemaReady) return []
     return this.sql.exec<TaskRow>('SELECT * FROM tasks ORDER BY updated_at DESC LIMIT ?', limit).toArray().map(row => this.taskFromRow(row))
   }
 
   async listAudit(limit = 200): Promise<AuditRow[]> {
+    if (!this.schemaReady) return []
     return listAudit(this.sql, limit)
   }
 }

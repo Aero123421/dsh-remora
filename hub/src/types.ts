@@ -22,7 +22,8 @@ export interface HostRecord {
   revokedAt: number | null
 }
 
-export type ClientKind = 'cimd' | 'dcr' | 'cli' | 'pat'
+import type { ClientKind } from './client-policy.ts'
+export type { ClientKind }
 
 export interface ClientRecord {
   clientId: string

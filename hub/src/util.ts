@@ -112,3 +112,4 @@ export function parseJson<T>(text: string | null | undefined, fallback: T): T {
 export function clampText(value: string, max: number): string {
   return value.length > max ? `${value.slice(0, max - 1)}…` : value
 }
+
