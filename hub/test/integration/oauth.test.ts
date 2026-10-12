@@ -80,6 +80,7 @@ describe('OAuth, MCP and the HTTP API', () => {
     expect(metadata.grant_types_supported).toContain('urn:ietf:params:oauth:grant-type:device_code')
     expect(metadata.scopes_supported).toEqual(['dsh.read', 'dsh.content', 'dsh.tasks', 'dsh.admin', 'offline_access'])
     expect(metadata.registration_endpoint).toBeUndefined()
+    expect(metadata.revocation_endpoint).toBe(`${ORIGIN}/oauth/revoke`)
 
     const resource = (await (await hubFetch('/.well-known/oauth-protected-resource/mcp')).json()) as Record<string, unknown>
     expect(resource.resource).toBe(MCP)
@@ -221,6 +222,22 @@ describe('OAuth, MCP and the HTTP API', () => {
     expect(viaPat.status).toBe(200)
     const status = (await viaPat.json()) as { freeTier: Record<string, number> }
     expect(typeof status.freeTier.workerRequests).toBe('number')
+    // Audience binding: an API token does not work at /mcp.
+    const apiAtMcp = await hubFetch('/mcp', { method: 'POST', headers: { authorization: `Bearer ${tokens.access_token}`, 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) })
+    expect(apiAtMcp.status).toBe(401)
+
+    // RFC 7009 revocation (the CLI's logout): the token stops working at once.
+    const revoked = await hubFetch('/oauth/revoke', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: tokens.access_token, token_type_hint: 'access_token', client_id: 'remora-cli' }).toString() })
+    expect(revoked.status).toBe(200)
+    const afterRevoke = await hubFetch('/api/v1/ops/hosts.list', { method: 'POST', headers: { authorization: `Bearer ${tokens.access_token}`, 'content-type': 'application/json' }, body: '{}' })
+    expect(afterRevoke.status).toBe(401)
+    const revokeRefresh = await hubFetch('/oauth/revoke', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: tokens.refresh_token, client_id: 'remora-cli' }).toString() })
+    expect(revokeRefresh.status).toBe(200)
+    const refreshAfter = await tokenRequest({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: 'remora-cli' })
+    expect(refreshAfter.status).toBe(400)
+    const wrongShape = await hubFetch('/oauth/revoke', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'grant_type=refresh_token&token=x' })
+    expect(wrongShape.status).toBe(400)
+
     const patAtMcp = await hubFetch('/mcp', { method: 'POST', headers: { authorization: `Bearer ${pat}`, 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) })
     expect(patAtMcp.status).toBe(401)
   })

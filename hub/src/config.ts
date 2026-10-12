@@ -69,6 +69,7 @@ export const RATE_LIMITS = {
   setup: [10, 600],
   pairStart: [10, 3600],
   pairPoll: [600, 600],
+  unpair: [30, 3600],
   deviceAuthorization: [20, 600],
   token: [120, 600],
   dcr: [10, 3600],

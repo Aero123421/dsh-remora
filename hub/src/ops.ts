@@ -43,6 +43,16 @@ async function contextFor(env: Env, caller: Caller): Promise<CallContext> {
   return hubStub(env).callContext(caller.clientId, { max, windowSeconds })
 }
 
+/**
+ * The params exactly as the host receives them in the request frame: `hostId`
+ * is filled in for operations whose schema has it. Passkey confirmations are
+ * computed over this object (see vendor/protocol/confirmation.ts).
+ */
+export function finalParams(op: string, params: Record<string, unknown>, hostId: string): Record<string, unknown> {
+  const spec = findOperation(op)
+  return spec && 'hostId' in INPUT_SCHEMAS[spec.id as OperationId].properties ? { ...params, hostId } : params
+}
+
 export async function runOperation(env: Env, caller: Caller, op: string, rawParams: unknown, options: RunOptions = {}): Promise<ExecuteResult> {
   const spec = findOperation(op)
   if (!spec) return err('not_found', `Unknown operation: ${op}`)
@@ -77,7 +87,7 @@ export async function runOperation(env: Env, caller: Caller, op: string, rawPara
 
   const grant = context.grants[hostId]
   if (!grant) return { ok: false, error: { ...denied('hub', 'switched-off', op), message: `${op} was refused by the hub: this client is blocked on this host (Connections page).` } }
-  const forwarded = 'hostId' in INPUT_SCHEMAS[op as OperationId].properties ? { ...params, hostId } : params
+  const forwarded = finalParams(op, params, hostId)
   return hostStub(env, hostId).execute({
     op,
     params: forwarded,
@@ -145,4 +155,11 @@ async function hubOperation(env: Env, context: CallContext, op: string): Promise
     freeTier: await freeTierUsage(env),
   }
   return result
+}
+
+/** Unpair a host: mark it revoked on the hub, then close its socket and fail its open tasks. */
+export async function revokeHostEverywhere(env: Env, hostId: string, by: 'owner' | 'host'): Promise<boolean> {
+  const changed = await hubStub(env).revokeHost(hostId, by)
+  if (changed) await hostStub(env, hostId).revoke()
+  return changed
 }

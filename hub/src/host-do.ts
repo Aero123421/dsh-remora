@@ -429,6 +429,10 @@ export class HostDO extends DurableObject<Env> {
   private deliverUndelivered(ws: WebSocket): void {
     const rows = this.sql.exec<TaskRow>("SELECT * FROM tasks WHERE delivered = 0 AND params IS NOT NULL AND state = 'parked' ORDER BY created_at").toArray()
     for (const row of rows) {
+      // A delivery already in flight from createTask() (it awaits its response in `pending`)
+      // must not be sent twice: onAuthenticated() can reach this point after createTask()
+      // inserted and sent a task while onAuthenticated() awaited the owner credentials.
+      if (this.pending.has(row.delivery_id)) continue
       const call = parseJson<ExecuteCall | null>(row.frame, null)
       if (!call) continue
       this.sendRequest(ws, row.delivery_id, { ...call, params: parseJson(row.params, {}) }, RELAY_TIMEOUT_MS, row.task_id, row.idempotency_key)

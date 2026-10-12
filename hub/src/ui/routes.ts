@@ -11,7 +11,7 @@ import type { HostLive } from '../host-do.ts'
 import { html, json, readForm, readJson, redirect, sameOrigin } from '../http.ts'
 import { hostStub, hubStub } from '../meter.ts'
 import { oauthEnv, oauthFor, resourcesFor } from '../oauth.ts'
-import { liveHosts, runOperation, type Caller } from '../ops.ts'
+import { finalParams, liveHosts, revokeHostEverywhere, runOperation, type Caller } from '../ops.ts'
 import type { ClientWithGrants, GrantLevel } from '../types.ts'
 import { randomToken } from '../util.ts'
 import { HUB_VERSION } from '../version.ts'
@@ -342,6 +342,15 @@ ${task.state === 'parked' ? h`<p class="muted">ホストがオフラインのた
   return view('タスク', 'home', body)
 }
 
+/** Why an attention item cannot be answered from the hub, and what to do instead. */
+const NOT_ANSWERABLE: Readonly<Record<string, string>> = {
+  question: 'DSH の質問ツール（tool-ask-user）が既定の legacy モードのため、外から答えられません。DSH Web で答えるか、DSH の設定で tool-ask-user を timed に切り替えると、次の質問からここで答えられます。',
+  'plan-review': 'このプランの確認には外から答えられません。DSH Web で承認するか差し戻してください。',
+  approval: 'DSH 0.2.1 には承認に外から答える API がないため、DSH Web で承認・拒否してください。',
+  'goal-stopped': 'ゴールが止まっています。DSH Web で再開するか解除してください。',
+  'login-expired': 'プロバイダーへのログインが切れています。その PC の DSH で再ログインしてください。',
+}
+
 async function attentionPage(env: Env, url: URL): Promise<Response> {
   const data = await overview(env)
   const sections: Raw[] = []
@@ -362,20 +371,20 @@ ${items.map(item => h`<article class="card" id="${item.hostId}-${item.attentionI
   <p><span class="badge warn">${ATTENTION_LABEL[item.kind] ?? item.kind}</span> <span class="muted">${relativeTime(item.createdAt)}</span></p>
   <p class="untrusted"><strong>${item.title}</strong></p>
   ${item.detail ? h`<div class="untrusted pre">${item.detail}</div>` : ''}
-  ${item.kind === 'approval'
-    ? canApprove && summary.online
+  ${!summary.online
+    ? h`<p class="muted">ホストがオフラインのため、今は答えられません。</p>`
+    : item.answerable && item.kind === 'approval' && canApprove
       ? h`<form data-confirm-op="approval.respond" data-host="${summary.hostId}" data-params="${JSON.stringify({ hostId: summary.hostId, sessionId: item.sessionId, attentionId: item.attentionId })}" class="actions">
           <button class="primary" type="submit" data-approve="true">パスキーで確認して承認</button><button type="submit" data-approve="false">拒否</button><p data-status hidden></p></form>`
-      : h`<p class="muted">承認は DSH Web で行ってください（リモートでの承認はリモート全権とパスキー確認が必要です）。</p>`
-    : item.answerable && summary.online
-      ? h`<form method="post" action="/attention/respond" class="stack">
+      : item.answerable && item.kind !== 'approval'
+        ? h`<form method="post" action="/attention/respond" class="stack">
           <input type="hidden" name="hostId" value="${summary.hostId}"><input type="hidden" name="sessionId" value="${item.sessionId}"><input type="hidden" name="attentionId" value="${item.attentionId}">
           ${(item.options ?? []).map(option => h`<label class="check"><input type="radio" name="optionId" value="${option.id}"> <span class="untrusted">${option.label}</span></label>`)}
           ${item.kind === 'plan-review' ? h`<div class="actions"><button class="primary" type="submit" name="approve" value="true">プランを承認</button><button type="submit" name="approve" value="false">差し戻す</button></div>` : ''}
           <textarea name="text" rows="2" placeholder="自由記述の回答（任意）"></textarea>
           ${item.kind !== 'plan-review' ? h`<button class="primary" type="submit">回答する</button>` : ''}
         </form>`
-      : h`<p class="muted">この項目は DSH Web で対応してください。</p>`}
+        : h`<p class="muted not-answerable">${NOT_ANSWERABLE[item.kind] ?? 'この項目には外から答えられません。DSH Web で対応してください。'}</p>`}
 </article>`)}</section>`)
   }
   const body = h`${message(url)}<h1>要対応</h1>
@@ -407,8 +416,13 @@ async function confirmedOperation(env: Env, request: Request): Promise<Response>
   if (typeof operation !== 'string' || typeof requestId !== 'string' || typeof issuedAt !== 'number' || typeof assertion !== 'object' || assertion === null) {
     return json({ error: { code: 'invalid_request', message: 'operation, params, requestId, issuedAt and assertion are required' } }, { status: 400 })
   }
+  const hostId = body.hostId
+  if (typeof hostId !== 'string') return json({ error: { code: 'invalid_request', message: 'hostId is required' } }, { status: 400 })
+  const raw = typeof params === 'object' && params !== null && !Array.isArray(params) ? (params as Record<string, unknown>) : {}
+  if (typeof raw.hostId === 'string' && raw.hostId !== hostId) return json({ error: { code: 'invalid_request', message: 'params.hostId does not match hostId' } }, { status: 400 })
+  // Same params as /auth/confirm/options signed over, and the frame id is the requestId it returned.
   const confirmation = { issuedAt, assertion } as Confirmation
-  const outcome = await runOperation(env, OWNER, operation, params, { confirmation, requestId })
+  const outcome = await runOperation(env, OWNER, operation, finalParams(operation, raw, hostId), { confirmation, requestId })
   return outcome.ok ? json({ ok: true, result: outcome.result }) : json({ error: outcome.error }, { status: 400 })
 }
 
@@ -618,7 +632,7 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
   if (revokeHost) {
     if (!session.fresh) return redirect(`/hosts/${revokeHost[1]}?msg=reauth`)
     const hostId = revokeHost[1] as string
-    if (await hub.revokeHost(hostId)) await hostStub(env, hostId).revoke()
+    await revokeHostEverywhere(env, hostId, 'owner')
     return redirect('/?msg=host-revoked')
   }
 
