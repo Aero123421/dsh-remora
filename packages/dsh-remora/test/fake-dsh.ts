@@ -210,6 +210,7 @@ export class FakeDsh {
     get: (id: string) => self.workspaces.find(w => w.id === id),
     create: async (path: string) => self.addWorkspace(`ws-${self.workspaces.length + 1}`, path),
     resolveByPath: async (path: string) => self.workspaces.find(w => w.path === path),
+    delete: async (id: string) => { const before = self.workspaces.length; self.workspaces = self.workspaces.filter(w => w.id !== id); return self.workspaces.length < before },
     get archivedSessionIds() { return self.archived },
     get pinnedSessionIds() { return self.pinned },
   }))(this)

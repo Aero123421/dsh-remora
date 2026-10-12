@@ -150,7 +150,7 @@ export const ja = {
   'scope.gitHosts': 'Git のホスト',
   'scope.gitHostsHint': 'ワークスペース作成で https クローンを許すホスト（例: github.com）。',
   'scope.untrusted': '信頼していないワークスペース',
-  'scope.untrustedHint': 'Git からクローンしたワークスペース。中のスキルは「信頼する」まで外から使えません。',
+  'scope.untrustedHint': 'Git からクローンしたワークスペース。「信頼する」まで、外からのタスク投入と追加指示を拒否します（DSH は文中で名前を挙げたスキルも読み込めるため、信頼済みのワークスペースではスキルの許可リストは目安です）。',
   'scope.trust': '信頼する',
   'scope.catalogUnavailable': '{name} を DSH から読めませんでした。名前を直接入力できます。',
 
@@ -372,7 +372,7 @@ export const en: Record<CopyKey, string> = {
   'scope.gitHosts': 'Git hosts',
   'scope.gitHostsHint': 'Hosts allowed for https clones when creating workspaces (e.g. github.com).',
   'scope.untrusted': 'Untrusted workspaces',
-  'scope.untrustedHint': 'Workspaces cloned from Git. Their skills stay unavailable from outside until you trust them.',
+  'scope.untrustedHint': 'Workspaces cloned from Git. Prompts from outside are refused until you trust them (DSH can load a skill named anywhere in a prompt, so in trusted workspaces the skill allow-list is advisory).',
   'scope.trust': 'Trust',
   'scope.catalogUnavailable': 'Could not read {name} from DSH. You can type names instead.',
 

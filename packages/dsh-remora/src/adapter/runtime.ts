@@ -5,7 +5,7 @@
 import { realpath } from 'node:fs/promises'
 import type { ModelChoice, SessionSummary } from '@dsh-remora/protocol'
 import type { HostContext } from '../dsh.ts'
-import type { AdapterDeps, OperationContext, SessionScopeInput } from '../ops/types.ts'
+import type { AdapterDeps, OperationContext, SessionScopeInput, WorkspaceCreationRecord, WorkspaceCreationStore } from '../ops/types.ts'
 import { OperationError } from '../ops/types.ts'
 import { redactLine } from '../redact.ts'
 import type {
@@ -53,9 +53,22 @@ export class Runtime {
   /** Latest auth-looking `api-session/error` per session (login-expired attention). */
   readonly loginErrors = new Map<string, { message: string; at: number }>()
 
+  /** Durable workspace.create ledger (memory fallback when the core gives none). */
+  readonly creations: WorkspaceCreationStore
+
   constructor(ctx: HostContext, deps: AdapterDeps) {
     this.ctx = ctx as HostContext & EventfulContext
     this.deps = deps
+    this.creations = deps.workspaceCreations ?? memoryCreations()
+  }
+
+  /** Clone state of a workspace Remora created; undefined for every other workspace (ready). */
+  workspaceState(workspaceId: string): WorkspaceCreationRecord['state'] | undefined {
+    let found: WorkspaceCreationRecord | undefined
+    for (const record of this.creations.list()) {
+      if (record.workspaceId === workspaceId && (!found || record.updatedAt >= found.updatedAt)) found = record
+    }
+    return found?.state
   }
 
   get<T>(name: string): T | undefined {
@@ -273,5 +286,13 @@ export async function realpathOrNull(path: string): Promise<string | null> {
     return await realpath(path)
   } catch {
     return null
+  }
+}
+
+function memoryCreations(): WorkspaceCreationStore {
+  const records = new Map<string, WorkspaceCreationRecord>()
+  return {
+    list: () => [...records.values()],
+    put: async (record) => { records.set(record.key, { ...record }) },
   }
 }

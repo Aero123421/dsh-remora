@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process'
 import { lstat, mkdir, readdir, realpath, rm } from 'node:fs/promises'
 import { join, sep } from 'node:path'
 import type { OperationParams, OperationResults, WorkspaceSummary } from '@dsh-remora/protocol'
-import type { OperationContext } from '../ops/types.ts'
+import type { OperationContext, WorkspaceCreationRecord } from '../ops/types.ts'
 import { OperationError } from '../ops/types.ts'
 import { redactLine } from '../redact.ts'
 import type { DshWorkspace } from './dsh-types.ts'
@@ -165,12 +165,35 @@ function isInside(child: string, parent: string): boolean {
   return child.startsWith(parent.endsWith(sep) ? parent : parent + sep)
 }
 
-export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT_CLONE_LIMITS) {
-  /** idempotencyKey (+client) -> workspace id, for the life of the process. */
-  const done = new Map<string, string>()
-  const running = new Map<string, Promise<Result<'workspace.create'>>>()
+/** Failed clones stay visible in workspaces.list this long. */
+const FAILED_VISIBLE_MS = 24 * 60 * 60_000
 
-  function summary(workspace: DshWorkspace): WorkspaceSummary {
+export function failedSummary(record: WorkspaceCreationRecord): WorkspaceSummary {
+  return {
+    workspaceId: record.workspaceId ?? '',
+    name: redactLine(record.name, 200),
+    path: record.path,
+    pinned: false,
+    archived: false,
+    untrusted: true,
+    state: 'clone-failed',
+    ...(record.message ? { stateMessage: record.message } : {}),
+  }
+}
+
+
+/** Recent failed clones (no longer registered with DSH), for workspaces.list. */
+export function failedClones(records: readonly WorkspaceCreationRecord[], now = Date.now()): WorkspaceSummary[] {
+  return records.filter(record => record.state === 'clone-failed' && record.updatedAt >= now - FAILED_VISIBLE_MS).map(failedSummary)
+}
+
+
+export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT_CLONE_LIMITS) {
+  const running = new Map<string, Promise<Result<'workspace.create'>>>()
+  /** Background clones, so dispose() can stop them. */
+  const clones = new Map<string, AbortController>()
+
+  function summary(workspace: DshWorkspace, record?: WorkspaceCreationRecord): WorkspaceSummary {
     return {
       workspaceId: workspace.id,
       name: redactLine(workspace.title, 200),
@@ -178,17 +201,45 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
       pinned: false,
       archived: false,
       untrusted: rt.deps.scope.isUntrustedWorkspace(workspace.id),
+      state: record?.state ?? 'ready',
+      ...(record?.message ? { stateMessage: record.message } : {}),
     }
+  }
+
+  async function save(record: WorkspaceCreationRecord, change: Partial<WorkspaceCreationRecord>): Promise<WorkspaceCreationRecord> {
+    const next: WorkspaceCreationRecord = { ...record, ...change, updatedAt: Date.now() }
+    await rt.creations.put(next)
+    return next
+  }
+
+  /** Remove the folder and the DSH registration of a clone that did not finish. */
+  async function cleanUp(record: WorkspaceCreationRecord, message: string): Promise<void> {
+    await rm(record.path, { recursive: true, force: true }).catch(() => undefined)
+    if (record.workspaceId) await rt.workspaces?.delete(record.workspaceId).catch(() => false)
+    await save(record, { state: 'clone-failed', message: redactLine(message, 500) })
+  }
+
+  function startClone(record: WorkspaceCreationRecord, url: string): void {
+    const controller = new AbortController()
+    clones.set(record.key, controller)
+    // Not tied to the request: the clone outlives the hub's request timeout.
+    runClone(url, record.path, limits, controller.signal)
+      .then(() => save(record, { state: 'ready' }))
+      .catch((error: unknown) => cleanUp(record, error instanceof Error ? error.message : String(error)))
+      .catch((error: unknown) => rt.deps.logger.warn('Remora: recording the clone result failed', error))
+      .finally(() => clones.delete(record.key))
   }
 
   async function create(params: Params<'workspace.create'>, context: OperationContext): Promise<Result<'workspace.create'>> {
     const registry = rt.workspaces
     if (!registry) throw unavailable('DSH workspace registry is not available')
     const key = `${context.actor.clientId}\u0000${params.idempotencyKey}`
-    const previous = done.get(key)
+    const previous = rt.creations.list().find(record => record.key === key)
     if (previous) {
-      const workspace = registry.get(previous)
-      if (workspace) return { workspace: summary(workspace) }
+      if (previous.state === 'clone-failed') return { workspace: failedSummary(previous) }
+      const workspace = previous.workspaceId ? registry.get(previous.workspaceId) : undefined
+      if (workspace) return { workspace: summary(workspace, previous) }
+      throw new OperationError('gone', 'the workspace created with this idempotencyKey was removed from DSH')
     }
     checkFolderName(params.name)
     const placement = rt.deps.scope.placements().find(item => item.placementId === params.placementId)
@@ -209,34 +260,47 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
       throw new OperationError('unavailable', `could not create the folder: ${(error as Error).message}`)
     }
     let real: string
+    let workspace: DshWorkspace
     try {
       real = await realpath(target)
       if (!isInside(real, root)) throw denied('the folder resolved outside the placement')
-      if (url) await runClone(url, real, limits, context.signal)
+      try {
+        workspace = (await registry.resolveByPath(real)) ?? await registry.create(real)
+      } catch (error) {
+        throw fromDsh(error, 'registering the workspace with DSH failed')
+      }
     } catch (error) {
       await rm(target, { recursive: true, force: true }).catch(() => undefined)
       throw error instanceof OperationError ? error : new OperationError('internal', `creating the workspace failed: ${(error as Error).message}`)
     }
-    let workspace: DshWorkspace
-    try {
-      workspace = (await registry.resolveByPath(real)) ?? await registry.create(real)
-    } catch (error) {
-      await rm(target, { recursive: true, force: true }).catch(() => undefined)
-      throw fromDsh(error, 'registering the workspace with DSH failed')
-    }
+    // Untrusted before anyone can see it, so no prompt reaches a half-cloned repository.
     if (url) await rt.deps.scope.markUntrustedWorkspace(workspace.id)
-    done.set(key, workspace.id)
-    return { workspace: summary(workspace) }
+    const now = Date.now()
+    const record: WorkspaceCreationRecord = { key, workspaceId: workspace.id, path: real, name: params.name, state: url ? 'cloning' : 'ready', createdAt: now, updatedAt: now }
+    await rt.creations.put(record)
+    if (url) startClone(record, url)
+    return { workspace: summary(workspace, record) }
   }
 
   return {
-    'workspace.create'(params: Params<'workspace.create'>, context: OperationContext): Promise<Result<'workspace.create'>> {
-      const key = `${context.actor.clientId}\u0000${params.idempotencyKey}`
-      const inFlight = running.get(key)
-      if (inFlight) return inFlight
-      const promise = create(params, context).finally(() => running.delete(key))
-      running.set(key, promise)
-      return promise
+    handlers: {
+      'workspace.create'(params: Params<'workspace.create'>, context: OperationContext): Promise<Result<'workspace.create'>> {
+        const key = `${context.actor.clientId}\u0000${params.idempotencyKey}`
+        const inFlight = running.get(key)
+        if (inFlight) return inFlight
+        const promise = create(params, context).finally(() => running.delete(key))
+        running.set(key, promise)
+        return promise
+      },
+    },
+    /** A clone that was running when DSH stopped cannot resume: clean it up. */
+    async recover(): Promise<void> {
+      for (const record of rt.creations.list()) {
+        if (record.state === 'cloning' && !clones.has(record.key)) await cleanUp(record, 'DSH stopped while the clone was running').catch(() => undefined)
+      }
+    },
+    dispose(): void {
+      for (const controller of clones.values()) controller.abort()
     },
   }
 }

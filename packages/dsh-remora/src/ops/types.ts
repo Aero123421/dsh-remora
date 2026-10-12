@@ -90,9 +90,34 @@ export type OperationHandler<Op extends HostOperationId> =
 
 export type OperationHandlers = { [Op in HostOperationId]?: OperationHandler<Op> }
 
+/**
+ * One `workspace.create` request, kept durably so a retried idempotency key
+ * answers the same workspace after a restart and clone progress survives the
+ * request (the clone runs in the background, past the hub's request timeout).
+ */
+export interface WorkspaceCreationRecord {
+  /** `<clientId>\u0000<idempotencyKey>`. */
+  key: string
+  workspaceId: string | null
+  path: string
+  name: string
+  state: 'ready' | 'cloning' | 'clone-failed'
+  message?: string
+  createdAt: number
+  updatedAt: number
+}
+
+export interface WorkspaceCreationStore {
+  list(): WorkspaceCreationRecord[]
+  /** Durable before it resolves. */
+  put(record: WorkspaceCreationRecord): Promise<void>
+}
+
 export interface AdapterDeps {
   scope: ScopePolicy
   tasks: TaskStore
+  /** Durable workspace.create ledger. Without it the adapter keeps one in memory. */
+  workspaceCreations?: WorkspaceCreationStore
   /** Queue an event for the hub. The core sends task completion and attention changes at once and batches the rest (≥ 30 s). */
   emit(event: HostEvent): void
   logger: HostContext['logger']
