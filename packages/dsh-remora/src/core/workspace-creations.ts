@@ -58,9 +58,21 @@ export class FileWorkspaceCreationStore implements WorkspaceCreationStore {
     const copy = { ...record }
     await this.document.update((current) => {
       const cutoff = this.now() - RETENTION_MS
-      const creations = current.creations.filter(item => item.key !== copy.key && (item.state === 'cloning' || item.updatedAt >= cutoff))
-      creations.push(copy)
-      return { creations: creations.slice(-LIMIT) }
+      const others = current.creations.filter(item => item.key !== copy.key && (item.state === 'cloning' || item.updatedAt >= cutoff))
+      others.push(copy)
+      return { creations: pruneCreations(others) }
     })
   }
+}
+
+/**
+ * Keep at most LIMIT records, dropping the oldest FINISHED ones first. A
+ * `cloning` record is never dropped: it is what lets recovery remove the
+ * folder of a clone interrupted by a crash.
+ */
+export function pruneCreations(records: WorkspaceCreationRecord[], limit = LIMIT): WorkspaceCreationRecord[] {
+  const excess = records.length - limit
+  if (excess <= 0) return records
+  const drop = new Set(records.filter(record => record.state !== 'cloning').sort((a, b) => a.updatedAt - b.updatedAt).slice(0, excess))
+  return records.filter(record => !drop.has(record))
 }

@@ -26,6 +26,10 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
   const reads = createReads(rt)
   const actions = createActions(rt)
   const workspaces = createWorkspaceCreate(rt, { ...DEFAULT_CLONE_LIMITS, ...options.clone })
+  // The core builds the adapter while it initialises, before (and whether or not)
+  // the hub link comes up: clones interrupted by a crash or restart are cleaned up
+  // here, so their folders do not linger and their records do not stay `cloning`.
+  const recovered = workspaces.recover().catch((error: unknown) => deps.logger.warn('Remora: clone recovery failed', error))
 
   const handlers: OperationHandlers = {
     ...reads,
@@ -43,15 +47,13 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
   return {
     handlers,
     has: (service: string) => ctx.get(service) !== undefined,
-    start: () => {
-      watcher.start()
-      void workspaces.recover()
-    },
+    start: () => watcher.start(),
     dispose: () => {
       watcher.dispose()
       workspaces.dispose()
     },
     /** Internals for tests. */
+    recovered,
     runtime: rt,
     tasks,
     watcher,

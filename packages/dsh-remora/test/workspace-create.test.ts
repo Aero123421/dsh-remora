@@ -136,8 +136,10 @@ test('workspace.create idempotency and clone recovery survive a restart', async 
   await (await import('node:fs/promises')).mkdir(join(f.placement, 'half'))
   f.dsh.addWorkspace('ws-half', join(f.placement, 'half'))
   f.creations.set('client-1\u0000k2', { key: 'client-1\u0000k2', workspaceId: 'ws-half', path: join(f.placement, 'half'), name: 'half', state: 'cloning', createdAt: 1, updatedAt: 1 })
+  // Recovery runs when the adapter is built (core init), without start() / a hub link.
   const restarted = buildAdapter(f.dsh.ctx(), f.deps, { clone: { git: f.git, timeoutMs: 5000, maxBytes: 1000 } })
-  restarted.start()
+  await restarted.recovered
+  assert.equal(f.creations.get('client-1\u0000k2')?.state, 'clone-failed')
   const again = await restarted.handlers['workspace.create']!({ placementId: 'p1', name: 'kept', idempotencyKey: 'k' }, context())
   assert.equal(again.workspace.workspaceId, first.workspace.workspaceId)
   for (let i = 0; i < 100 && f.creations.get('client-1\u0000k2')?.state === 'cloning'; i++) await new Promise(resolve => setTimeout(resolve, 10))

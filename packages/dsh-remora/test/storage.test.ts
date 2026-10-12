@@ -144,3 +144,12 @@ test('workspace creation records survive reopening the document', async () => {
     assert.deepEqual(reopened.list().map(r => [r.key, r.state]), [['c\u0000k', 'ready']])
   } finally { await cleanup() }
 })
+
+test('pruning workspace creation records never drops a cloning record', async () => {
+  const { pruneCreations } = await import('../src/core/workspace-creations.ts')
+  const record = (key: string, state: 'ready' | 'cloning' | 'clone-failed', updatedAt: number) => ({ key, workspaceId: key, path: `/p/${key}`, name: key, state, createdAt: 0, updatedAt })
+  const records = [record('old-clone', 'cloning', 1), record('a', 'ready', 2), record('b', 'clone-failed', 3), record('c', 'ready', 4), record('d', 'ready', 5)]
+  assert.deepEqual(pruneCreations(records, 3).map(r => r.key), ['old-clone', 'c', 'd'])
+  const allCloning = [record('x', 'cloning', 1), record('y', 'cloning', 2)]
+  assert.deepEqual(pruneCreations(allCloning, 1).map(r => r.key), ['x', 'y'])
+})

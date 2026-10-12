@@ -86,3 +86,32 @@ test('fullAccess in the operation context is ceiling ∩ the caller grant, with 
   }
   assert.deepEqual(seen.map(context => context.fullAccess), [false, true])
 })
+
+test('no remote path drives agent turns in an untrusted or cloning workspace', async () => {
+  const { buildAdapter: build } = await import('../src/adapter/index.ts')
+  const { context } = await import('./fake-dsh.ts')
+  const dsh = createFake()
+  dsh.addWorkspace('ws-u', '/work/u')
+  dsh.addWorkspace('ws-c', '/work/c')
+  const u = dsh.addSession('su', { workspace: 'ws-u', live: true })
+  dsh.addSession('sc', { workspace: 'ws-c', live: true })
+  u.values.userQuestions = { active: [{ callId: 'call-1', state: 'continued', questions: [{ id: 'q', question: 'Ok?', options: [{ label: 'Yes' }] }] }], settled: [] }
+  const h = harness(dsh, { workspaces: ['ws-u', 'ws-c'], untrusted: ['ws-u'], commands: ['/compact', '/goal'] })
+  const creations = [{ key: 'c\u0000k', workspaceId: 'ws-c', path: '/work/c', name: 'c', state: 'cloning' as const, createdAt: 1, updatedAt: 1 }]
+  const adapter = build(dsh.ctx(), { ...h.deps, workspaceCreations: { list: () => creations, put: async () => {} } })
+  const handlers = adapter.handlers as Required<typeof adapter.handlers>
+  const code = (promise: Promise<unknown>) => promise.then(() => 'ok', (error: { code?: string }) => error.code)
+  for (const [sessionId, expected] of [['su', 'denied'], ['sc', 'conflict']] as const) {
+    assert.equal(await code(handlers['goal.manage']({ sessionId, action: 'set', goal: 'ship it' }, context())), expected, `goal set ${sessionId}`)
+    assert.equal(await code(handlers['goal.manage']({ sessionId, action: 'resume' }, context())), expected, `goal resume ${sessionId}`)
+    assert.equal(await code(handlers['command.run']({ sessionId, command: '/goal', args: 'do things' }, context())), expected, `command ${sessionId}`)
+    assert.equal(await code(handlers['command.run']({ sessionId, command: '/compact' }, context())), expected)
+    assert.equal(await code(handlers['task.start']({ target: { sessionId }, prompt: 'x', idempotencyKey: sessionId }, context({ taskId: `t-${sessionId}` }))), expected)
+  }
+  assert.equal(await code(handlers['attention.respond']({ sessionId: 'su', attentionId: 'call-1', answer: { optionId: '0' } }, context())), 'denied')
+  assert.deepEqual(dsh.answers, [])
+  assert.equal(dsh.calls.filter(call => ['command', 'prompt', 'resolveAgent'].includes(call.method)).length, 0, 'no agent was woken or driven')
+  // Operations that start no turn still work.
+  assert.equal(await code(handlers['model.select']({ sessionId: 'su', model: 'deepseek-chat' }, context())), 'ok')
+  assert.notEqual(await code(handlers['goal.manage']({ sessionId: 'su', action: 'pause' }, context())), 'denied')
+})
