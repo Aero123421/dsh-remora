@@ -6,13 +6,14 @@
 import type { AuditRow } from '../audit.ts'
 import { verifyAuditChain } from '../audit.ts'
 import { getSession, rpIdOf, type OwnerSession } from '../auth.ts'
-import { FREE_TIER, FREE_TIER_WARN, dcrEnabled, hubOrigin, secrets } from '../config.ts'
+import { FREE_TIER, FREE_TIER_WARN, OWNER_CLIENT_ID, dcrEnabled, hubOrigin, secrets } from '../config.ts'
 import type { HostLive } from '../host-do.ts'
 import { html, json, readForm, readJson, redirect, sameOrigin } from '../http.ts'
 import { hostStub, hubStub } from '../meter.ts'
 import { oauthEnv, oauthFor, resourcesFor } from '../oauth.ts'
-import { finalParams, liveHosts, revokeHostEverywhere, runOperation, type Caller } from '../ops.ts'
+import { finalParams, liveHosts, refreshParked, revokeHostEverywhere, runOperation, type Caller } from '../ops.ts'
 import type { ClientWithGrants, GrantLevel } from '../types.ts'
+import { safeNext } from '../next.ts'
 import { randomToken } from '../util.ts'
 import { HUB_VERSION } from '../version.ts'
 import {
@@ -21,11 +22,11 @@ import {
 } from '../vendor/protocol/index.ts'
 import { ATTENTION_LABEL, LEVEL_LABEL, STATE_LABEL, dateTime, flash, h, page, raw, reauthForm, relativeTime, type NavKey, type Raw } from './layout.ts'
 
-const OWNER: Caller = { clientId: 'hub-ui', clientName: 'ハブの画面', scopes: [...SCOPES], kind: 'owner' }
+const OWNER: Caller = { clientId: OWNER_CLIENT_ID, clientName: 'ハブの画面', scopes: [...SCOPES], kind: 'owner' }
 
 const MESSAGES: Readonly<Record<string, [string, 'ok' | 'error']>> = {
   'passkey-added': ['パスキーを追加しました。', 'ok'],
-  'passkey-removed': ['パスキーを削除しました。', 'ok'],
+  'passkey-removed': ['パスキーを削除しました。ただし、ペアリング済みの DSH ホストは、各ホストの DSH 画面で新しい一覧を承認するまで、削除したパスキーを危険な操作の確認に使える鍵として信頼し続けます。各ホストで確認してください。', 'error'],
   'passkey-last': ['最後の 1 本は削除できません。先に別のパスキーを追加してください。', 'error'],
   'token-revoked': ['個人トークンを取り消しました。', 'ok'],
   'client-revoked': ['接続を取り消しました。', 'ok'],
@@ -55,9 +56,6 @@ function view(title: string, nav: NavKey, body: Raw, scripts: string[] = ['/js/w
   return html(page({ title, nav, body, scripts }))
 }
 
-function safeNext(value: string | null): string {
-  return value && value.startsWith('/') && !value.startsWith('//') && !value.startsWith('/\\') ? value : '/'
-}
 
 const pct = (ratio: number) => `${Math.min(100, Math.round(ratio * 100))}%`
 
@@ -103,7 +101,7 @@ function loginPage(url: URL): Response {
   <p class="flash error" data-needs-webauthn hidden>このブラウザはパスキーに対応していません。</p>
   ${error === 'recovery' ? flash('リカバリーコードが正しくないか、使用済みです。', 'error') : ''}
   ${error === 'rate' ? flash('試行回数が多すぎます。しばらく待ってください。', 'error') : ''}
-  <button class="primary big" type="button" data-login data-next="${safeNext(url.searchParams.get('next'))}">パスキーでログイン</button>
+  <button class="primary big" type="button" data-login data-next="${safeNext(url.searchParams.get('next'), url.origin)}">パスキーでログイン</button>
   <p data-status hidden></p>
 </section>
 <details class="recovery">
@@ -142,7 +140,7 @@ function fullAccessOn(summary: HostSummary, clients: ClientWithGrants[], now = D
 function hostCard(entry: { summary: HostSummary; live: HostLive }, clients: ClientWithGrants[]): Raw {
   const { summary, live } = entry
   return h`<a class="card host" href="/hosts/${summary.hostId}">
-  <div class="row"><span class="dot ${summary.online ? 'on' : 'off'}" aria-hidden="true"></span><strong>${summary.name}</strong>
+  <div class="row"><span class="dot ${summary.online ? 'on' : 'off'}" aria-hidden="true"></span><strong>${summary.name}</strong>${live.reportedName && live.reportedName !== summary.name ? h` <span class="muted">（ホストの申告名: ${live.reportedName}）</span>` : ''}
   ${fullAccessOn(summary, clients) ? h`<span class="badge danger">リモート全権</span>` : ''}
   ${summary.killSwitch ? h`<span class="badge danger">緊急停止中</span>` : ''}</div>
   <p class="muted">${summary.online ? '接続中' : `オフライン（最終 ${relativeTime(summary.lastSeenAt)}）`} ・ 上限: ${summary.ceiling ? LEVEL_LABEL[summary.ceiling.level] : '未報告'} ・ 実行中 ${live.running.length} ・ 要対応 ${live.attention.length}</p>
@@ -201,7 +199,7 @@ async function hostPage(env: Env, url: URL, hostId: string): Promise<Response> {
   const host = await hubStub(env).getHost(hostId)
   if (!host || host.revokedAt) return notFound()
   const live = await hostStub(env, hostId).summary()
-  const name = live.name || host.name
+  const name = host.name
   let content: Raw
   if (!live.online) {
     content = h`<p class="muted">ホストがオフラインです。その PC で DSH Web を起動すると、ワークスペースとセッションが表示されます。</p>`
@@ -213,8 +211,8 @@ async function hostPage(env: Env, url: URL, hostId: string): Promise<Response> {
     if (!workspaces.ok || !sessions.ok) {
       content = h`${errorFlash(!workspaces.ok ? workspaces.error : undefined, 'ワークスペースを読めませんでした')}${errorFlash(!sessions.ok ? sessions.error : undefined, 'セッションを読めませんでした')}`
     } else {
-      const list = (workspaces.result as { workspaces: WorkspaceSummary[] }).workspaces
-      const all = (sessions.result as { sessions: SessionSummary[] }).sessions
+      const list = (workspaces.result as { workspaces?: WorkspaceSummary[] }).workspaces ?? []
+      const all = (sessions.result as { sessions?: SessionSummary[] }).sessions ?? []
       const children = (parent: string) => all.filter(session => session.parentSessionId === parent)
       const sessionItem = (session: SessionSummary): Raw => h`<li><a href="/hosts/${hostId}/sessions/${encodeURIComponent(session.sessionId)}">${session.pinned ? '📌 ' : ''}<span class="untrusted">${session.title || '(無題)'}</span></a>
         ${session.running ? h`<span class="badge ok">実行中</span>` : ''} <span class="muted">${relativeTime(session.updatedAt)}</span>
@@ -228,7 +226,7 @@ async function hostPage(env: Env, url: URL, hostId: string): Promise<Response> {
   }
   const body = h`${message(url)}
 <p class="crumbs"><a href="/">ホーム</a> / ホスト</p>
-<h1><span class="dot ${live.online ? 'on' : 'off'}" aria-hidden="true"></span> ${name}</h1>
+<h1><span class="dot ${live.online ? 'on' : 'off'}" aria-hidden="true"></span> ${name}${live.reportedName && live.reportedName !== name ? h` <span class="muted">（ホストの申告名: ${live.reportedName}）</span>` : ''}</h1>
 <p class="muted">${live.online ? '接続中' : `オフライン（最終 ${relativeTime(live.lastSeenAt)}）`} ・ プラグイン ${live.pluginVersion ?? '—'} ・ DSH ${live.dshVersion ?? '—'} ・ 上限 ${live.ceiling ? LEVEL_LABEL[live.ceiling.level] : '未報告'}${live.killSwitch ? ' ・ 緊急停止中' : ''}</p>
 ${content}
 <details class="card"><summary>使える操作（${live.operations.length}）</summary><p class="mono small">${live.operations.join(', ') || '—'}</p></details>
@@ -285,7 +283,7 @@ ${running.length === 0 ? h`<p class="muted">このセッションでハブから
   <button type="submit">モデルを変更</button>
   <p class="muted">DSH はこの選択を新しいセッションの既定値にも保存します。</p>
 </form></section>`
-  const body = h`${message(url)}<p class="crumbs"><a href="/">ホーム</a> / <a href="/hosts/${hostId}">${live.name || host.name}</a> / セッション</p>${detail}${actions}`
+  const body = h`${message(url)}<p class="crumbs"><a href="/">ホーム</a> / <a href="/hosts/${hostId}">${host.name}</a> / セッション</p>${detail}${actions}`
   return view('セッション', 'home', body)
 }
 
@@ -374,7 +372,10 @@ ${items.map(item => h`<article class="card" id="${item.hostId}-${item.attentionI
   ${!summary.online
     ? h`<p class="muted">ホストがオフラインのため、今は答えられません。</p>`
     : item.answerable && item.kind === 'approval' && canApprove
-      ? h`<form data-confirm-op="approval.respond" data-host="${summary.hostId}" data-params="${JSON.stringify({ hostId: summary.hostId, sessionId: item.sessionId, attentionId: item.attentionId })}" class="actions">
+      ? h`<div class="confirm-preview"><p>パスキーで署名する内容（DSH ホストが検証します）:</p>
+          <dl class="facts"><dt>操作</dt><dd class="mono">approval.respond</dd><dt>ホスト</dt><dd class="mono">${summary.hostId}</dd>
+          <dt>パラメータ</dt><dd><pre class="codes">${JSON.stringify({ hostId: summary.hostId, sessionId: item.sessionId, attentionId: item.attentionId, answer: { approve: '承認なら true、拒否なら false' } }, null, 2)}</pre></dd></dl></div>
+        <form data-confirm-op="approval.respond" data-host="${summary.hostId}" data-params="${JSON.stringify({ hostId: summary.hostId, sessionId: item.sessionId, attentionId: item.attentionId })}" class="actions">
           <button class="primary" type="submit" data-approve="true">パスキーで確認して承認</button><button type="submit" data-approve="false">拒否</button><p data-status hidden></p></form>`
       : item.answerable && item.kind !== 'approval'
         ? h`<form method="post" action="/attention/respond" class="stack">
@@ -531,6 +532,7 @@ ${url.searchParams.get('recovered') ? flash('リカバリーコードでログ�
 ${passkeys.length < 2 ? flash('パスキーは 2 本以上の登録をおすすめします（スマホと PC、またはセキュリティキー）。', 'error') : ''}
 <ul class="list">${passkeys.map(passkey => h`<li><div class="row"><strong>${passkey.label}</strong> <span class="muted">登録 ${dateTime(passkey.createdAt)} ・ 最終使用 ${relativeTime(passkey.lastUsedAt)}</span></div>
   ${passkeys.length > 1 ? reauthForm('/settings/passkeys/remove', { credentialId: passkey.credentialId }, '削除', 'danger small') : ''}</li>`)}</ul>
+<p class="muted">パスキーを削除しても、ペアリング済みの DSH ホストは、各ホストの DSH 画面で変更を承認するまで、そのパスキーを危険な操作の確認用に信頼し続けます。なくした・盗まれたパスキーを削除したときは、すべてのホストで承認してください。</p>
 <form class="stack" data-add-passkey><label>新しいパスキーの名前<input name="label" maxlength="60" placeholder="例: MacBook"></label><button class="primary" type="submit">パスキーを追加</button><p data-status hidden></p></form>
 <p class="muted">パスキーを追加・削除すると、次に DSH ホストが接続したとき新しい一覧が届きます。ホスト側は変更を DSH の画面で確認してから使います。</p></section>
 <section class="card" id="recovery"><h2>リカバリーコード</h2>
@@ -645,12 +647,16 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
       if (widening && !session.fresh) return redirect('/connections?msg=reauth')
       const hostId = form.get('hostId') ?? ''
       const live = await hostStub(env, hostId).summary()
-      const result = await hub.setGrant(form.get('clientId') ?? '', hostId, level, live.ceiling?.level ?? null)
+      const clientId = form.get('clientId') ?? ''
+      const result = await hub.setGrant(clientId, hostId, level, live.ceiling?.level ?? null)
+      // Parked tasks of this client that the new grant no longer allows fail now.
+      if (result.ok) await refreshParked(env, clientId, [hostId])
       return redirect(`/connections?msg=${result.ok ? 'grant-saved' : `grant-${result.reason}`}`)
     }
     case '/connections/revoke': {
       if (!session.fresh) return redirect('/connections?msg=reauth')
       await revokeClient(env, form.get('clientId') ?? '', origin)
+      await refreshParked(env, form.get('clientId') ?? '')
       return redirect('/connections?msg=client-revoked')
     }
     case '/settings/passkeys/remove': {
@@ -673,6 +679,7 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
     }
     case '/settings/tokens/revoke':
       await hub.revokePersonalToken(form.get('id') ?? '')
+      await refreshParked(env, `pat:${form.get('id') ?? ''}`)
       return redirect('/settings?msg=token-revoked#tokens')
     case '/settings/allow-other-clients': {
       if (!session.fresh) return redirect('/settings?msg=reauth#clients')

@@ -17,7 +17,12 @@ export async function handleApi(request: Request, env: Env, _ctx: ExecutionConte
       operations: OPERATIONS.map(spec => ({ id: spec.id, level: spec.level, scope: spec.scope, phase: spec.phase, readOnly: spec.readOnly, destructive: spec.destructive, description: spec.description, inputSchema: INPUT_SCHEMAS[spec.id as OperationId] })),
     })
   }
-  const op = decodeURIComponent(url.pathname.slice(ENDPOINTS.ops.length))
+  let op: string
+  try {
+    op = decodeURIComponent(url.pathname.slice(ENDPOINTS.ops.length))
+  } catch {
+    return errorResponse({ code: 'invalid_request', message: 'The operation id in the path is not valid URL encoding.' })
+  }
   if (request.method !== 'POST') return new Response('method not allowed', { status: 405, headers: { allow: 'POST' } })
   let params: unknown
   try {

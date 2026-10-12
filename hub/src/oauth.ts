@@ -45,63 +45,8 @@ export const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code'
 /** The CLI's registered redirect; any loopback port matches (RFC 8252 §7.3). The device flow reuses it without redirecting. */
 export const CLI_REDIRECT_URIS = ['http://127.0.0.1/callback', 'http://localhost/callback']
 
-export interface KnownClient {
-  name: string
-  matches(clientId: string, redirectUri: string): boolean
-}
-
-const CLAUDE_HOSTED_CALLBACKS = new Set(['https://claude.ai/api/mcp/auth_callback', 'https://claude.com/api/mcp/auth_callback'])
-
-/**
- * Clients allowed by default. Sources (checked 2026-10-12):
- * - ChatGPT: CIMD client id `https://chatgpt.com/oauth/client.json` (OpenAI Apps SDK auth docs).
- * - Claude Code: CIMD client id `https://claude.ai/oauth/claude-code-client-metadata`
- *   (claude.com/docs/connectors/building/authentication, "Callback URLs").
- * - Claude (web, Desktop, mobile, Cowork): Anthropic hosts a CIMD document on claude.ai but
- *   does not publish its exact URL; the callback is `https://claude.ai/api/mcp/auth_callback`.
- *   We accept any https client id on claude.ai whose redirect is that callback (or the
- *   claude.com variant). The redirect check is what matters: tokens can only go there.
- */
-export const KNOWN_CLIENTS: readonly KnownClient[] = [
-  { name: 'ChatGPT', matches: clientId => clientId === 'https://chatgpt.com/oauth/client.json' },
-  { name: 'Claude Code', matches: clientId => clientId === 'https://claude.ai/oauth/claude-code-client-metadata' },
-  {
-    name: 'Claude',
-    matches: (clientId, redirectUri) => {
-      try {
-        return new URL(clientId).hostname === 'claude.ai' && CLAUDE_HOSTED_CALLBACKS.has(redirectUri)
-      } catch {
-        return false
-      }
-    },
-  },
-]
-
-export function isCimdClientId(clientId: string): boolean {
-  try {
-    const url = new URL(clientId)
-    return url.protocol === 'https:' && url.pathname !== '/' && url.pathname !== ''
-  } catch {
-    return false
-  }
-}
-
-export function clientKind(clientId: string): ClientKind {
-  if (clientId === CLI_CLIENT_ID) return 'cli'
-  return isCimdClientId(clientId) ? 'cimd' : 'dcr'
-}
-
-export function knownClientName(clientId: string, redirectUri: string): string | null {
-  return KNOWN_CLIENTS.find(client => client.matches(clientId, redirectUri))?.name ?? null
-}
-
-/** The hub's policy on who may even reach the consent page. */
-export function clientPolicy(clientId: string, redirectUri: string, settings: { allowOtherClients: boolean; dcr: boolean }): { allowed: true } | { allowed: false; reason: 'not-allowlisted' | 'dcr-disabled' } {
-  const kind = clientKind(clientId)
-  if (kind === 'cli') return { allowed: true }
-  if (kind === 'cimd') return knownClientName(clientId, redirectUri) !== null || settings.allowOtherClients ? { allowed: true } : { allowed: false, reason: 'not-allowlisted' }
-  return settings.dcr ? { allowed: true } : { allowed: false, reason: 'dcr-disabled' }
-}
+export { KNOWN_CLIENTS, clientKind, clientPolicy, isCimdClientId, knownClientName, type KnownClient } from './client-policy.ts'
+import { clientKind, clientPolicy, knownClientName } from './client-policy.ts'
 
 // --- construction (per origin) ---------------------------------------------------
 

@@ -84,7 +84,14 @@
     return post(`${prefix}/verify`, { challengeId, response: credentialJson(credential), label: (extra && extra.label) || '' })
   }
 
-  const safeNext = value => (value && value.startsWith('/') && !value.startsWith('//') ? value : '/')
+  // Same rule as safeNext() in src/util.ts: a path on this origin only.
+  const safeNext = value => {
+    if (!value || !value.startsWith('/') || /[\u0000-\u001f\u007f\\]/.test(value)) return '/'
+    try {
+      const url = new URL(value, location.origin)
+      return url.origin === location.origin ? url.pathname + url.search + url.hash : '/'
+    } catch { return '/' }
+  }
 
   document.addEventListener('DOMContentLoaded', () => {
     if (!supported()) {

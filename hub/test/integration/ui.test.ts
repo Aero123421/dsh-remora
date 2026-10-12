@@ -60,6 +60,7 @@ describe('owner pages', () => {
     const attention = await (await owner.browser.fetch('/attention')).text()
     expect(attention).toContain('Which file?')
     expect(attention).toContain('data-confirm-op="approval.respond"')
+    expect(attention).toContain('パスキーで署名する内容')
     expect(attention).toContain('tool-ask-user を timed に切り替える')
     const answered = await owner.browser.postForm('/attention/respond', { hostId: host.hostId, sessionId: 's1', attentionId: 'q1', optionId: 'a' })
     expect(answered.headers.get('location')).toBe('/attention?msg=sent')
