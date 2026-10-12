@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type Server } from 'node:http'
 import { createPublicKey, verify, type KeyObject } from 'node:crypto'
 import { WebSocketServer, type WebSocket } from 'ws'
 import {
-  KEEPALIVE_PING, KEEPALIVE_PONG, hostAuthMessage, pairPollMessage, parseHostFrame,
+  KEEPALIVE_PING, KEEPALIVE_PONG, hostAuthMessage, pairPollMessage, parseHostFrame, unpairMessage,
   type HostFrame, type HubFrame, type OwnerCredential,
 } from '@dsh-remora/protocol'
 
@@ -33,6 +33,8 @@ export class FakeHub {
   publicKey: string | null = null
   pollSignaturesValid = true
   polls = 0
+  /** Set when the host removed itself with a valid signature. */
+  unpaired = false
   /** Frames received from the host after authentication, newest last. */
   readonly received: HostFrame[] = []
   readonly hellos: HostFrame[] = []
@@ -85,6 +87,15 @@ export class FakeHub {
       if (this.polls <= (this.options.pendingPolls ?? 0)) { reply(200, { status: 'pending' }); return }
       if (this.options.approve === 'denied') { reply(200, { status: 'denied' }); return }
       reply(200, { status: 'approved', hostId: this.hostId, hubOrigin: this.origin, rpId: this.options.rpId ?? '127.0.0.1', owner: this.options.owner })
+      return
+    }
+    if (req.method === 'POST' && req.url === '/pair/unpair') {
+      const input = await body(req)
+      const ok = this.publicKey !== null && input.hostId === this.hostId
+        && verify(null, Buffer.from(unpairMessage(this.origin, this.hostId, input.issuedAt as number)), ed25519Key(this.publicKey), Buffer.from(input.signature as string, 'base64url'))
+      if (!ok) { reply(401, { error: 'bad signature' }); return }
+      this.unpaired = true
+      reply(200, { ok: true })
       return
     }
     reply(404, {})

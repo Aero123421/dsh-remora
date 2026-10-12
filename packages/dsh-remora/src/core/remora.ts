@@ -7,7 +7,8 @@ import { homedir, hostname } from 'node:os'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import {
-  OPERATIONS, PROTOCOL_VERSION, canonicalJson,
+  ENDPOINTS, OPERATIONS, PROTOCOL_VERSION, canonicalJson, unpairMessage,
+  type UnpairRequest,
   type Grant, type HostEvent, type OperationId, type OwnerCredential, type PermissionLevel, type RequestFrame,
 } from '@dsh-remora/protocol'
 import type { HostContext } from '../dsh.ts'
@@ -31,6 +32,7 @@ import {
 } from './settings.ts'
 import { JsonDocument, remoraDataDir, resolveDshHome } from './storage.ts'
 import { FileTaskStore } from './tasks.ts'
+import { readQuestionModes, switchToTimed, type QuestionModeReport } from './question-mode.ts'
 import { checkForUpdate, downloadVerified, type UpdateCheck } from './updates.ts'
 
 type GetFetch = (input: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => Promise<Response>
@@ -93,6 +95,8 @@ export interface RemoraSnapshot {
     lock: 'held' | 'other' | 'none'
   }
   pairing: PairingView
+  /** Result of the last unpair in this process: whether the hub also forgot the host. */
+  lastUnpair: { at: number; hub: 'removed' | 'refused' | 'unreachable' | 'not-paired' } | null
   pendingCredentials: { receivedAt: number; added: string[]; removed: string[]; total: number } | null
   keyStorage: 'credentials' | 'file'
   dataDir: string
@@ -105,6 +109,8 @@ export interface RemoraSnapshot {
   auditIntact: boolean
   update: UpdateCheck | null
   canInstallUpdate: boolean
+  /** `ask_user_question` mode per agent preset: only `timed` questions can be answered remotely. */
+  questionModes: QuestionModeReport
 }
 
 const ALIAS_PATTERN = /^[A-Za-z0-9._-]{1,64}$/
@@ -149,6 +155,7 @@ export class RemoraCore {
   private lockTimer: unknown = null
   private expiryTimer: unknown = null
   private updateCheck: UpdateCheck | null = null
+  private lastUnpair: { at: number; hub: 'removed' | 'refused' | 'unreachable' | 'not-paired' } | null = null
   private fatal: string | null = null
   private disposed = false
   private readonly dshVersion = dshVersion()
@@ -352,6 +359,7 @@ export class RemoraCore {
 
   private async onPaired(approved: ApprovedPairing, key: HostKey): Promise<void> {
     await this.stopLink('idle', null)
+    this.lastUnpair = null
     await this.keyStore.save(key)
     this.hostKey = key
     await this.pairingDoc.update(() => ({
@@ -379,12 +387,38 @@ export class RemoraCore {
   /** Forget the pairing and the key. The host should also be removed on the hub. */
   async unpair(local: boolean): Promise<void> {
     this.pairing.reset()
+    this.lastUnpair = { at: this.clock.now(), hub: await this.unpairAtHub() }
     await this.stopLink('idle', null)
     await this.keyStore.delete()
     this.hostKey = null
     this.adapterStarted = false
     await this.pairingDoc.reset()
-    this.audit({ kind: 'settings', action: 'unpaired', outcome: 'ok', local })
+    this.audit({ kind: 'settings', action: 'unpaired', outcome: this.lastUnpair.hub === 'removed' ? 'ok' : 'error', reason: `hub:${this.lastUnpair.hub}`, local })
+  }
+
+  /**
+   * Ask the hub to forget this host (`POST /pair/unpair`, signed with the
+   * host key). Local state is cleared whatever the answer; a failure only
+   * means the user must also remove the host on the hub.
+   */
+  private async unpairAtHub(): Promise<'removed' | 'refused' | 'unreachable' | 'not-paired'> {
+    const paired = this.pairingDoc.value.paired
+    const key = this.hostKey
+    if (!paired || !key) return 'not-paired'
+    const issuedAt = this.clock.now()
+    const body: UnpairRequest = { hostId: paired.hostId, issuedAt, signature: key.sign(unpairMessage(paired.hubOrigin, paired.hostId, issuedAt)) }
+    const fetchImpl: FetchLike = this.options.fetch ?? ((input, init) => fetch(input, init))
+    try {
+      const response = await fetchImpl(`${paired.hubOrigin}${ENDPOINTS.hostUnpair}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10_000),
+      })
+      return response.ok ? 'removed' : 'refused'
+    } catch {
+      return 'unreachable'
+    }
   }
 
   async resolveCredentialChange(accept: boolean, local: boolean): Promise<void> {
@@ -399,6 +433,20 @@ export class RemoraCore {
       await this.pairingDoc.update(current => ({ ...current, pendingCredentials: null }))
     }
     this.audit({ kind: 'settings', action: accept ? 'owner-credentials-accepted' : 'owner-credentials-rejected', outcome: 'ok', local })
+  }
+
+  /** Switch every legacy preset to timed questions so they can be answered from outside. */
+  async switchQuestionMode(local: boolean): Promise<string[]> {
+    this.requireLocal(local, ['question-mode'])
+    let changed: string[]
+    try {
+      changed = await switchToTimed(service => this.ctx.get(service))
+    } catch (error) {
+      this.audit({ kind: 'settings', action: 'question-mode:timed', outcome: 'error', local })
+      throw new RpcError('question-mode-failed', (error as Error).message.slice(0, 300))
+    }
+    this.audit({ kind: 'settings', action: 'question-mode:timed', outcome: 'ok', local })
+    return changed
   }
 
   reconnect(): void {
@@ -661,6 +709,7 @@ export class RemoraCore {
         lock: this.lockState,
       },
       pairing: this.pairing.view,
+      lastUnpair: this.lastUnpair,
       pendingCredentials: pending ? {
         receivedAt: pending.receivedAt,
         added: pending.credentials.map(c => c.credentialId).filter(id => !pinnedIds.includes(id)),
@@ -681,6 +730,7 @@ export class RemoraCore {
       auditIntact: this.auditLog.intact,
       update: this.updateCheck,
       canInstallUpdate: this.pluginManager() !== null,
+      questionModes: readQuestionModes(service => this.ctx.get(service)),
     }
   }
 
