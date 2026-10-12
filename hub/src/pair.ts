@@ -8,8 +8,9 @@ import { RATE_LIMITS, hubOrigin } from './config.ts'
 import { clientIp, errorResponse, html, json, readForm, readJson, redirect, sameOrigin } from './http.ts'
 import { hostStub, hubStub } from './meter.ts'
 import { flash, h, page, type Raw } from './ui/layout.ts'
-import { isRawEd25519Key, newHostId } from './util.ts'
-import { ENDPOINTS, PAIRING_POLL_INTERVAL_MS, formatUserCode, isSupportedProtocol, normalizeUserCode, type PairPollRequest, type PairStartRequest, type PairStartResponse } from './vendor/protocol/index.ts'
+import { revokeHostEverywhere } from './ops.ts'
+import { isRawEd25519Key, newHostId, verifyEd25519 } from './util.ts'
+import { ENDPOINTS, PAIRING_POLL_INTERVAL_MS, formatUserCode, isSupportedProtocol, normalizeUserCode, type PairPollRequest, type PairStartRequest, type PairStartResponse, type UnpairRequest, unpairMessage } from './vendor/protocol/index.ts'
 
 export async function pairStart(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') return new Response('method not allowed', { status: 405, headers: { allow: 'POST' } })
@@ -114,4 +115,35 @@ export async function pairApprovePost(request: Request, env: Env): Promise<Respo
   if (!host) return redirect(`${ENDPOINTS.pairApprove}?code=${encodeURIComponent(code)}`)
   await hostStub(env, host.hostId).provision(host.hostId, host.publicKey, host.name)
   return redirect(`/hosts/${host.hostId}?paired=1`)
+}
+
+/** How far `issuedAt` of a self-unpair may be from now. */
+export const UNPAIR_WINDOW_MS = 5 * 60_000
+
+/**
+ * A paired host removes itself: the request is signed with its host key over
+ * `unpairMessage(hubOrigin, hostId, issuedAt)`. On success the host is revoked
+ * exactly like the owner's revoke (socket closed, open tasks failed, audited).
+ */
+export async function hostUnpair(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') return new Response('method not allowed', { status: 405, headers: { allow: 'POST' } })
+  const hub = hubStub(env)
+  const [max, window] = RATE_LIMITS.unpair
+  if (!(await hub.hit(`unpair:${clientIp(request)}`, max, window))) return errorResponse({ code: 'rate_limited', message: 'Too many unpair attempts; try again later.' })
+  let body: Partial<UnpairRequest>
+  try {
+    body = (await readJson(request, 4096)) as Partial<UnpairRequest>
+  } catch {
+    return errorResponse({ code: 'invalid_request', message: 'invalid JSON' })
+  }
+  if (typeof body.hostId !== 'string' || typeof body.issuedAt !== 'number' || typeof body.signature !== 'string' || body.hostId.length > 64) {
+    return errorResponse({ code: 'invalid_request', message: 'hostId, issuedAt and signature are required' })
+  }
+  if (Math.abs(Date.now() - body.issuedAt) > UNPAIR_WINDOW_MS) return errorResponse({ code: 'invalid_request', message: 'issuedAt is more than 5 minutes away from the hub clock.' })
+  const host = await hub.getHost(body.hostId)
+  if (!host || host.revokedAt !== null) return errorResponse({ code: 'not_found', message: 'This host is not paired with the hub.' })
+  const ok = await verifyEd25519(host.publicKey, unpairMessage(hubOrigin(request, env), body.hostId, body.issuedAt), body.signature)
+  if (!ok) return errorResponse({ code: 'denied', message: 'The signature does not match the key paired for this host.' })
+  await revokeHostEverywhere(env, body.hostId, 'host')
+  return json({ ok: true })
 }

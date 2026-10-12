@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:workers'
 import { describe, expect, it } from 'vitest'
-import type { HubFrame } from '../../src/vendor/protocol/index.ts'
-import { FakeHost, eventually, reauth, setupOwner } from './helpers.ts'
+import { confirmationChallenge, fromBase64Url, type HubFrame } from '../../src/vendor/protocol/index.ts'
+import { FakeHost, ORIGIN, eventually, reauth, setupOwner } from './helpers.ts'
 
 const now = Date.now()
 
@@ -22,7 +22,8 @@ describe('owner pages', () => {
         case 'session.get': return { ok: true, result: { session: { sessionId: 's1', title: 'Session one', workspaceId: 'w1', parentSessionId: null, pinned: false, archived: false, running: false, updatedAt: now, agentPreset: 'ptc', model: { provider: 'deepseek', model: 'v4', effort: 'high' } }, context: { usedTokens: 5000, maxTokens: 10000, ratio: 0.5 }, recentTurns: [{ index: 0, request: 'hi', reply: 'hello <i>there</i>', at: now }], queueLength: 0, attention: [], hasLiveClient: true, untrusted: true } }
         case 'attention.list': return { ok: true, result: { items: [
           { attentionId: 'q1', hostId: host.hostId, sessionId: 's1', kind: 'question', title: 'Pick one', detail: 'Which file?', options: [{ id: 'a', label: 'A' }], answerable: true, createdAt: now },
-          { attentionId: 'ap1', hostId: host.hostId, sessionId: 's1', kind: 'approval', title: 'Run rm?', answerable: false, createdAt: now },
+          { attentionId: 'ap1', hostId: host.hostId, sessionId: 's1', kind: 'approval', title: 'Run rm?', answerable: true, createdAt: now },
+          { attentionId: 'q2', hostId: host.hostId, sessionId: 's1', kind: 'question', title: 'Legacy question', answerable: false, createdAt: now },
         ] } }
         case 'task.start': return { ok: true, result: { taskId: frame.taskId, state: 'accepted', sessionId: 's1', createdAt: now, updatedAt: now } }
         default: return { ok: true, result: { accepted: true } }
@@ -59,6 +60,7 @@ describe('owner pages', () => {
     const attention = await (await owner.browser.fetch('/attention')).text()
     expect(attention).toContain('Which file?')
     expect(attention).toContain('data-confirm-op="approval.respond"')
+    expect(attention).toContain('tool-ask-user を timed に切り替える')
     const answered = await owner.browser.postForm('/attention/respond', { hostId: host.hostId, sessionId: 's1', attentionId: 'q1', optionId: 'a' })
     expect(answered.headers.get('location')).toBe('/attention?msg=sent')
 
@@ -90,6 +92,23 @@ describe('owner pages', () => {
     expect(options.status).toBe(200)
     const body = (await options.json()) as { requestId: string; options: { challenge: string; allowCredentials: unknown[] } }
     expect(body.options.allowCredentials).toHaveLength(1)
+
+    // The challenge covers the final params (hostId filled in) and the frame id is the requestId.
+    const params = { sessionId: 's1', attentionId: 'ap1', answer: { approve: false } }
+    const prepared = await owner.browser.postJson('/auth/confirm/options', { hostId: host.hostId, operation: 'approval.respond', params })
+    const ready = (await prepared.json()) as { requestId: string; issuedAt: number; params: Record<string, unknown>; options: { challenge: string; rpId: string } }
+    expect(ready.params).toEqual({ ...params, hostId: host.hostId })
+    const signed = await owner.authenticator.get(ready.options)
+    const confirmedSigned = await owner.browser.postJson('/ops/confirmed', {
+      hostId: host.hostId, operation: 'approval.respond', params, requestId: ready.requestId, issuedAt: ready.issuedAt,
+      assertion: { credentialId: signed.id, authenticatorData: signed.response.authenticatorData, clientDataJSON: signed.response.clientDataJSON, signature: signed.response.signature, userHandle: signed.response.userHandle },
+    })
+    expect(confirmedSigned.status).toBe(200)
+    const frame = requests.filter(item => item.op === 'approval.respond').at(-1) as Extract<HubFrame, { t: 'request' }>
+    expect(frame.id).toBe(ready.requestId)
+    const expected = await confirmationChallenge({ hubOrigin: ORIGIN, hostId: host.hostId, requestId: frame.id, operation: frame.op, params: frame.params, issuedAt: frame.confirmation?.issuedAt as number })
+    const clientData = JSON.parse(new TextDecoder().decode(fromBase64Url(frame.confirmation?.assertion.clientDataJSON as string))) as { challenge: string }
+    expect(clientData.challenge).toBe(expected)
 
     // The free-tier meter counts requests (flushed every 50 events or minute).
     await eventually(async () => {

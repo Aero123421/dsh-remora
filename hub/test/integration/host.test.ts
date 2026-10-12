@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:workers'
 import { describe, expect, it } from 'vitest'
 import type { ExecuteCall } from '../../src/host-do.ts'
-import type { HubFrame, TaskInfo } from '../../src/vendor/protocol/index.ts'
+import { unpairMessage, type HubFrame, type TaskInfo } from '../../src/vendor/protocol/index.ts'
 import { FakeHost, ORIGIN, eventually, hubFetch, reauth, setupOwner, sleep } from './helpers.ts'
 
 const actor = { clientId: 'client-a', clientName: 'Test client' }
@@ -82,6 +82,14 @@ describe('pairing and the host connection', () => {
     thief.hostId = host.hostId
     await thief.connect({}, { badSignature: true })
     expect(await thief.next('close')).toMatchObject({ reason: 'auth_failed' })
+
+    // Self-unpair must be signed with the host key and fresh.
+    const unpair = async (body: Record<string, unknown>) => hubFetch('/pair/unpair', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    const forgedUnpair = await unpair({ hostId: host.hostId, issuedAt: Date.now(), signature: await thief.sign(unpairMessage(ORIGIN, host.hostId, Date.now())) })
+    expect(forgedUnpair.status).toBe(403)
+    const old = Date.now() - 6 * 60_000
+    const staleUnpair = await unpair({ hostId: host.hostId, issuedAt: old, signature: await host.sign(unpairMessage(ORIGIN, host.hostId, old)) })
+    expect(staleUnpair.status).toBe(400)
 
     // Revoking closes the live connection.
     await reauth(owner)
@@ -170,5 +178,23 @@ describe('pairing and the host connection', () => {
     const audit = await stub.listAudit(100)
     expect(audit.some(row => row.operation === 'task.start' && row.outcome === 'ok')).toBe(true)
     expect(JSON.stringify(audit)).not.toContain('hello')
+  })
+
+  it('lets a paired host unpair itself with a signed request', async () => {
+    const owner = await setupOwner()
+    const host = await FakeHost.create()
+    await host.pair(owner)
+    await host.connect()
+    await host.next('ready')
+    const issuedAt = Date.now()
+    const body = JSON.stringify({ hostId: host.hostId, issuedAt, signature: await host.sign(unpairMessage(ORIGIN, host.hostId, issuedAt)) })
+    const response = await hubFetch('/pair/unpair', { method: 'POST', headers: { 'content-type': 'application/json' }, body })
+    expect(response.status).toBe(200)
+    expect(await host.next('close')).toMatchObject({ reason: 'revoked' })
+    const replay = await hubFetch('/pair/unpair', { method: 'POST', headers: { 'content-type': 'application/json' }, body })
+    expect(replay.status).toBe(404)
+    const audit = await env.HUB.get(env.HUB.idFromName('hub')).listAudit(50)
+    expect(audit.some(row => row.operation === 'host.unpair' && row.hostId === host.hostId && row.actor === 'host')).toBe(true)
+    expect((await hubFetch(`/ws/host/${host.hostId}`, { headers: { upgrade: 'websocket' } })).status).toBe(404)
   })
 })

@@ -24,7 +24,7 @@ import { countingKv, hubStub } from './meter.ts'
 import type { ClientKind } from './types.ts'
 import { flash, h, page, raw, type Raw } from './ui/layout.ts'
 import { randomToken } from './util.ts'
-import { CLI_CLIENT_ID, ENDPOINTS, SCOPES, formatUserCode, normalizeUserCode, sha256, toBase64Url } from './vendor/protocol/index.ts'
+import { CLI_CLIENT_ID, ENDPOINTS, SCOPES, resourceIndicators, formatUserCode, normalizeUserCode, sha256, toBase64Url } from './vendor/protocol/index.ts'
 
 export interface TokenProps {
   clientId: string
@@ -127,7 +127,7 @@ export function oauthEnv(env: Env): Env {
 }
 
 export function resourcesFor(origin: string): { mcp: string; api: string } {
-  return { mcp: `${origin}${ENDPOINTS.mcp}`, api: `${origin}${ENDPOINTS.ops.replace(/\/$/, '')}` }
+  return resourceIndicators(origin)
 }
 
 export function oauthFor(origin: string, env: Env): OAuthSetup {
@@ -232,6 +232,7 @@ export async function handleOAuth(request: Request, env: Env, ctx: ExecutionCont
     if (!response.ok) return response
     const metadata = (await response.json()) as Record<string, unknown>
     metadata.device_authorization_endpoint = `${origin}${ENDPOINTS.deviceAuthorization}`
+    metadata.revocation_endpoint = `${origin}${ENDPOINTS.revocation}`
     const grants = Array.isArray(metadata.grant_types_supported) ? (metadata.grant_types_supported as string[]) : []
     metadata.grant_types_supported = [...new Set([...grants, DEVICE_GRANT])]
     return json(metadata, { headers: { 'cache-control': 'public, max-age=300', 'access-control-allow-origin': '*' } })
@@ -248,6 +249,7 @@ export async function handleOAuth(request: Request, env: Env, ctx: ExecutionCont
   if (path === ENDPOINTS.deviceAuthorization) return deviceAuthorization(request, env, setup)
   if (path === ENDPOINTS.deviceVerify) return request.method === 'POST' ? devicePost(request, env, setup) : deviceGet(request, env)
 
+  if (path === ENDPOINTS.revocation) return revoke(request, env, ctx, setup, origin)
   if (path === ENDPOINTS.token && request.method === 'POST') {
     const [max, window] = RATE_LIMITS.token
     if (!(await hubStub(env).hit(`token:${clientIp(request)}`, max, window))) return json({ error: 'slow_down', error_description: 'Too many token requests.' }, { status: 429 })
@@ -258,6 +260,25 @@ export async function handleOAuth(request: Request, env: Env, ctx: ExecutionCont
   }
   if (path.startsWith('/oauth/') || path.startsWith('/.well-known/oauth-')) return setup.server.fetch(request, libEnv, ctx)
   return null
+}
+
+/**
+ * RFC 7009 revocation. The library serves revocation on its token endpoint
+ * (a request with `token` and no `grant_type`), so the body is forwarded there
+ * unchanged; client authentication and the always-200 answer are the library's.
+ */
+async function revoke(request: Request, env: Env, ctx: ExecutionContext, setup: OAuthSetup, origin: string): Promise<Response> {
+  if (request.method !== 'POST') return new Response('method not allowed', { status: 405, headers: { allow: 'POST' } })
+  const [max, window] = RATE_LIMITS.token
+  if (!(await hubStub(env).hit(`token:${clientIp(request)}`, max, window))) return json({ error: 'slow_down', error_description: 'Too many requests.' }, { status: 429 })
+  const body = await bodyText(request)
+  const form = new URLSearchParams(body)
+  if (form.has('grant_type') || !form.get('token')) return json({ error: 'invalid_request', error_description: 'Send token (and token_type_hint) without grant_type.' }, { status: 400 })
+  if (form.get('client_id') === CLI_CLIENT_ID) await ensureCliClient(env)
+  const headers = new Headers({ 'content-type': 'application/x-www-form-urlencoded' })
+  const authorization = request.headers.get('authorization')
+  if (authorization) headers.set('authorization', authorization)
+  return setup.server.fetch(new Request(`${origin}${ENDPOINTS.token}`, { method: 'POST', headers, body }), oauthEnv(env), ctx)
 }
 
 function oauthApi(setup: OAuthSetup, env: Env): OAuthHelpers {

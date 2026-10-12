@@ -12,6 +12,7 @@ import { cose, decodeCredentialPublicKey } from '@simplewebauthn/server/helpers'
 import { RATE_LIMITS, SESSION_COOKIE, SESSION_MAX_MS, hubOrigin, secrets } from './config.ts'
 import { clearCookie, clientIp, getCookie, json, readForm, readJson, redirect, sameOrigin, sessionCookie } from './http.ts'
 import { hubStub } from './meter.ts'
+import { finalParams } from './ops.ts'
 import type { PasskeyRecord } from './types.ts'
 import { randomToken, safeEqual, sha256Hex } from './util.ts'
 import { confirmationChallenge, fromBase64Url, toBase64Url } from './vendor/protocol/index.ts'
@@ -227,7 +228,11 @@ export async function handleAuth(request: Request, env: Env, path: string): Prom
       if (typeof hostId !== 'string' || typeof operation !== 'string') return fail(400, 'hostId and operation are required')
       const requestId = `r_${randomToken(12)}`
       const issuedAt = Date.now()
-      const challenge = await confirmationChallenge({ hubOrigin: origin, hostId, requestId, operation, params: body.params ?? {}, issuedAt })
+      const rawParams = typeof body.params === 'object' && body.params !== null && !Array.isArray(body.params) ? (body.params as Record<string, unknown>) : {}
+      if (typeof rawParams.hostId === 'string' && rawParams.hostId !== hostId) return fail(400, 'params.hostId does not match hostId')
+      // The challenge covers the params the host will see, hostId included.
+      const params = finalParams(operation, rawParams, hostId)
+      const challenge = await confirmationChallenge({ hubOrigin: origin, hostId, requestId, operation, params, issuedAt })
       const passkeys = await hub.listPasskeys()
       const options = await generateAuthenticationOptions({
         rpID: rpIdOf(origin),
@@ -235,7 +240,7 @@ export async function handleAuth(request: Request, env: Env, path: string): Prom
         challenge: bytes(challenge),
         allowCredentials: passkeys.map(passkey => ({ id: passkey.credentialId, transports: passkey.transports })),
       })
-      return json({ requestId, issuedAt, options })
+      return json({ requestId, issuedAt, params, options })
     }
   }
   return fail(404, 'not found')

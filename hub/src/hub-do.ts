@@ -465,11 +465,13 @@ export class HubDO extends DurableObject<Env> {
     return (await this.listHosts(true)).find(host => host.hostId === hostId) ?? null
   }
 
-  async revokeHost(hostId: string): Promise<boolean> {
+  async revokeHost(hostId: string, by: 'owner' | 'host' = 'owner'): Promise<boolean> {
     const changed = this.sql.exec('UPDATE hosts SET revoked_at = ? WHERE host_id = ? AND revoked_at IS NULL', Date.now(), hostId).rowsWritten > 0
     if (changed) {
       this.sql.exec('DELETE FROM grants WHERE host_id = ?', hostId)
-      await this.audit({ actor: 'owner', actorName: 'オーナー', operation: 'host.revoke', hostId, outcome: 'ok', layer: null, reason: null })
+      await this.audit(by === 'host'
+        ? { actor: 'host', actorName: 'DSH ホスト', operation: 'host.unpair', hostId, outcome: 'ok', layer: null, reason: null }
+        : { actor: 'owner', actorName: 'オーナー', operation: 'host.revoke', hostId, outcome: 'ok', layer: null, reason: null })
     }
     return changed
   }

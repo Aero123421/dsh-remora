@@ -6,6 +6,7 @@ export type Route =
   | { kind: 'host-socket'; hostId: string }
   | { kind: 'pair-start' }
   | { kind: 'pair-poll' }
+  | { kind: 'host-unpair' }
   | { kind: 'pair-approve' }
   | { kind: 'auth'; path: string }
   | { kind: 'mcp' }
@@ -25,6 +26,7 @@ export function route(method: string, pathname: string): Route {
   if (pathname.startsWith('/oauth/') || pathname.startsWith('/.well-known/oauth-') || pathname === ENDPOINTS.deviceVerify) return { kind: 'oauth', path: pathname }
   if (pathname === ENDPOINTS.pairStart) return method === 'POST' ? { kind: 'pair-start' } : { kind: 'method-not-allowed', allow: 'POST' }
   if (pathname === ENDPOINTS.pairPoll) return method === 'POST' ? { kind: 'pair-poll' } : { kind: 'method-not-allowed', allow: 'POST' }
+  if (pathname === ENDPOINTS.hostUnpair) return method === 'POST' ? { kind: 'host-unpair' } : { kind: 'method-not-allowed', allow: 'POST' }
   if (pathname === ENDPOINTS.pairApprove) return method === 'GET' || method === 'POST' || method === 'HEAD' ? { kind: 'pair-approve' } : { kind: 'method-not-allowed', allow: 'GET, POST' }
   if (pathname.startsWith('/auth/')) return { kind: 'auth', path: pathname }
   const socket = /^\/ws\/host\/([^/]+)$/.exec(pathname)

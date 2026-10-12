@@ -11,7 +11,7 @@ import { html } from './http.ts'
 import { handleMcp } from './mcp.ts'
 import { countWorkerRequest, hostStub, maybeFlush } from './meter.ts'
 import { handleOAuth, oauthFor, registerProtectedHandlers } from './oauth.ts'
-import { pairApprovePage, pairApprovePost, pairPoll, pairStart } from './pair.ts'
+import { hostUnpair, pairApprovePage, pairApprovePost, pairPoll, pairStart } from './pair.ts'
 import { route } from './router.ts'
 import { h, page } from './ui/layout.ts'
 import { handleUi } from './ui/routes.ts'
@@ -41,6 +41,8 @@ async function dispatch(request: Request, env: Env, ctx: ExecutionContext): Prom
       return pairStart(request, env)
     case 'pair-poll':
       return pairPoll(request, env)
+    case 'host-unpair':
+      return hostUnpair(request, env)
     case 'pair-approve':
       return request.method === 'POST' ? pairApprovePost(request, env) : pairApprovePage(request, env)
     case 'auth':
