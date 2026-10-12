@@ -27,42 +27,54 @@ export async function openSettings(page) {
   await mustBePresent(page, DSH.settingsDialog, 'the settings dialog')
 }
 
-/** Open the Remora tab and wait until it rendered the plugin state. */
+/** Open the Remora page and wait until it rendered the plugin state. */
 export async function openRemoraTab(page) {
   const open = await firstPresent(page, REMORA.section, 300)
   if (open) {
-    const killSwitch = await mustBePresent(open, REMORA.killSwitch, 'the kill switch button')
+    const killSwitch = await mustBePresent(open, REMORA.killSwitch, 'the kill switch card')
     return { section: open, killSwitch, response: null }
   }
   const nav = await mustBePresent(page, DSH.settingsNavRemora, '"Remora" in the settings left nav')
   const state = page.waitForResponse(response => /\/api\/remora\/state$/.test(response.url()), { timeout: 15_000 }).catch(() => null)
   await nav.click()
   const response = await state
-  const section = await mustBePresent(page, REMORA.section, 'the Remora section (section.dsh-remora)')
-  const killSwitch = await mustBePresent(section, REMORA.killSwitch, 'the kill switch button (rendered once /api/remora/state answered)')
+  const section = await mustBePresent(page, REMORA.section, 'the Remora page (div.rmr with the kill switch)')
+  const killSwitch = await mustBePresent(section, REMORA.killSwitch, 'the kill switch card (rendered once /api/remora/state answered)')
   return { section, killSwitch, response }
 }
 
-async function rpcBody(response) {
+/** Select one of the page's tabs (Connection, Permissions, Scope, ...). */
+export async function openRemoraSubTab(section, name) {
+  const tab = await mustBePresent(section, REMORA.tab(name), `the "${name}" tab of the Remora page`)
+  await tab.click()
+}
+
+export async function rpcBody(response) {
   if (!response) return undefined
   try { return await response.json() } catch { return undefined }
 }
 
-/** Click the kill switch and wait for the plugin to confirm the new value. */
-async function toggleKillSwitch(page, killSwitch) {
-  const before = await killSwitch.getAttribute('aria-pressed')
+export async function killSwitchOn(killSwitch) {
+  return (await killSwitch.getAttribute('data-on')) === 'true'
+}
+
+/** Click the kill switch button and wait for the plugin to confirm the new value. */
+export async function toggleKillSwitch(page, killSwitch) {
+  const before = await killSwitchOn(killSwitch)
+  const button = await mustBePresent(killSwitch, REMORA.killSwitchButton, 'the kill switch button')
+  if (await button.isDisabled()) throw new Error(`the kill switch button is disabled (title: ${await button.getAttribute('title')})`)
   const reply = page.waitForResponse(response => /\/api\/remora\/kill-switch$/.test(response.url()), { timeout: 15_000 })
-  await killSwitch.click()
+  await button.click()
   const body = await rpcBody(await reply)
   if (!body?.result?.ok) throw new Error(`kill-switch RPC failed: ${JSON.stringify(body)}`)
-  const expected = before === 'true' ? 'false' : 'true'
+  const expected = !before
   let after
   for (const deadline = Date.now() + 10_000; Date.now() < deadline; await page.waitForTimeout(200)) {
-    after = await killSwitch.getAttribute('aria-pressed')
+    after = await killSwitchOn(killSwitch)
     if (after === expected) break
   }
-  if (after !== expected) throw new Error(`kill switch stayed aria-pressed=${after} (expected ${expected})`)
-  if (body.result.value?.killSwitch !== (expected === 'true')) throw new Error(`server state killSwitch=${body.result.value?.killSwitch}, expected ${expected}`)
+  if (after !== expected) throw new Error(`kill switch stayed data-on=${after} (expected ${expected})`)
+  if (body.result.value?.settings?.killSwitch !== expected) throw new Error(`server state killSwitch=${body.result.value?.settings?.killSwitch}, expected ${expected}`)
   return after
 }
 
@@ -70,7 +82,7 @@ async function toggleKillSwitch(page, killSwitch) {
  * Register the browser-check steps on the runner.
  * @returns {Promise<{ session?: { context, page, issues } }>} the DSH page, reused by the flow
  */
-export async function browserSteps(r, { browser, web, artifacts, plugin, prefix = 'browser', label = 'loopback', minimal = false }) {
+export async function browserSteps(r, { browser, web, artifacts, plugin, prefix = 'browser', label = 'loopback', minimal = false, local = true }) {
   const out = {}
   const failShot = name => async () => { if (out.session?.page) await shot(out.session.page, artifacts, `${prefix}-FAILED-${name}`).catch(() => {}) }
 
@@ -92,22 +104,26 @@ export async function browserSteps(r, { browser, web, artifacts, plugin, prefix 
 
   await r.step(`${prefix}.remora-tab`, 'The Remora tab renders the plugin state from /api/remora/state', { needs: [`${prefix}.settings-nav`], onFailure: failShot('remora-tab') }, async () => {
     const { page } = out.session
-    const { section, killSwitch, response } = await openRemoraTab(page)
+    const { killSwitch, response } = await openRemoraTab(page)
     const body = await rpcBody(response)
     if (response && !body?.result?.ok) throw new Error(`/api/remora/state answered ${response.status()} ${JSON.stringify(body)}`)
     const state = body?.result?.value
-    const textContent = await section.innerText()
-    if (plugin?.version && !textContent.includes(plugin.version)) throw new Error(`tab does not show plugin version ${plugin.version}:\n${textContent}`)
+    if (plugin?.version && state && state.version !== plugin.version) throw new Error(`plugin reports version ${state.version}, expected ${plugin.version}`)
     const path = await shot(page, artifacts, `${prefix}-03-remora-tab`)
-    return `state: version=${state?.version} protocol=${state?.protocol} hub.connected=${state?.hub?.connected} permission=${state?.permission?.level} killSwitch=${await killSwitch.getAttribute('aria-pressed')} available=[${state?.features?.available?.join(', ') ?? '?'}]; ${path}`
+    return `state: version=${state?.version} protocol=${state?.protocol} dsh=${state?.dshVersion} local=${state?.local} paired=${state?.hub?.paired} ceiling=${state?.settings?.ceiling?.level} killSwitch=${await killSwitchOn(killSwitch)} operations=${state?.operations?.filter(op => op.available !== false).length ?? '?'}; ${path}`
   })
 
   if (minimal) return out
 
-  await r.step(`${prefix}.kill-switch`, 'The kill switch toggles through the authenticated route and survives a reload', { needs: [`${prefix}.remora-tab`], onFailure: failShot('kill-switch') }, async () => {
+  await r.step(`${prefix}.kill-switch`, local
+    ? 'The kill switch turns on through the authenticated route, survives a reload, and turns off'
+    : 'From another device the kill switch turns on and survives a reload; resuming is refused (local only)', { needs: [`${prefix}.remora-tab`], onFailure: failShot('kill-switch') }, async () => {
     const { page } = out.session
     let { killSwitch } = await openRemoraTab(page)
-    if (await killSwitch.getAttribute('aria-pressed') === 'true') await toggleKillSwitch(page, killSwitch)
+    if (await killSwitchOn(killSwitch)) {
+      if (!local) throw new Error('the kill switch is already on; a remote browser cannot turn it off')
+      await toggleKillSwitch(page, killSwitch)
+    }
     await toggleKillSwitch(page, killSwitch)
     const on = await shot(page, artifacts, `${prefix}-04-kill-switch-on`)
     await page.reload()
@@ -115,8 +131,12 @@ export async function browserSteps(r, { browser, web, artifacts, plugin, prefix 
     if (notice) await notice.click()
     await openSettings(page)
     ;({ killSwitch } = await openRemoraTab(page))
-    const persisted = await killSwitch.getAttribute('aria-pressed')
-    if (persisted !== 'true') throw new Error(`after reload the kill switch is aria-pressed=${persisted}`)
+    if (!(await killSwitchOn(killSwitch))) throw new Error('after reload the kill switch is off')
+    if (!local) {
+      const resume = await mustBePresent(killSwitch, REMORA.killSwitchButton, 'the Resume button')
+      if (!(await resume.isDisabled())) throw new Error('a non-loopback browser may resume after the kill switch (expected local-only)')
+      return `on → reload (still on); Resume is disabled here (title "${await resume.getAttribute('title')}"); ${on}`
+    }
     await toggleKillSwitch(page, killSwitch)
     const off = await shot(page, artifacts, `${prefix}-05-kill-switch-off`)
     return `on → reload (still on) → off; ${on}, ${off}`

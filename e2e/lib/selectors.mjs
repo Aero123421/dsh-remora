@@ -31,49 +31,60 @@ export const dsh = {
   composer: css('[data-composer-input][contenteditable="true"]'),
 }
 
-/** The Remora settings tab (packages/dsh-remora/src/client.tsx). */
+/** The Remora settings page (packages/dsh-remora/src/ui/page.tsx), English locale. */
 export const remora = {
-  section: [testid('remora-section'), css('section.dsh-remora')],
+  section: [testid('remora-page'), css('div.rmr:has(#kill-switch)')],
   heading: role('heading', { name: 'Remora', exact: true }),
   // Scoped to the section located above.
-  /** Kill switch toggle; its state is aria-pressed. */
-  killSwitch: [testid('remora-kill-switch'), css('button[aria-pressed]')],
-  /** Plugin and protocol version line, e.g. "0.0.1 · protocol 1". */
-  version: [testid('remora-version'), text(/· protocol \d+/, { exact: false })],
-  hubStatus: [testid('remora-hub-status'), css('.dsh-remora-dot')],
-  hubConnected: [css('[data-testid="remora-hub-status"][data-state="connected"]'), text('Connected')],
+  /** Kill switch card; its state is data-on="true|false", the button inside toggles it. */
+  killSwitch: [testid('remora-kill-switch'), css('#kill-switch')],
+  killSwitchButton: [css('button')],
+  /** Tabs inside the page (SegmentedControl). */
+  tab: name => [scope => scope.locator('.rmr-tabs, #rmr-tabs').getByText(name, { exact: true }), scope => scope.getByRole('radio', { name, exact: true }), scope => scope.getByRole('tab', { name, exact: true }), scope => scope.getByText(name, { exact: true })],
+  tabs: { connection: 'Connection', permissions: 'Permissions', scope: 'Scope', activity: 'Clients & audit log', compat: 'Compatibility & updates' },
   loadFailed: css('[role="alert"]'),
-  // Pairing (planned; P0 scaffold has none of these yet).
-  hubUrlInput: [testid('remora-hub-url'), role('textbox', { name: /hub url|ハブの? ?URL/i })],
-  pairStart: [testid('remora-pair-start'), role('button', { name: /^(pair|connect)|ペアリング|接続/i })],
-  pairCode: [testid('remora-pair-code'), text(/^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/, { exact: false })],
-  /** DSH-side ceiling for remote access ("Can request" is what task.start needs). */
-  ceilingRequest: [testid('remora-ceiling-request'), role('radio', { name: /request|依頼/i }), role('option', { name: /request|依頼/i })],
+  // Connection tab.
+  hubUrlInput: [testid('remora-hub-url'), role('textbox', { name: /hub url|ハブの ?URL/i })],
+  pairStart: [testid('remora-pair-start'), role('button', { name: /^(start pairing|re-?pair)|ペアリング/i })],
+  pairCode: [testid('remora-pair-code'), css('.rmr-code')],
+  hubConnected: [css('[data-testid="remora-hub-status"][data-state="connected"]'), text('Connected')],
+  // Permissions tab: the DSH-side ceiling ("Can request" is what task.start needs).
+  ceilingRequest: [testid('remora-ceiling-request'), css('button[role="radio"][data-level="request"]')],
+  // Scope tab: the workspace allow list (Switch per workspace).
+  scopeSwitches: [css('[role="switch"]')],
 }
 
-/** Hub pages (hub/src/ui.ts). */
+/** Hub pages (hub/src/ui/routes.ts, hub/src/pair.ts), Japanese UI. */
 export const hub = {
-  setupTokenInput: [testid('hub-setup-token'), role('textbox', { name: /setup token|セットアップ/i })],
-  registerPasskey: [testid('hub-register-passkey'), role('button', { name: /(register|create).*passkey|passkey.*(register|create)|パスキー.*(登録|作成)/i })],
-  signInPasskey: [testid('hub-sign-in'), role('button', { name: /sign in|ログイン|サインイン/i })],
-  signedIn: [testid('hub-signed-in'), role('button', { name: /sign out|ログアウト|サインアウト/i })],
-  recoveryCodes: [testid('hub-recovery-codes')],
-  recoveryAcknowledge: [testid('hub-recovery-ack'), role('button', { name: /saved|continue|done|保存しました|続ける/i })],
+  setupTokenInput: [testid('hub-setup-token'), css('form[data-setup] input[name="setupToken"]')],
+  setupLabelInput: [testid('hub-setup-label'), css('form[data-setup] input[name="label"]')],
+  registerPasskey: [testid('hub-register-passkey'), css('form[data-setup] button[type="submit"]')],
+  setupStatus: [css('form[data-setup] [data-status]')],
+  recoveryCodes: [testid('hub-recovery-codes'), css('[data-recovery-codes]')],
+  recoveryAcknowledge: [testid('hub-recovery-ack'), css('[data-after-setup] a.button.primary')],
+  /** The signed-in navigation (absent on the narrow setup and login pages). */
+  signedIn: [css('[data-testid="hub-signed-in"] a[href="/settings"]'), css('nav.nav a[href="/settings"]')],
+  loginButton: [css('button[data-login]')],
   /** /pair?code=XXXX-XXXX */
-  pairCode: [testid('hub-pair-code')],
-  pairApprove: [testid('hub-pair-approve'), role('button', { name: /approve|承認/i })],
-  pairApproved: [testid('hub-pair-approved'), text(/paired|approved|承認しました|ペアリングしました/i, { exact: false })],
-  /** Personal tokens page (path in HUB_PATHS.tokens). */
-  tokenName: [testid('hub-token-name'), role('textbox', { name: /name|名前/i })],
-  tokenScopeRequest: [testid('hub-token-scope-tasks'), role('checkbox', { name: /dsh\.tasks|request/i })],
-  tokenCreate: [testid('hub-token-create'), role('button', { name: /create token|new token|issue|発行|作成/i })],
-  tokenValue: [testid('hub-token-value')],
+  pairCode: [testid('hub-pair-code'), css('strong.code')],
+  pairApprove: [testid('hub-pair-approve'), css('button[name="decision"][value="approve"]')],
+  pairApproved: [testid('hub-pair-approved'), text(/追加しました|承認しました|paired|approved/i, { exact: false })],
+  /** Personal tokens on /settings#tokens. */
+  tokenForm: [css('form[action="/settings/tokens"]')],
+  tokenName: [testid('hub-token-name'), css('input[name="name"]')],
+  tokenScope: scope => form => form.locator(`input[name="scope"][value="${scope}"]`),
+  tokenCreate: [testid('hub-token-create'), css('button[type="submit"]')],
+  tokenValue: [testid('hub-secret'), css('pre#secret')],
+  /** /connections: one card per client, a level <select> per host. */
+  clientCard: name => scope => scope.locator('article.card').filter({ hasText: name }),
+  grantSelect: [testid('hub-grant-level'), css('select[name="level"]')],
   /** OAuth consent at /oauth/authorize. */
   consentApprove: [testid('hub-consent-approve'), role('button', { name: /^(allow|approve|authorize)|許可|承認/i })],
 }
 
 export const HUB_PATHS = {
   home: '/',
-  setup: '/setup',
-  tokens: '/tokens',
+  setup: '/',
+  tokens: '/settings#tokens',
+  connections: '/connections',
 }
