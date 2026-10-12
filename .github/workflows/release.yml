@@ -259,4 +259,11 @@ jobs:
         run: |
           flags=""
           [ "$PRERELEASE" = "true" ] && flags="--prerelease"
-          gh release create "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Remora ${VERSION}" --notes-file notes.md $flags
+          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # The release was created by hand (e.g. "Draft a new release" on GitHub, which also creates the tag):
+            # attach the built assets and the generated notes to it instead of failing.
+            gh release upload "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "v${VERSION}" --repo "$GITHUB_REPOSITORY" --title "Remora ${VERSION}" --notes-file notes.md $flags
+          else
+            gh release create "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Remora ${VERSION}" --notes-file notes.md $flags
+          fi
