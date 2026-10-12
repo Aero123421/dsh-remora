@@ -2,7 +2,24 @@
 
 Remora のハブです。自分の Cloudflare アカウントの無料枠で動かし、DSH ホストと ChatGPT・Claude・CLI・HTTP API の間を中継します。会話の本文は保存しません。
 
-> まだ準備中の版です。今はトップページ、ホスト用 WebSocket の入口（ハンドシェイクの骨組み）、Durable Object の土台だけが動きます。パスキー、OAuth、MCP は次の版で追加します。
+> まだ実機（DSH・ChatGPT・Claude）との結合テスト前の版です。
+
+## できること
+
+- オーナーのログインはパスキーだけ。初回は `SETUP_TOKEN` で最初のパスキーを登録し、以後 `SETUP_TOKEN` は使えません。リカバリーコード 10 個（ハッシュで保存、1 回ずつ）。重要な操作の前にはパスキーで再確認します。
+- DSH ホストのペアリング（確認コードまたは QR）。接続のたびに Ed25519 の署名チャレンジ。同じ鍵の同時接続は古い方を切って記録します。
+- OAuth 2.1（`@cloudflare/workers-oauth-provider`）。MCP（`/mcp`）と HTTP API（`/api/v1/ops/*`）は別の audience。CIMD 対応、既知のクライアント（ChatGPT、Claude、Claude Code、Remora CLI）だけを既定で許可。DCR は既定オフ。CLI はループバック＋PKCE とデバイスコード（`/device`）。
+- MCP はセッションを持たない作り（MCP 2026-07-28 と、`initialize` を使う 2025 年版の両方に対応）。
+- HTTP API は OAuth のトークンか、ハブで発行する個人トークン（期限とスコープ付き）。
+- タスク台帳（冪等キー、オフライン中は保留して再接続時に配送）、要対応のキャッシュ、内容を残さないハッシュ連鎖の監査ログ、無料枠メーター。
+
+## 設定（シークレットと環境変数）
+
+| 名前 | 必須 | 意味 |
+| --- | --- | --- |
+| `SETUP_TOKEN` | はい | 最初のパスキー登録だけに使う 16 文字以上の合言葉 |
+| `ENABLE_DCR` | いいえ | `true` で動的クライアント登録を有効化（回数制限つき） |
+| `HUB_ORIGIN` | いいえ | 複数のホスト名で公開するときの正式なオリジン |
 
 ## デプロイ
 
@@ -27,7 +44,9 @@ npm ci
 cp .dev.vars.example .dev.vars   # SETUP_TOKEN を入れる
 npm run dev                      # http://127.0.0.1:8787
 npm run typecheck
-npm test
+npm test                         # node:test（純粋なモジュール）＋ vitest-pool-workers（結合テスト）
 ```
+
+結合テストは workerd の中でハブを動かし、ソフトウェアのパスキーと Ed25519 の偽ホストで、ペアリング、ハンドシェイク、中継、タスクの冪等性と保留、MCP、OAuth（認可コード＋PKCE、デバイスコード、CIMD の許可リスト）、権限の拒否、画面を確かめます。
 
 `src/vendor/protocol/` はリポジトリ直下の `packages/protocol/src` のコピーです。ここは直接編集せず、リポジトリ直下で `pnpm vendor:sync` を実行してください。
