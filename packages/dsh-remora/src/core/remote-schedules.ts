@@ -7,8 +7,6 @@
 import type { RemoteScheduleRecord, RemoteScheduleStore } from '../ops/types.ts'
 import { asObject, type DocumentSpec, type JsonDocument } from './storage.ts'
 
-const LIMIT = 500
-
 export interface RemoteSchedulesDocument { schedules: RemoteScheduleRecord[] }
 
 function parseRecord(value: unknown, index: number): RemoteScheduleRecord {
@@ -47,7 +45,8 @@ export class FileRemoteScheduleStore implements RemoteScheduleStore {
   }
 
   async put(record: RemoteScheduleRecord): Promise<void> {
-    await this.document.update(current => ({ schedules: [...current.schedules.filter(item => item.scheduleId !== record.scheduleId), { ...record }].slice(-LIMIT) }))
+    // Never trimmed by age: records go when their schedule leaves DSH's catalogue (the adapter prunes them).
+    await this.document.update(current => ({ schedules: [...current.schedules.filter(item => item.scheduleId !== record.scheduleId), { ...record }] }))
   }
 
   async remove(scheduleIds: readonly string[]): Promise<void> {

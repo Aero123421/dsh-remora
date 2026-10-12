@@ -214,7 +214,7 @@ const confirmPath = (hostId: string, confirmationId: string) => `/confirm/${host
 /** One request a client parked for the owner's passkey. */
 function confirmationRow(item: PendingConfirmation, hostId: string, hostName: string): Raw {
   return h`<li class="inbox-item kind-confirmation" data-expiring data-testid="hub-confirmation-item">
-  <div class="row"><span class="badge danger">${ATTENTION_LABEL.confirmation}</span> <a href="${confirmPath(hostId, item.confirmationId)}">${CONFIRM_LABEL[item.operation] ?? item.operation}</a> <span class="muted">${item.clientName} から</span></div>
+  <div class="row"><span class="badge danger">${ATTENTION_LABEL.confirmation}</span> <a href="${confirmPath(hostId, item.confirmationId)}">${CONFIRM_LABEL[item.operation] ?? item.operation}</a> <span class="muted">${visibleText(item.clientName).text} から</span></div>
   <div class="row"><code class="untrusted">${visibleText(item.what).text}</code></div>
   <div class="row muted">${hostName ? h`<span>${hostName}</span>` : ''} ${countdown(item.expiresAt)} <span>${relativeTime(item.createdAt)}</span>
   <a class="button small primary" href="${confirmPath(hostId, item.confirmationId)}">確認する</a></div>

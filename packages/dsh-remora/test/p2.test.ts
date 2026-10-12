@@ -130,6 +130,11 @@ test('schedules: create like a prompt (scope, trust, idempotency), list with pro
   // A bounded number of remote schedules, and the kill switch / unpairing takes them all away.
   for (let i = 0; i < 19; i++) await handlers['schedule.create']({ ...params, idempotencyKey: `bulk-${i}`, when: { everySeconds: 3600 } }, context())
   assert.equal(await code(handlers['schedule.create']({ ...params, idempotencyKey: 'one-too-many', when: { everySeconds: 3600 } }, context())), 'conflict')
+  // A delete DSH refuses (another session) does not drop Remora's record of it.
+  const k2 = listed.schedules.find(s => s.rule === 'every 1 h')!.scheduleId
+  dsh.addSession('s2', { workspace: 'ws-a' })
+  assert.deepEqual(await handlers['schedule.delete']({ sessionId: 's2', scheduleId: k2 }, context()), { deleted: false })
+  assert.equal((await handlers['schedules.list']({}, context())).schedules.find(s => s.scheduleId === k2)?.createdBy, 'Test')
   const before = dsh.scheduleRows.length
   assert.equal(await adapter.removeRemoteSchedules(), 20)
   assert.equal(dsh.scheduleRows.length, before - 20)

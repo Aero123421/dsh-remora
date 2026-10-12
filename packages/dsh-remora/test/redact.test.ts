@@ -73,4 +73,7 @@ test('a tail cut out of longer output loses its first, partial line before redac
   assert.equal(dropPartialHead('abcdefghijklmnopqrstuvwx1234 now\nnext line\n'), 'next line\n')
   assert.equal(dropPartialHead('x'.repeat(5000)), `…${'x'.repeat(4744)}`)
   assert.equal(dropPartialHead('short'), '')
+  const tail = dropPartialHead('AAAAAAAA\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASC\nqhkiG9w0BAQEFAAS\n-----END PRIVATE KEY-----\nok')
+  assert.equal(redact(tail), `${MASK}\n-----END PRIVATE KEY-----\nok`)
+  assert.equal(redact(redact(tail)), redact(tail))
 })

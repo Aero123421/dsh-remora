@@ -108,6 +108,8 @@ function scheduleError(error: unknown, fallback: string): OperationError {
 }
 
 export function createSchedules(rt: Runtime) {
+  /** Creates run one at a time, so the cap cannot be passed by concurrent calls. */
+  let creating: Promise<unknown> = Promise.resolve()
   /** `<clientId>\0<key>` → schedule id and when it was created. */
   const created = new Map<string, { scheduleId: string; sessionId: string; at: number }>()
   const remote = rt.deps.remoteSchedules ?? memorySchedules()
@@ -127,6 +129,40 @@ export function createSchedules(rt: Runtime) {
     }
   }
 
+  async function create(params: Params<'schedule.create'>, context: OperationContext): Promise<Result<'schedule.create'>> {
+    const row = await rt.row(params.sessionId, context.signal)
+    if (row.subagent) throw invalid(`session ${row.sessionId} is a subagent session`)
+    if (row.archived) throw new OperationError('conflict', `session ${row.sessionId} is archived`)
+    // A schedule starts turns later, so it obeys the same rule as a prompt now.
+    rt.assertCanDriveTurns(row.workspace?.id ?? null)
+    const now = Date.now()
+    for (const [key, entry] of created) if (now - entry.at > IDEMPOTENCY_MS) created.delete(key)
+    const key = `${context.actor.clientId}\u0000${params.idempotencyKey}`
+    const earlier = created.get(key)
+    if (earlier) {
+      const existing = (await catalog()).find(entry => entry.id === earlier.scheduleId)
+      if (existing) return { schedule: scheduleInfo(existing, hasContent(context), createdBy(existing.id)) }
+    }
+    // Remote schedules outlive the call that made them: keep their number bounded.
+    const catalogue = await catalog()
+    const known = new Set(catalogue.map(entry => entry.id))
+    await remote.remove(remote.list().filter(record => !known.has(record.scheduleId)).map(record => record.scheduleId))
+    const live = new Set(catalogue.filter(entry => entry.status === 'active').map(entry => entry.id))
+    if (remote.list().filter(record => live.has(record.scheduleId)).length >= REMOTE_SCHEDULES_MAX) {
+      throw new OperationError('conflict', `${REMOTE_SCHEDULES_MAX} scheduled prompts created through Remora are already active on this host; delete some first`)
+    }
+    const request = createRequest(params.title.trim(), params.prompt, params.when)
+    let record
+    try {
+      record = await service().create(row.sessionId, request, context.signal)
+    } catch (error) {
+      throw scheduleError(error, 'creating the automation task failed')
+    }
+    created.set(key, { scheduleId: record.id, sessionId: row.sessionId, at: now })
+    await remote.put({ scheduleId: record.id, sessionId: row.sessionId, clientId: context.actor.clientId, clientName: context.actor.clientName, createdAt: now })
+    return { schedule: scheduleInfo({ ...record, sessionId: row.sessionId, status: 'active' }, hasContent(context), context.actor.clientName) }
+  }
+
   return {
     async 'schedules.list'(params: Params<'schedules.list'>, context: OperationContext): Promise<Result<'schedules.list'>> {
       if (params.sessionId !== undefined) await rt.row(params.sessionId, context.signal)
@@ -138,36 +174,10 @@ export function createSchedules(rt: Runtime) {
       return { schedules }
     },
 
-    async 'schedule.create'(params: Params<'schedule.create'>, context: OperationContext): Promise<Result<'schedule.create'>> {
-      const row = await rt.row(params.sessionId, context.signal)
-      if (row.subagent) throw invalid(`session ${row.sessionId} is a subagent session`)
-      if (row.archived) throw new OperationError('conflict', `session ${row.sessionId} is archived`)
-      // A schedule starts turns later, so it obeys the same rule as a prompt now.
-      rt.assertCanDriveTurns(row.workspace?.id ?? null)
-      const now = Date.now()
-      for (const [key, entry] of created) if (now - entry.at > IDEMPOTENCY_MS) created.delete(key)
-      const key = `${context.actor.clientId}\u0000${params.idempotencyKey}`
-      const earlier = created.get(key)
-      if (earlier) {
-        const existing = (await catalog()).find(entry => entry.id === earlier.scheduleId)
-        if (existing) return { schedule: scheduleInfo(existing, hasContent(context), createdBy(existing.id)) }
-      }
-      // Remote schedules outlive the call that made them: keep their number bounded.
-      const catalogue = await catalog()
-      const live = new Set(catalogue.filter(entry => entry.status === 'active').map(entry => entry.id))
-      if (remote.list().filter(record => live.has(record.scheduleId)).length >= REMOTE_SCHEDULES_MAX) {
-        throw new OperationError('conflict', `${REMOTE_SCHEDULES_MAX} scheduled prompts created through Remora are already active on this host; delete some first`)
-      }
-      const request = createRequest(params.title.trim(), params.prompt, params.when)
-      let record
-      try {
-        record = await service().create(row.sessionId, request, context.signal)
-      } catch (error) {
-        throw scheduleError(error, 'creating the automation task failed')
-      }
-      created.set(key, { scheduleId: record.id, sessionId: row.sessionId, at: now })
-      await remote.put({ scheduleId: record.id, sessionId: row.sessionId, clientId: context.actor.clientId, clientName: context.actor.clientName, createdAt: now })
-      return { schedule: scheduleInfo({ ...record, sessionId: row.sessionId, status: 'active' }, hasContent(context), context.actor.clientName) }
+    'schedule.create'(params: Params<'schedule.create'>, context: OperationContext): Promise<Result<'schedule.create'>> {
+      const run = creating.then(() => create(params, context))
+      creating = run.catch(() => undefined)
+      return run
     },
 
     async 'schedule.delete'(params: Params<'schedule.delete'>, context: OperationContext): Promise<Result<'schedule.delete'>> {
@@ -178,7 +188,8 @@ export function createSchedules(rt: Runtime) {
       } catch (error) {
         throw scheduleError(error, 'deleting the automation task failed')
       }
-      await remote.remove([params.scheduleId])
+      // Forget it only once it is really gone (DSH fences deletes by session).
+      if (outcome.deleted || !(await catalog()).some(entry => entry.id === params.scheduleId)) await remote.remove([params.scheduleId])
       return { deleted: outcome.deleted }
     },
 
@@ -187,16 +198,19 @@ export function createSchedules(rt: Runtime) {
       const records = remote.list()
       if (records.length === 0) return 0
       const schedule = rt.get<DshSchedule>(SERVICES.schedule)
-      let removed = 0
+      if (!schedule) return 0
+      const gone: string[] = []
       for (const record of records) {
         try {
-          if ((await schedule?.delete({ sessionId: record.sessionId, id: record.scheduleId }, AbortSignal.timeout(10_000)))?.deleted) removed++
+          if ((await schedule.delete({ sessionId: record.sessionId, id: record.scheduleId }, AbortSignal.timeout(10_000))).deleted) gone.push(record.scheduleId)
         } catch {
-          // already gone, or the session went away
+          // kept: tried again next time
         }
       }
-      await remote.remove(records.map(record => record.scheduleId))
-      return removed
+      // Records whose schedule left the catalogue (delivered one-shots, deleted on DSH) go too.
+      const left = new Set((await catalog().catch(() => [] as DshScheduleCatalogEntry[])).map(entry => entry.id))
+      await remote.remove([...gone, ...records.filter(record => !left.has(record.scheduleId)).map(record => record.scheduleId)])
+      return gone.length
     },
   }
 }

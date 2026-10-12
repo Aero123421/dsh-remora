@@ -21,6 +21,11 @@ const RULES: readonly Rule[] = [
     pattern: /-----BEGIN ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----[\s\S]*?(?:-----END \1-----|$)/g,
     replace: (_m, kind) => `-----BEGIN ${kind}-----\n${MASK}\n-----END ${kind}-----`,
   },
+  // The tail of one whose head was cut off (output tails): everything up to its END line.
+  {
+    pattern: /^(?:(?!-----BEGIN )[\s\S])*?-----END ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----/,
+    replace: (_m, kind) => `${MASK}\n-----END ${kind}-----`,
+  },
   // Authorization headers and bearer tokens.
   {
     pattern: /\b(Authorization\s*[:=]\s*["']?(?:Bearer|Basic|Token|Bot)\s+)[^\s"',;]+/gi,
