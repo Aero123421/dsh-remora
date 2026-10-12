@@ -1,3 +1,7 @@
 # One-time secret for registering the first passkey. Pick a long random value;
 # it stops working as soon as the first passkey is registered.
 SETUP_TOKEN=
+# Optional: turn on RFC 7591 dynamic client registration (off by default, rate-limited when on).
+# ENABLE_DCR=true
+# Optional: the hub's canonical origin when it is reachable under several hostnames.
+# HUB_ORIGIN=https://remora.example.com
