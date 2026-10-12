@@ -28,7 +28,8 @@ export async function launchChromium({ headed = false } = {}) {
   if (!executablePath) throw new Error(`no Chromium found (tried ${candidates.join(', ')}); run \`npx --prefix e2e playwright install chromium\` or set REMORA_E2E_CHROMIUM`)
   // Only local servers are involved; never route them through an HTTP(S)_PROXY
   // from the environment (a proxy would see non-loopback test traffic).
-  const browser = await chromium.launch({ headless: !headed, executablePath, args: ['--no-proxy-server'] })
+  // The harness owns signal handling (it also stops DSH, the hub and the mock).
+  const browser = await chromium.launch({ headless: !headed, executablePath, args: ['--no-proxy-server'], handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false })
   return { browser, executablePath }
 }
 

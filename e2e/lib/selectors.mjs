@@ -4,9 +4,9 @@
 // browser context is created with locale en-US).
 //
 // Remora and hub selectors prefer `data-testid` hooks — the contract proposed
-// to the plugin and hub streams (see docs/e2e.md, "Test hooks") — and fall
-// back to accessible names, so the harness works before and after the hooks
-// land. Each entry is a function (page|locator) => Locator; `firstPresent`
+// to the plugin and hub streams (see docs/e2e.md, "テスト用フック") — and fall
+// back to accessible names in English or Japanese, so the harness works
+// before and after the hooks land. Each entry is a function (page|locator) => Locator; `firstPresent`
 // in lib/browser.mjs tries alternatives in order.
 
 const css = selector => scope => scope.locator(selector)
@@ -44,32 +44,32 @@ export const remora = {
   hubConnected: [css('[data-testid="remora-hub-status"][data-state="connected"]'), text('Connected')],
   loadFailed: css('[role="alert"]'),
   // Pairing (planned; P0 scaffold has none of these yet).
-  hubUrlInput: [testid('remora-hub-url'), role('textbox', { name: /hub url/i })],
-  pairStart: [testid('remora-pair-start'), role('button', { name: /^(pair|connect)/i })],
+  hubUrlInput: [testid('remora-hub-url'), role('textbox', { name: /hub url|ハブの? ?URL/i })],
+  pairStart: [testid('remora-pair-start'), role('button', { name: /^(pair|connect)|ペアリング|接続/i })],
   pairCode: [testid('remora-pair-code'), text(/^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/, { exact: false })],
   /** DSH-side ceiling for remote access ("Can request" is what task.start needs). */
-  ceilingRequest: [testid('remora-ceiling-request'), role('radio', { name: /request/i }), role('option', { name: /request/i })],
+  ceilingRequest: [testid('remora-ceiling-request'), role('radio', { name: /request|依頼/i }), role('option', { name: /request|依頼/i })],
 }
 
 /** Hub pages (hub/src/ui.ts). */
 export const hub = {
-  setupTokenInput: [testid('hub-setup-token'), role('textbox', { name: /setup token/i })],
-  registerPasskey: [testid('hub-register-passkey'), role('button', { name: /(register|create).*passkey|passkey.*(register|create)/i })],
-  signInPasskey: [testid('hub-sign-in'), role('button', { name: /sign in/i })],
-  signedIn: [testid('hub-signed-in'), role('button', { name: /sign out/i })],
+  setupTokenInput: [testid('hub-setup-token'), role('textbox', { name: /setup token|セットアップ/i })],
+  registerPasskey: [testid('hub-register-passkey'), role('button', { name: /(register|create).*passkey|passkey.*(register|create)|パスキー.*(登録|作成)/i })],
+  signInPasskey: [testid('hub-sign-in'), role('button', { name: /sign in|ログイン|サインイン/i })],
+  signedIn: [testid('hub-signed-in'), role('button', { name: /sign out|ログアウト|サインアウト/i })],
   recoveryCodes: [testid('hub-recovery-codes')],
-  recoveryAcknowledge: [testid('hub-recovery-ack'), role('button', { name: /saved|continue|done/i })],
+  recoveryAcknowledge: [testid('hub-recovery-ack'), role('button', { name: /saved|continue|done|保存しました|続ける/i })],
   /** /pair?code=XXXX-XXXX */
   pairCode: [testid('hub-pair-code')],
-  pairApprove: [testid('hub-pair-approve'), role('button', { name: /approve/i })],
-  pairApproved: [testid('hub-pair-approved'), text(/paired|approved/i, { exact: false })],
+  pairApprove: [testid('hub-pair-approve'), role('button', { name: /approve|承認/i })],
+  pairApproved: [testid('hub-pair-approved'), text(/paired|approved|承認しました|ペアリングしました/i, { exact: false })],
   /** Personal tokens page (path in HUB_PATHS.tokens). */
-  tokenName: [testid('hub-token-name'), role('textbox', { name: /name/i })],
+  tokenName: [testid('hub-token-name'), role('textbox', { name: /name|名前/i })],
   tokenScopeRequest: [testid('hub-token-scope-tasks'), role('checkbox', { name: /dsh\.tasks|request/i })],
-  tokenCreate: [testid('hub-token-create'), role('button', { name: /create token|new token|issue/i })],
+  tokenCreate: [testid('hub-token-create'), role('button', { name: /create token|new token|issue|発行|作成/i })],
   tokenValue: [testid('hub-token-value')],
   /** OAuth consent at /oauth/authorize. */
-  consentApprove: [testid('hub-consent-approve'), role('button', { name: /^(allow|approve|authorize)/i })],
+  consentApprove: [testid('hub-consent-approve'), role('button', { name: /^(allow|approve|authorize)|許可|承認/i })],
 }
 
 export const HUB_PATHS = {

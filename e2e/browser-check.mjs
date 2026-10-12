@@ -29,6 +29,11 @@ export async function openSettings(page) {
 
 /** Open the Remora tab and wait until it rendered the plugin state. */
 export async function openRemoraTab(page) {
+  const open = await firstPresent(page, REMORA.section, 300)
+  if (open) {
+    const killSwitch = await mustBePresent(open, REMORA.killSwitch, 'the kill switch button')
+    return { section: open, killSwitch, response: null }
+  }
   const nav = await mustBePresent(page, DSH.settingsNavRemora, '"Remora" in the settings left nav')
   const state = page.waitForResponse(response => /\/api\/remora\/state$/.test(response.url()), { timeout: 15_000 }).catch(() => null)
   await nav.click()

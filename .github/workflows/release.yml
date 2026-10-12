@@ -1,0 +1,262 @@
+# Release: push a tag v<version> (the same version in packages/dsh-remora,
+# packages/cli and hub/) and this workflow
+#   1. checks versions, types, tests and the hub bundle,
+#   2. runs the E2E browser check against the pinned DSH,
+#   3. packs the plugin tarball and builds the CLI on native runners,
+#   4. publishes one GitHub Release with every asset, a single SHA256SUMS
+#      and build provenance attestations.
+# Nothing is published to npm and nothing is deployed to Cloudflare.
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Versions and checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - name: Tag matches every package version
+        id: version
+        run: node scripts/check-version.mjs --tag "$GITHUB_REF_NAME"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - name: hub/ has the current protocol copy
+        run: pnpm vendor:check
+      - name: Hub checks and bundle (no deploy)
+        working-directory: hub
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm test
+          npx wrangler deploy --dry-run --outdir dist
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+
+  e2e:
+    name: E2E against real DSH
+    needs: verify
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e.yml
+    with:
+      only: browser
+      strict: false
+
+  plugin:
+    name: Plugin tarball
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm pack:plugin
+      - name: Tarball is named after the release version
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          test -f "artifacts/dsh-remora-${VERSION}.tgz" || { echo "::error::artifacts/dsh-remora-${VERSION}.tgz was not produced"; ls -la artifacts; exit 1; }
+          mkdir -p release
+          cp "artifacts/dsh-remora-${VERSION}.tgz" release/
+          # The packed manifest must stay install-safe: no scripts, no runtime dependencies.
+          tar -xzOf "release/dsh-remora-${VERSION}.tgz" package/package.json | node -e '
+            const pkg = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            const bad = ["scripts", "dependencies", "devDependencies"].filter(key => pkg[key] && Object.keys(pkg[key]).length);
+            if (bad.length) { console.error(`::error::packed package.json has ${bad.join(", ")}`); process.exit(1) }'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-plugin
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+
+  cli:
+    name: CLI ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: linux-x64, runner: ubuntu-24.04 }
+          - { target: linux-arm64, runner: ubuntu-24.04-arm }
+          - { target: darwin-x64, runner: macos-15-intel }
+          - { target: darwin-arm64, runner: macos-15 }
+          - { target: win32-x64, runner: windows-2025 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Build the standalone binary (Node SEA, native runner)
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          script=packages/cli/scripts/build-binaries.mjs
+          if [ ! -f "$script" ]; then
+            echo "::error file=$script::$script is missing. The CLI release build lives there (it writes artifacts/cli/remora-<os>-<arch>[.exe]); merge the CLI stream before tagging."
+            exit 1
+          fi
+          node "$script" --out-dir artifacts/cli
+          ext=""; [ "$TARGET" = "win32-x64" ] && ext=".exe"
+          binary="artifacts/cli/remora-${TARGET}${ext}"
+          if [ ! -f "$binary" ]; then
+            echo "::error::$script did not produce $binary (runner is $(node -p 'process.platform + "-" + process.arch'))"
+            ls -la artifacts/cli || true
+            exit 1
+          fi
+      - name: Binary reports the release version
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          ext=""; [ "$TARGET" = "win32-x64" ] && ext=".exe"
+          out="$("./artifacts/cli/remora-${TARGET}${ext}" --version)"
+          echo "$out"
+          case "$out" in *"$VERSION"*) ;; *) echo "::error::remora --version printed '$out', expected $VERSION"; exit 1 ;; esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-cli-${{ matrix.target }}
+          path: artifacts/cli/remora-${{ matrix.target }}*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: GitHub Release
+    needs: [verify, e2e, plugin, cli]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write       # create the release and upload assets
+      id-token: write       # OIDC token for the provenance attestation
+      attestations: write   # store the attestation
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Add the install scripts
+        run: |
+          for script in scripts/install.sh scripts/install.ps1; do
+            if [ ! -f "$script" ]; then echo "::error file=$script::$script is missing; the release page links to it"; exit 1; fi
+            cp "$script" dist/
+          done
+      - name: One SHA256SUMS for every asset
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          expected="dsh-remora-${VERSION}.tgz install.ps1 install.sh remora-darwin-arm64 remora-darwin-x64 remora-linux-arm64 remora-linux-x64 remora-win32-x64.exe"
+          for asset in $expected; do test -f "$asset" || { echo "::error::missing release asset $asset"; ls -la; exit 1; }; done
+          rm -f SHA256SUMS
+          sha256sum $expected > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/dsh-remora-*.tgz
+            dist/remora-*
+            dist/install.sh
+            dist/install.ps1
+            dist/SHA256SUMS
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          tag="v${VERSION}"
+          previous="$(git describe --tags --abbrev=0 --match 'v*' "${tag}^" 2>/dev/null || true)"
+          range="${previous:+${previous}..}${tag}"
+          {
+            echo "Remora ${VERSION} — unofficial, self-hosted remote control for DSH (DeepSeek Harness)."
+            echo
+            echo "## Install"
+            echo
+            echo "**DSH plugin**: in DSH Web open Plugins → Add plugin and paste"
+            echo "\`https://github.com/${REPO}/releases/download/${tag}/dsh-remora-${VERSION}.tgz\`,"
+            echo "or run \`dsh plugin --profile web add https://github.com/${REPO}/releases/download/${tag}/dsh-remora-${VERSION}.tgz\`."
+            echo
+            echo "**CLI**:"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://github.com/${REPO}/releases/download/${tag}/install.sh | sh -s -- --version ${tag}"
+            echo '```'
+            echo
+            echo '```powershell'
+            echo "& ([scriptblock]::Create((irm https://github.com/${REPO}/releases/download/${tag}/install.ps1))) -Version ${tag}"
+            echo '```'
+            echo
+            echo "**Hub**: update your Cloudflare deployment through the upstream-sync pull request in your hub repository (or redeploy \`hub/\`)."
+            echo
+            echo "## Verify"
+            echo
+            echo '```sh'
+            echo "sha256sum -c SHA256SUMS --ignore-missing"
+            echo "gh attestation verify dsh-remora-${VERSION}.tgz --repo ${REPO}"
+            echo '```'
+            echo
+            echo "## Changes"
+            echo
+            git log --no-merges --format='- %s (%h)' "$range"
+          } > notes.md
+          cat notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          flags=""
+          [ "$PRERELEASE" = "true" ] && flags="--prerelease"
+          gh release create "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Remora ${VERSION}" --notes-file notes.md $flags

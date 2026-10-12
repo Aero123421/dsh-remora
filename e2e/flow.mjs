@@ -42,15 +42,17 @@ async function ensureRemoraTab(page) {
   return openRemoraTab(page)
 }
 
-export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, world, mock, dshSession, log }) {
-  const state = { setupToken: `e2e-${randomUUID()}` }
+export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl, setupToken, world, mock, dshSession, log }) {
+  const state = { setupToken: setupToken ?? `e2e-${randomUUID()}` }
   const failShot = (name, which = 'hub') => async () => {
     const page = which === 'hub' ? state.hubPage : dshSession?.page
     if (page) await shot(page, artifacts, `flow-FAILED-${name}`).catch(() => {})
   }
 
-  await r.step('hub.start', `Hub runs under wrangler dev on :${hubPort} with an empty state`, { timeoutMs: 360_000 }, async () => {
-    const started = await startHub({ hubDir, port: hubPort, stateDir: world.hubState, setupToken: state.setupToken, logFile: `${artifacts}/hub.log` })
+  await r.step('hub.start', hubUrl ? `Use the already running hub at ${hubUrl}` : `Hub runs under wrangler dev on :${hubPort} with an empty state`, { timeoutMs: 360_000 }, async () => {
+    const started = hubUrl
+      ? { origin: new URL(hubUrl).origin, health: await (await fetch(new URL('/healthz', hubUrl))).json() }
+      : await startHub({ hubDir, port: hubPort, stateDir: world.hubState, setupToken: state.setupToken, logFile: `${artifacts}/hub.log` })
     state.hub = started
     state.api = hubApi(started.origin)
     const unauth = await fetch(`${started.origin}/api/v1/ops/status`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
@@ -78,7 +80,9 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, world,
     }
     if (tokenInput) await tokenInput.fill(state.setupToken)
     await (register ?? await mustBePresent(page, HUB.registerPasskey, 'register passkey button')).click()
-    const ack = await firstPresent(page, HUB.recoveryAcknowledge, 8000)
+    // Recovery codes may be shown first; acknowledge them if they are.
+    const next = await firstPresent(page, [...HUB.signedIn, ...HUB.recoveryAcknowledge], 15_000)
+    const ack = next && !(await firstPresent(page, HUB.signedIn, 100)) ? next : null
     if (ack) {
       await shot(page, artifacts, 'flow-hub-recovery-codes')
       await ack.click()

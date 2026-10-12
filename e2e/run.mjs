@@ -2,8 +2,8 @@
 // Remora E2E harness. See docs/e2e.md.
 //
 //   node e2e/run.mjs [--only=browser|flow] [--strict] [--keep] [--headed]
-//                    [--dsh-version=<v>] [--fresh-dsh] [--plugin=<tgz>] [--no-pack]
-//                    [--no-remote]
+//                    [--dsh-version=<version|dist-tag|newest>] [--fresh-dsh] [--plugin=<tgz>] [--no-pack]
+//                    [--no-remote] [--hub-url=<url> --setup-token=<token>]
 //
 // Exit codes: 0 all good (skips allowed), 1 a step failed, 2 --strict and something was skipped.
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
@@ -36,11 +36,14 @@ const { values: args } = parseArgs({
     plugin: { type: 'string' },
     'no-pack': { type: 'boolean', default: false },
     'no-remote': { type: 'boolean', default: false },
+    'hub-url': { type: 'string' },
+    'setup-token': { type: 'string' },
     help: { type: 'boolean', short: 'h', default: false },
   },
 })
 if (args.help) {
-  console.log(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n').slice(1, 9).map(line => line.replace(/^\/\/ ?/, '')).join('\n'))
+  const header = readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n').slice(1)
+  console.log(header.slice(0, header.findIndex(line => !line.startsWith('//'))).map(line => line.replace(/^\/\/ ?/, '')).join('\n'))
   process.exit(0)
 }
 if (args.only && !['browser', 'flow'].includes(args.only)) {
@@ -103,11 +106,24 @@ await r.step('setup.plugin-tarball', 'The plugin tarball exists and matches SHA2
 })
 
 await r.step('setup.dsh-install', `@deepseek-ai/dsh@${dshVersion} installed from npm into an isolated directory`, { timeoutMs: 660_000 }, async () => {
-  const dir = args['dsh-dir'] ? resolve(args['dsh-dir']) : join(repo, '.cache', 'e2e', `dsh-${dshVersion}`)
-  ctx.dsh = await installDsh({ version: dshVersion, dir, fresh: args['fresh-dsh'], logFile: join(artifacts, 'dsh-install.log') })
-  const version = (await run('dsh --version', process.execPath, [ctx.dsh.bin, '--version'], { env: childEnv(), timeoutMs: 60_000 })).trim()
-  if (version !== dshVersion) throw new Error(`dsh --version printed ${version}`)
-  return `${ctx.dsh.bin} (dsh --version: ${version})`
+  let version = dshVersion
+  if (version === 'newest') {
+    // The highest published version, prereleases included (npm lists versions in semver order).
+    const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+    version = JSON.parse(await run('npm view dsh versions', npm, ['view', '@deepseek-ai/dsh', 'versions', '--json'], { env: childEnv(), timeoutMs: 60_000 })).at(-1)
+    r.log(`  newest @deepseek-ai/dsh is ${version}`)
+  } else if (!/^\d+\.\d+\.\d+/.test(version)) {
+    // An npm dist-tag such as "latest" or "next": resolve it to the exact version.
+    const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+    version = (await run('npm view dsh', npm, ['view', `@deepseek-ai/dsh@${dshVersion}`, 'version'], { env: childEnv(), timeoutMs: 60_000 })).trim().split('\n').pop().replace(/^.*'(.+)'$/, '$1')
+    r.log(`  @deepseek-ai/dsh@${dshVersion} is ${version}`)
+  }
+  const dir = args['dsh-dir'] ? resolve(args['dsh-dir']) : join(repo, '.cache', 'e2e', `dsh-${version}`)
+  ctx.dsh = await installDsh({ version, dir, fresh: args['fresh-dsh'], logFile: join(artifacts, 'dsh-install.log') })
+  const printed = (await run('dsh --version', process.execPath, [ctx.dsh.bin, '--version'], { env: childEnv(), timeoutMs: 60_000 })).trim()
+  if (printed !== version) throw new Error(`dsh --version printed ${printed}, expected ${version}`)
+  ctx.dshVersion = version
+  return `${ctx.dsh.bin} (dsh --version: ${printed})`
 })
 
 await r.step('setup.world', 'Isolated HOME / DSH_HOME / workspace in a temp dir', {}, async () => {
@@ -173,10 +189,12 @@ if (ctx.browser) {
   // --- flow ---------------------------------------------------------------------
   if (wantFlow) {
     const hubPort = PORTS.hub
-    if (!(await isFree(hubPort))) {
+    const hubUrl = args['hub-url'] ?? process.env.REMORA_E2E_HUB_URL
+    const setupToken = args['setup-token'] ?? process.env.REMORA_E2E_SETUP_TOKEN
+    if (!hubUrl && !(await isFree(hubPort))) {
       await r.step('hub.port', `port ${hubPort} is free for the hub`, {}, async () => { throw new Error(`port ${hubPort} is in use (another wrangler dev?)`) })
     } else {
-      ctx.flow = await flowSteps(r, { browser: ctx.browser, artifacts, hubDir: join(repo, 'hub'), hubPort, world: ctx.world, mock: ctx.mock, dshSession: browserOut.session, log: line => r.log(line) })
+      ctx.flow = await flowSteps(r, { browser: ctx.browser, artifacts, hubDir: join(repo, 'hub'), hubPort, hubUrl, setupToken, world: ctx.world, mock: ctx.mock, dshSession: browserOut.session, log: line => r.log(line) })
     }
   }
 
@@ -206,6 +224,6 @@ if (ctx.browser) {
   }
 }
 
-const code = r.finish({ dsh: dshVersion, plugin: pluginManifest.version, only: args.only ?? 'all' })
+const code = r.finish({ dsh: ctx.dshVersion ?? dshVersion, plugin: pluginManifest.version, only: args.only ?? 'all' })
 await cleanup()
 process.exit(code)
