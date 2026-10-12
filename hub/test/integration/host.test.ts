@@ -107,10 +107,14 @@ describe('pairing and the host connection', () => {
     await host.connect()
     await host.next('ready')
     const answers: Extract<HubFrame, { t: 'request' }>[] = []
+    const states = new Map<string, TaskInfo['state']>()
     host.respond = frame => {
       answers.push(frame)
-      if (frame.op === 'task.start') return { ok: true, result: { taskId: frame.taskId, hostId: host.hostId, sessionId: 'sess-1', state: 'accepted', createdAt: Date.now(), updatedAt: Date.now() } }
-      if (frame.op === 'task.get') return { ok: true, result: { taskId: frame.taskId, state: 'completed', result: { reply: 'done!' }, hasLiveClient: false } }
+      if (frame.op === 'task.start') {
+        states.set(frame.taskId!, 'accepted')
+        return { ok: true, result: { taskId: frame.taskId, hostId: host.hostId, sessionId: 'sess-1', state: 'accepted', createdAt: Date.now(), updatedAt: Date.now() } }
+      }
+      if (frame.op === 'task.get') return { ok: true, result: { taskId: frame.taskId, state: states.get(frame.taskId!), ...(states.get(frame.taskId!) === 'completed' ? { result: { reply: 'done!' } } : {}), hasLiveClient: false } }
       return { ok: true, result: {} }
     }
     const stub = hostObject(host.hostId)
@@ -138,6 +142,7 @@ describe('pairing and the host connection', () => {
     expect(taskOf(other).taskId).not.toBe(task.taskId)
 
     // State follows task events; task.wait returns early on completion and fetches the result.
+    states.set(task.taskId, 'running')
     host.sendEvent([{ kind: 'task', taskId: task.taskId, state: 'running', sessionId: 'sess-1', updatedAt: Date.now() }])
     await eventually(async () => {
       const got = await stub.execute(call('task.get', { taskId: task.taskId }))
@@ -146,6 +151,7 @@ describe('pairing and the host connection', () => {
     const started = Date.now()
     const waiting = stub.execute(call('task.wait', { taskId: task.taskId, timeoutMs: 10_000 }))
     await sleep(200)
+    states.set(task.taskId, 'completed')
     host.sendEvent([{ kind: 'task', taskId: task.taskId, state: 'completed', updatedAt: Date.now() }])
     const waited = await waiting
     expect(Date.now() - started).toBeLessThan(5000)

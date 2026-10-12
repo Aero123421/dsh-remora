@@ -81,19 +81,23 @@ async function readSse(body: ReadableStream<Uint8Array>, onData: (data: string, 
     else if (field === 'event') event = value
   }
   const reader = body.getReader()
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let nl: number
-    while ((nl = buffer.indexOf('\n')) !== -1) {
-      line(buffer.slice(0, nl))
-      buffer = buffer.slice(nl + 1)
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let nl: number
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        line(buffer.slice(0, nl))
+        buffer = buffer.slice(nl + 1)
+      }
     }
+    buffer += decoder.decode()
+    if (buffer) line(buffer)
+    dispatch()
+  } finally {
+    reader.releaseLock()
   }
-  buffer += decoder.decode()
-  if (buffer) line(buffer)
-  dispatch()
 }
 
 /** Sends JSON-RPC messages to the hub's MCP endpoint and collects what comes back. */
@@ -105,7 +109,11 @@ export class McpForwarder {
 
   async send(message: unknown, emit: (reply: unknown) => void): Promise<void> {
     const ids = requestIds(message)
-    const fail = (text: string) => { for (const id of ids) emit(rpcError(id, -32000, text)) }
+    const requested = new Set(ids)
+    const pending = new Set(ids)
+    const fail = (text: string) => {
+      for (const id of pending) { pending.delete(id); emit(rpcError(id, -32000, text)) }
+    }
     const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }
     if (this.protocolVersion) headers['mcp-protocol-version'] = this.protocolVersion
     if (this.sessionId) headers['mcp-session-id'] = this.sessionId
@@ -121,52 +129,64 @@ export class McpForwarder {
     const session = response.headers.get('mcp-session-id')
     if (session) this.sessionId = session
     const watch = (reply: unknown) => {
-      if (isInitialize(message)) {
-        const version = ((reply as Json | null)?.result as Json | undefined)?.protocolVersion
-        if (typeof version === 'string') this.protocolVersion = version
-      }
-      emit(reply)
-    }
-    if (!response.ok) {
-      let detail = ''
-      try {
-        const body = await response.json() as { jsonrpc?: unknown; error?: { message?: unknown } | string, error_description?: unknown }
-        // A JSON-RPC error with an HTTP status (e.g. 400 unsupported version) goes to the client as is.
-        if (body?.jsonrpc === '2.0' && ids.length > 0) { watch(body); return }
-        const e = body?.error
-        detail = typeof e === 'string' ? e : typeof e?.message === 'string' ? e.message : ''
-      } catch { /* not JSON */ }
-      fail(`Remora: ハブがエラーを返しました（HTTP ${response.status}${detail ? `: ${detail}` : ''}）${response.status === 401 ? '。remora login でログインし直してください' : ''}`)
-      return
-    }
-    const type = (response.headers.get('content-type') ?? '').toLowerCase()
-    if (response.status === 202 || response.status === 204 || !response.body) {
-      await response.body?.cancel().catch(() => {})
-      if (ids.length > 0) fail('Remora: ハブが応答を返しませんでした')
-      return
-    }
-    if (type.includes('text/event-stream')) {
-      const seen = new Set<string | number>()
-      await readSse(response.body, (data, event) => {
-        if (event !== 'message') return
-        let parsed: unknown
-        try { parsed = JSON.parse(data) } catch { return }
-        for (const item of Array.isArray(parsed) ? parsed : [parsed]) {
-          const id = (item as Json | null)?.id
-          if ((typeof id === 'string' || typeof id === 'number') && ((item as Json).result !== undefined || (item as Json).error !== undefined)) seen.add(id)
+      const items = (Array.isArray(reply) ? reply : [reply]).filter(item => {
+        const response = item as Json | null
+        const id = response?.id
+        if ((typeof id === 'string' || typeof id === 'number') && (response?.result !== undefined || response?.error !== undefined) && requested.has(id)) {
+          if (!pending.delete(id)) return false
+          if (isInitialize(message)) {
+            const version = (response?.result as Json | undefined)?.protocolVersion
+            if (typeof version === 'string') this.protocolVersion = version
+          }
         }
-        watch(parsed)
+        return true
       })
-      const missing = ids.filter(id => !seen.has(id))
-      for (const id of missing) emit(rpcError(id, -32000, 'Remora: ハブとの接続が応答の途中で切れました'))
-      return
+      if (items.length > 0) emit(Array.isArray(reply) ? items : items[0])
     }
-    const text = await response.text()
-    if (!text.trim()) { if (ids.length > 0) fail('Remora: ハブが空の応答を返しました'); return }
     try {
-      watch(JSON.parse(text))
+      if (!response.ok) {
+        let detail = ''
+        try {
+          const body = await response.json() as { jsonrpc?: unknown; error?: { message?: unknown } | string, error_description?: unknown }
+          // A JSON-RPC error with an HTTP status (e.g. 400 unsupported version) goes to the client as is.
+          if (body?.jsonrpc === '2.0' && ids.length > 0) { watch(body); fail('Remora: ハブが応答を返しませんでした'); return }
+          const e = body?.error
+          detail = typeof e === 'string' ? e : typeof e?.message === 'string' ? e.message : ''
+        } catch { /* not JSON */ }
+        fail(`Remora: ハブがエラーを返しました（HTTP ${response.status}${detail ? `: ${detail}` : ''}）${response.status === 401 ? '。remora login でログインし直してください' : ''}`)
+        return
+      }
+      const type = (response.headers.get('content-type') ?? '').toLowerCase()
+      if (response.status === 202 || response.status === 204 || !response.body) {
+        await response.body?.cancel().catch(() => {})
+        fail('Remora: ハブが応答を返しませんでした')
+        return
+      }
+      if (type.includes('text/event-stream')) {
+        await readSse(response.body, (data, event) => {
+          if (event !== 'message') return
+          let parsed: unknown
+          try { parsed = JSON.parse(data) } catch { return }
+          watch(parsed)
+        })
+        fail('Remora: ハブとの接続が応答の途中で切れました')
+        return
+      }
+      const text = await response.text()
+      if (!text.trim()) { fail('Remora: ハブが空の応答を返しました'); return }
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(text)
+      } catch {
+        fail('Remora: ハブの応答が JSON ではありません')
+        return
+      }
+      watch(parsed)
+      fail('Remora: ハブが応答を返しませんでした')
     } catch {
-      fail('Remora: ハブの応答が JSON ではありません')
+      // A response may fail after its headers, or after only part of a batch.
+      // Report only unanswered requests; notifications never get an error reply.
+      fail('Remora: ハブとの接続が応答の途中で切れました')
     }
   }
 }

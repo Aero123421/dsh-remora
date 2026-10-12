@@ -2,7 +2,7 @@
  * Durable list of the DSH schedules created through Remora
  * (`RemoteScheduleStore`): they keep starting turns after the call that made
  * them, so the kill switch and unpairing delete them, and the lists say who
- * made them. Holds ids and client names only, never prompts.
+ * made them. Holds ids, client names and retry identities, never prompts.
  */
 import type { RemoteScheduleRecord, RemoteScheduleStore } from '../ops/types.ts'
 import { asObject, type DocumentSpec, type JsonDocument } from './storage.ts'
@@ -12,12 +12,18 @@ export interface RemoteSchedulesDocument { schedules: RemoteScheduleRecord[] }
 function parseRecord(value: unknown, index: number): RemoteScheduleRecord {
   const raw = asObject(value, `schedules[${index}]`)
   if (typeof raw.scheduleId !== 'string' || typeof raw.sessionId !== 'string' || typeof raw.clientId !== 'string') throw new Error(`schedules[${index}] is invalid`)
+  if ((raw.idempotencyKey !== undefined || raw.requestHash !== undefined)
+    && (typeof raw.idempotencyKey !== 'string' || typeof raw.requestHash !== 'string' || !/^[a-f0-9]{64}$/.test(raw.requestHash))) {
+    throw new Error(`schedules[${index}] has an invalid retry identity`)
+  }
   return {
     scheduleId: raw.scheduleId,
     sessionId: raw.sessionId,
     clientId: raw.clientId,
     clientName: typeof raw.clientName === 'string' ? raw.clientName : raw.clientId,
     createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : 0,
+    ...(typeof raw.idempotencyKey === 'string' && typeof raw.requestHash === 'string' && /^[a-f0-9]{64}$/.test(raw.requestHash)
+      ? { idempotencyKey: raw.idempotencyKey, requestHash: raw.requestHash } : {}),
   }
 }
 
@@ -42,6 +48,10 @@ export class FileRemoteScheduleStore implements RemoteScheduleStore {
 
   list(): RemoteScheduleRecord[] {
     return this.document.value.schedules.map(record => ({ ...record }))
+  }
+
+  async refresh(): Promise<void> {
+    await this.document.refresh()
   }
 
   async put(record: RemoteScheduleRecord): Promise<void> {

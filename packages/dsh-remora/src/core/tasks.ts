@@ -30,6 +30,13 @@ export class FileTaskStore implements TaskStore {
     return [...this.index.values()]
   }
 
+  /** Load the ledger written by a previous connection owner before takeover. */
+  async refresh(): Promise<void> {
+    const current = await this.document.refresh()
+    this.index.clear()
+    for (const item of current.tasks) this.index.set(item.taskId, item)
+  }
+
   async put(record: TaskRecord): Promise<void> {
     const copy: TaskRecord = { ...record }
     await this.document.update(current => {

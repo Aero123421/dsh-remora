@@ -73,6 +73,7 @@ export class SettingsScopePolicy implements ScopePolicy {
   private readonly deps: ScopeDeps
   /** Placements whose stored realpath no longer resolves to itself are skipped. */
   private invalidPlacements = new Set<string>()
+  private roots: ForbiddenRoots | undefined
 
   constructor(deps: ScopeDeps) {
     this.deps = deps
@@ -82,16 +83,35 @@ export class SettingsScopePolicy implements ScopePolicy {
 
   /** Re-check placements against the filesystem (symlinks may have moved). */
   async revalidatePlacements(roots?: ForbiddenRoots): Promise<void> {
+    if (roots) this.roots = roots
     const invalid = new Set<string>()
     for (const placement of this.settings.scope.placements) {
       try {
-        const real = await validatePlacement(placement.path, roots)
+        const real = await validatePlacement(placement.path, this.roots)
         if (real !== placement.path) invalid.add(placement.placementId)
       } catch {
         invalid.add(placement.placementId)
       }
     }
     this.invalidPlacements = invalid
+  }
+
+  async resolvePlacement(placementId: string): Promise<PlacementInfo> {
+    const placement = this.settings.scope.placements.find(item => item.placementId === placementId)
+    if (!placement) throw new PlacementError('not-found', 'the placement is no longer configured')
+    try {
+      const real = await validatePlacement(placement.path, this.roots)
+      if (real !== placement.path) throw new PlacementError('forbidden', 'the placement folder now resolves to a different folder')
+      // Settings can change while filesystem checks are running.
+      if (!this.settings.scope.placements.some(item => item.placementId === placementId && item.path === real)) {
+        throw new PlacementError('forbidden', 'the placement is no longer allowed')
+      }
+      this.invalidPlacements.delete(placementId)
+      return { placementId, path: real }
+    } catch (error) {
+      this.invalidPlacements.add(placementId)
+      throw error
+    }
   }
 
   isPlacementValid(placementId: string): boolean {

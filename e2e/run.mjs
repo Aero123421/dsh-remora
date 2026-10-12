@@ -20,6 +20,7 @@ import { createWorld, dumpConfig, enableTimedQuestions, installDsh, installPlugi
 import { launchChromium } from './lib/browser.mjs'
 import { browserSteps } from './browser-check.mjs'
 import { flowSteps, stopFlow } from './flow.mjs'
+import { nativeHostSafety } from './host-safety.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const repo = resolve(here, '..')
@@ -232,6 +233,8 @@ if (ctx.browser) {
     }
   }
 }
+
+if (wantFlow) await r.step('host.safety', 'Emergency stop across DSH processes, revoked schedules and trusted HTTP peers', { needs: ['setup.dsh-install', 'setup.plugin-tarball'], timeoutMs: 180_000 }, () => nativeHostSafety({ dsh: ctx.dsh, tarball: ctx.tarball, artifacts, checkLan: !args['no-remote'] }))
 
 const code = r.finish({ dsh: ctx.dshVersion ?? dshVersion, plugin: pluginManifest.version, only: args.only ?? 'all' })
 await cleanup()

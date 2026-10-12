@@ -5,7 +5,8 @@
  */
 import { homedir, hostname } from 'node:os'
 import { createRequire } from 'node:module'
-import { readFileSync } from 'node:fs'
+import { readFileSync, watch, type FSWatcher } from 'node:fs'
+import { setTimeout as delay } from 'node:timers/promises'
 import {
   ENDPOINTS, OPERATIONS, PROTOCOL_VERSION, canonicalJson, rotateKeyMessage, unpairMessage,
   type UnpairRequest,
@@ -14,6 +15,12 @@ import {
 
 /** Operations the hub answers itself, or that are not request frames: never advertised as served operations. */
 const NOT_ADVERTISED: ReadonlySet<string> = new Set(['status', 'hosts.list', 'confirmation.get', 'audit.export', 'hub.export', 'host.rotate-key'])
+
+// Native DSH domains are cached per process. Keep this marker across plugin
+// reloads; only restarting DSH makes a secondary process's native state fresh.
+const STALE_NATIVE_STATE = Symbol.for('dsh-remora:stale-native-state')
+const processState = process as typeof process & { [STALE_NATIVE_STATE]?: Set<string> }
+const staleNativeDirs = processState[STALE_NATIVE_STATE] ??= new Set<string>()
 import type { HostContext } from '../dsh.ts'
 import { PLUGIN_VERSION } from '../dsh.ts'
 import { detectFeatures, type FeatureReport } from '../features.ts'
@@ -31,7 +38,7 @@ import { RpcError } from './rpc-error.ts'
 import { PlacementError, SettingsScopePolicy, newPlacement, validatePlacement, type ForbiddenRoots } from './scope.ts'
 import {
   ALL_OPERATION_IDS, FULL_ACCESS_TTL_MS, MAX_REMOTE_ANSWER_WAIT_MS, adoptNewOperations, confirmationsSpec, pairingSpec, settingsSpec, tasksSpec,
-  type ConfirmationsDocument, type PairingState, type RemoraSettings, type ScopeSettings, type SessionException,
+  type ConfirmationsDocument, type PairingState, type RemoraSettings, type SessionException,
 } from './settings.ts'
 import { JsonDocument, remoraDataDir, resolveDshHome } from './storage.ts'
 import { FileWorkspaceCreationStore, workspaceCreationsSpec } from './workspace-creations.ts'
@@ -52,8 +59,6 @@ export interface RemoraOptions {
   githubFetch?: GetFetch
   clock?: Clock
   forbiddenRoots?: ForbiddenRoots
-  /** Retry interval while another process holds the hub lock. */
-  lockRetryMs?: number
 }
 
 export interface OperationRow {
@@ -97,7 +102,7 @@ export interface RemoraSnapshot {
     revoked: boolean
     link: LinkStatus
     /** `held`: this process owns the hub connection. `other`: another DSH process with the same data folder does. */
-    lock: 'held' | 'other' | 'none'
+    lock: 'held' | 'other' | 'restart' | 'none'
   }
   pairing: PairingView
   /** Result of the last unpair in this process: whether the hub also forgot the host. */
@@ -166,13 +171,16 @@ export class RemoraCore {
   private lock!: InstanceLock
   private adapter: Adapter | null = null
   private adapterStarted = false
-  private lockState: 'held' | 'other' | 'none' = 'none'
-  private lockTimer: unknown = null
+  private lockState: 'held' | 'other' | 'restart' | 'none' = 'none'
+  private nativeCacheStale = false
   private expiryTimer: unknown = null
   private updateCheck: UpdateCheck | null = null
   private lastUnpair: { at: number; hub: 'removed' | 'refused' | 'unreachable' | 'not-paired' } | null = null
   private fatal: string | null = null
   private disposed = false
+  private closing: Promise<void> | null = null
+  private stateWatcher: FSWatcher | null = null
+  private stateUpdates: Promise<void> = Promise.resolve()
   private readonly dshVersion = dshVersion()
   readonly ready: Promise<void>
 
@@ -182,6 +190,7 @@ export class RemoraCore {
     this.clock = options.clock ?? systemClock
     const homePath = ctx.get('dshHomePath')
     this.dataDir = options.dataDir ?? remoraDataDir(typeof homePath === 'function' ? homePath as (...segments: string[]) => string : undefined)
+    this.nativeCacheStale = staleNativeDirs.has(this.dataDir)
     this.ready = this.init().catch(error => {
       this.fatal = (error as Error).message
       ctx.logger.warn('Remora: could not start', error)
@@ -200,8 +209,7 @@ export class RemoraCore {
     const creationsDoc = await JsonDocument.open(dir, workspaceCreationsSpec)
     this.remoteSchedules = new FileRemoteScheduleStore(await JsonDocument.open(dir, remoteSchedulesSpec))
     this.auditLog = await AuditLog.open(dir, { now: () => this.clock.now() })
-    const adopted = adoptNewOperations(this.settingsDoc.value)
-    if (adopted !== this.settingsDoc.value) await this.settingsDoc.update(() => adopted)
+    await this.settingsDoc.update(adoptNewOperations)
     const credentials = this.ctx.get('credentials') as CredentialsLike | undefined
     this.keyStore = new HostKeyStore(dir, credentials && typeof credentials.readRecord === 'function' ? credentials : undefined)
     if (this.pairingDoc.value.paired) {
@@ -247,7 +255,7 @@ export class RemoraCore {
       onRotateKey: frame => this.onRotateKey(frame),
       onRotateKeyCommit: frame => { void this.onRotateKeyCommit(frame) },
       onAuthFailed: () => this.onAuthFailed(),
-      onFatal: reason => { void this.onFatal(reason) },
+      onFatal: reason => { void this.onFatal(reason).catch(error => this.ctx.logger.warn('Remora: host shutdown failed', error)) },
       ...(this.options.createSocket ? { createSocket: this.options.createSocket } : {}),
       clock: this.clock,
       log: message => this.ctx.logger.warn(message),
@@ -298,22 +306,39 @@ export class RemoraCore {
     })
     this.scheduleExpiry()
     if (this.disposed) return
+    this.stateWatcher = watch(dir, { persistent: false }, (_event, file) => {
+      if (file === null || file.toString() === 'settings.json' || file.toString() === 'pairing.json') {
+        void this.syncState().catch(error => this.ctx.logger.warn('Remora: shared state update failed', error))
+      }
+    })
+    this.stateWatcher.on('error', error => {
+      this.ctx.logger.warn('Remora: shared state watcher failed', error)
+      void this.stopLink('stopped', 'storage-failed')
+    })
+    if (!this.canConnect()) await this.cleanStoppedSchedules('stopped-on-startup')
     await this.startLink()
   }
 
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    return this.closing ??= this.close()
+  }
+
+  private async close(): Promise<void> {
     this.disposed = true
+    this.stateWatcher?.close()
     await this.ready
     if (this.fatal !== null && !this.link) return
-    this.clock.clearTimeout(this.lockTimer)
     this.clock.clearTimeout(this.expiryTimer)
     this.pairing?.cancel('idle')
     this.dispatcher?.abortAll('unloading')
     this.link?.stop('idle')
     this.events?.dispose()
-    try { this.adapter?.dispose() } catch (error) { this.ctx.logger.warn('Remora: adapter dispose failed', error) }
+    await this.stateUpdates
+    await this.adapter?.stopClones?.()
+    try { await this.adapter?.dispose() } catch (error) { this.ctx.logger.warn('Remora: adapter dispose failed', error) }
     await this.keyWrites
     await this.lock?.release()
+    await this.auditLog?.flush()
   }
 
   private roots(): ForbiddenRoots {
@@ -330,24 +355,54 @@ export class RemoraCore {
   }
 
   private async startLink(): Promise<void> {
+    if (this.nativeCacheStale) {
+      this.lockState = 'restart'
+      this.link.stop('stopped', 'restart-required')
+      return
+    }
     if (!this.canConnect()) return
     if (!(await this.lock.acquire())) {
+      this.nativeCacheStale = true
+      staleNativeDirs.add(this.dataDir)
       this.lockState = 'other'
-      this.clock.clearTimeout(this.lockTimer)
-      this.lockTimer = this.clock.setTimeout(() => { void this.startLink() }, this.options.lockRetryMs ?? 60_000)
       return
     }
     this.lockState = 'held'
-    if (this.disposed || !this.canConnect()) return
-    this.link.start()
+    if (this.disposed || !this.canConnect()) { await this.lock.release(); this.lockState = 'none'; return }
+    try {
+      await this.tasks.refresh()
+      await this.workspaceCreations.refresh()
+      await this.remoteSchedules.refresh()
+      await this.confirmationsDoc.refresh()
+      await this.adapter?.prepare?.()
+      const previous = this.settingsDoc.value
+      const saved = await this.settingsDoc.refresh()
+      await this.pairingDoc.refresh()
+      await this.applySettings(previous, saved)
+      if (!this.canConnect()) {
+        await this.stopLink('stopped', saved.killSwitch ? 'kill-switch' : 'unpaired', 'stopped-before-connect')
+        return
+      }
+      this.link.start()
+    } catch (error) {
+      await this.lock.release()
+      this.lockState = 'none'
+      throw error
+    }
   }
 
-  private async stopLink(state: 'idle' | 'stopped', error: string | null): Promise<void> {
-    this.clock.clearTimeout(this.lockTimer)
+  private async stopLink(state: 'idle' | 'stopped', error: string | null, removeSchedules?: string): Promise<void> {
     this.dispatcher.abortAll('link stopped')
     this.link.stop(state, error)
-    await this.lock.release()
-    this.lockState = 'none'
+    try {
+      await this.adapter?.stopClones?.()
+      await this.keyWrites
+      this.link.stop(state, error)
+      if (removeSchedules && this.lock.held) await this.removeRemoteSchedules(removeSchedules)
+    } finally {
+      await this.lock.release()
+      this.lockState = this.nativeCacheStale ? 'restart' : 'none'
+    }
   }
 
   private onLinkReady(): void {
@@ -374,7 +429,17 @@ export class RemoraCore {
   }
 
   private async onRequest(frame: RequestFrame): Promise<void> {
-    await this.dispatcher.handle(frame)
+    try {
+      // File notifications are advisory; every request checks durable permissions
+      // before dispatch, including a stop made by another DSH process.
+      await this.syncState()
+      if (!this.link.connected) return
+      await this.dispatcher.handle(frame)
+    } catch (error) {
+      this.dispatcher.abortAll('storage failed')
+      await this.stopLink('stopped', 'storage-failed')
+      this.ctx.logger.warn('Remora: could not check shared state', error)
+    }
   }
 
   private async onOwnerCredentials(list: OwnerCredential[]): Promise<void> {
@@ -429,7 +494,7 @@ export class RemoraCore {
     this.previousKey = old
     this.hostKey = pending.key
     this.audit({ kind: 'connection', action: 'rotate-key-committed', outcome: 'ok' })
-    this.link.reconnect()
+    if (!this.disposed && this.canConnect() && this.lock.held) this.link.reconnect()
   }
 
   /**
@@ -449,12 +514,17 @@ export class RemoraCore {
   }
 
   private async removeRemoteSchedules(reason: string): Promise<void> {
+    await this.remoteSchedules.refresh()
     if (this.remoteSchedules.list().length === 0 || !this.adapter?.removeRemoteSchedules) return
     try {
       const removed = await this.adapter.removeRemoteSchedules()
+      await this.remoteSchedules.refresh()
+      if (this.remoteSchedules.list().length > 0) throw new RpcError('schedule-cleanup-pending')
       this.audit({ kind: 'settings', action: 'remote-schedules-removed', outcome: 'ok', reason: `${reason}:${removed}` })
     } catch (error) {
       this.ctx.logger.warn('Remora: could not remove the schedules created through Remora', error)
+      this.audit({ kind: 'settings', action: 'remote-schedules-removed', outcome: 'error', reason })
+      throw error
     }
   }
 
@@ -465,11 +535,37 @@ export class RemoraCore {
     return rethrow ? run : this.keyWrites
   }
 
-  private async onFatal(reason: string): Promise<void> {
-    this.audit({ kind: 'connection', action: reason, outcome: 'error' })
-    if (reason === 'revoked') await this.pairingDoc.update(current => ({ ...current, revoked: true }))
-    await this.lock.release()
-    this.lockState = 'none'
+  private onFatal(reason: string): Promise<void> {
+    this.dispatcher.abortAll(reason)
+    return this.updateState(async () => {
+      this.audit({ kind: 'connection', action: reason, outcome: 'error' })
+      if (reason === 'revoked') {
+        await this.pairingDoc.update(current => ({ ...current, revoked: true }))
+        await this.stopLink('stopped', 'revoked', 'revoked')
+      } else {
+        await this.stopLink('stopped', reason)
+      }
+    })
+  }
+
+  /** Retry tracked cleanup on startup, without deleting another process's schedules through stale DSH state. */
+  private async cleanStoppedSchedules(reason: string): Promise<void> {
+    if (this.nativeCacheStale) {
+      await this.remoteSchedules.refresh()
+      if (this.remoteSchedules.list().length > 0) throw new RpcError('restart-required')
+      return
+    }
+    if (!(await this.lock.acquire())) {
+      this.nativeCacheStale = true
+      staleNativeDirs.add(this.dataDir)
+      this.lockState = 'other'
+      return
+    }
+    try {
+      await this.workspaceCreations.refresh()
+      await this.adapter?.prepare?.()
+      await this.removeRemoteSchedules(reason)
+    } finally { await this.lock.release() }
   }
 
   private emit(event: HostEvent): void {
@@ -503,6 +599,7 @@ export class RemoraCore {
 
   async startPairing(hubUrl: string, local: boolean): Promise<PairingView> {
     this.requireLocal(local, ['pairing'])
+    if (this.nativeCacheStale) throw new RpcError('restart-required')
     const name = this.settingsDoc.value.hostName
     const view = await this.pairing.start(hubUrl, name, PLUGIN_VERSION)
     if (view.hubOrigin) await this.settingsDoc.update(current => ({ ...current, hubUrl: view.hubOrigin ?? current.hubUrl }))
@@ -517,14 +614,16 @@ export class RemoraCore {
   async unpair(local: boolean): Promise<void> {
     this.pairing.reset()
     this.lastUnpair = { at: this.clock.now(), hub: await this.unpairAtHub() }
-    await this.stopLink('idle', null)
-    await this.removeRemoteSchedules('unpaired')
+    // Publish the stop before waiting for the process that owns native DSH data.
+    await this.pairingDoc.reset()
+    await this.stopLink('idle', null, 'unpaired')
+    await this.waitForOwnerStop()
+    await this.cleanStoppedSchedules('unpaired')
     await this.keyStore.delete()
     this.hostKey = null
     this.previousKey = null
     this.pendingRotation = null
     this.adapterStarted = false
-    await this.pairingDoc.reset()
     this.audit({ kind: 'settings', action: 'unpaired', outcome: this.lastUnpair.hub === 'removed' ? 'ok' : 'error', reason: `hub:${this.lastUnpair.hub}`, local })
   }
 
@@ -581,8 +680,9 @@ export class RemoraCore {
     return changed
   }
 
-  reconnect(): void {
-    if (this.link.status.state === 'idle' || this.link.status.state === 'stopped') void this.startLink()
+  async reconnect(): Promise<void> {
+    if (this.nativeCacheStale) throw new RpcError('restart-required')
+    if (this.link.status.state === 'idle' || this.link.status.state === 'stopped') await this.startLink()
     else this.link.reconnect()
   }
 
@@ -592,16 +692,64 @@ export class RemoraCore {
     if (!local && reasons.length > 0) throw new RpcError('local-only', reasons.join(','))
   }
 
-  private async saveSettings(next: RemoraSettings, local: boolean, action: string): Promise<RemoraSettings> {
-    const previous = this.settingsDoc.value
-    this.requireLocal(local, wideningReasons(previous, next, this.clock.now()))
-    const saved = await this.settingsDoc.update(() => next)
-    this.audit({ kind: 'settings', action, outcome: 'ok', local })
+  private updateState<T>(run: () => Promise<T>): Promise<T> {
+    const pending = this.stateUpdates.then(run)
+    this.stateUpdates = pending.then(() => undefined, () => undefined)
+    return pending
+  }
+
+  /** Refresh settings and pairing changed by another process sharing this DSH home. */
+  async syncState(): Promise<void> {
+    await this.ready
+    if (this.disposed || !this.settingsDoc || !this.pairingDoc) return
+    await this.updateState(async () => {
+      const previous = this.settingsDoc.value
+      const previousPairing = this.pairingDoc.value
+      const saved = await this.settingsDoc.refresh()
+      const paired = await this.pairingDoc.refresh()
+      await this.applySettings(previous, saved)
+      if (canonicalJson(previousPairing) !== canonicalJson(paired)) {
+        if (paired.revoked || !paired.paired) {
+          this.pairing.cancel('idle')
+          await this.stopLink(paired.revoked ? 'stopped' : 'idle', paired.revoked ? 'revoked' : null, paired.revoked ? 'revoked' : 'unpaired')
+        } else if (previousPairing.paired?.publicKey !== paired.paired.publicKey || previousPairing.paired?.hubOrigin !== paired.paired.hubOrigin) {
+          await this.stopLink('idle', null)
+          this.hostKey = await this.keyStore.load()
+          this.previousKey = await this.keyStore.load('previous')
+          await this.startLink()
+        }
+      }
+      if (this.nativeCacheStale && !(await this.lock.occupied())) this.lockState = 'restart'
+    })
+  }
+
+  private saveSettings(change: (current: RemoraSettings) => RemoraSettings, local: boolean, action: string | ((previous: RemoraSettings, saved: RemoraSettings) => string)): Promise<RemoraSettings> {
+    return this.updateState(async () => {
+      const observed = this.settingsDoc.value
+      let previous = this.settingsDoc.value
+      const saved = await this.settingsDoc.update(current => {
+        previous = current
+        const next = change(current)
+        this.requireLocal(local, wideningReasons(current, next, this.clock.now()))
+        return next
+      })
+      if (previous !== saved) await this.audit({ kind: 'settings', action: typeof action === 'string' ? action : action(previous, saved), outcome: 'ok', local })
+      await this.applySettings(observed, saved)
+      return saved
+    })
+  }
+
+  private async applySettings(previous: RemoraSettings, saved: RemoraSettings): Promise<void> {
     if (canonicalJson(previous.ceiling) !== canonicalJson(saved.ceiling) || previous.killSwitch !== saved.killSwitch) this.sendHostStatus()
     this.scheduleExpiry()
-    if (previous.hostName !== saved.hostName && this.link.connected) this.link.reconnect()
-    this.settingsChanged()
-    return saved
+    if (canonicalJson(previous.scope.placements) !== canonicalJson(saved.scope.placements)) await this.scope.revalidatePlacements(this.roots())
+    if (canonicalJson(previous) !== canonicalJson(saved)) this.settingsChanged()
+    if (saved.killSwitch) {
+      this.events.flush()
+      await this.stopLink('stopped', 'kill-switch', 'kill-switch')
+    } else if (previous.killSwitch) {
+      await this.startLink()
+    } else if (previous.hostName !== saved.hostName && this.link.connected) this.link.reconnect()
   }
 
   private settingsChanged(): void {
@@ -609,46 +757,51 @@ export class RemoraCore {
   }
 
   async setPermission(input: { level: PermissionLevel; overrides?: Partial<Record<OperationId, boolean>>; confirmFull?: boolean }, local: boolean): Promise<void> {
-    const previous = this.settingsDoc.value
-    const now = this.clock.now()
-    const ceiling: Grant = { level: input.level }
-    if (input.overrides) {
-      const overrides: Partial<Record<OperationId, boolean>> = {}
-      for (const [id, flag] of Object.entries(input.overrides)) {
-        if (ALL_OPERATION_IDS.includes(id as OperationId) && typeof flag === 'boolean') overrides[id as OperationId] = flag
+    await this.saveSettings(previous => {
+      const now = this.clock.now()
+      const ceiling: Grant = { level: input.level }
+      if (input.overrides) {
+        const overrides: Partial<Record<OperationId, boolean>> = {}
+        for (const [id, flag] of Object.entries(input.overrides)) {
+          if (ALL_OPERATION_IDS.includes(id as OperationId) && typeof flag === 'boolean') overrides[id as OperationId] = flag
+        }
+        if (Object.keys(overrides).length > 0) ceiling.overrides = overrides
       }
-      if (Object.keys(overrides).length > 0) ceiling.overrides = overrides
-    }
-    if (input.level === 'full') {
-      if (fullAccessActive(previous.ceiling, now) && previous.ceiling.fullAccessExpiresAt !== undefined) {
-        ceiling.fullAccessExpiresAt = previous.ceiling.fullAccessExpiresAt
-      } else {
-        if (input.confirmFull !== true) throw new RpcError('full-confirmation-required')
-        ceiling.fullAccessExpiresAt = now + FULL_ACCESS_TTL_MS
+      if (input.level === 'full') {
+        if (fullAccessActive(previous.ceiling, now) && previous.ceiling.fullAccessExpiresAt !== undefined) {
+          ceiling.fullAccessExpiresAt = previous.ceiling.fullAccessExpiresAt
+        } else {
+          if (input.confirmFull !== true) throw new RpcError('full-confirmation-required')
+          ceiling.fullAccessExpiresAt = now + FULL_ACCESS_TTL_MS
+        }
       }
-    }
-    await this.saveSettings({ ...previous, ceiling, knownOperations: [...ALL_OPERATION_IDS] }, local, `permission:${input.level}${ceiling.overrides ? '+custom' : ''}`)
+      return { ...previous, ceiling, knownOperations: [...ALL_OPERATION_IDS] }
+    }, local, `permission:${input.level}${input.overrides ? '+custom' : ''}`)
   }
 
   async extendFullAccess(local: boolean): Promise<void> {
-    const previous = this.settingsDoc.value
-    if (!fullAccessActive(previous.ceiling, this.clock.now())) throw new RpcError('full-access-inactive')
-    await this.saveSettings({ ...previous, ceiling: { ...previous.ceiling, fullAccessExpiresAt: this.clock.now() + FULL_ACCESS_TTL_MS } }, local, 'full-access-extended')
+    await this.saveSettings(previous => {
+      if (!fullAccessActive(previous.ceiling, this.clock.now())) throw new RpcError('full-access-inactive')
+      return { ...previous, ceiling: { ...previous.ceiling, fullAccessExpiresAt: this.clock.now() + FULL_ACCESS_TTL_MS } }
+    }, local, 'full-access-extended')
   }
 
   async setKillSwitch(on: boolean, local: boolean): Promise<void> {
-    const previous = this.settingsDoc.value
-    if (previous.killSwitch === on) return
+    if (on) this.dispatcher.abortAll('kill switch')
+    await this.saveSettings(previous => previous.killSwitch === on ? previous : { ...previous, killSwitch: on }, local, `kill-switch:${on ? 'on' : 'off'}`)
     if (on) {
-      this.dispatcher.abortAll('kill switch')
-      await this.saveSettings({ ...previous, killSwitch: true }, local, 'kill-switch:on')
-      this.events.flush()
-      await this.stopLink('stopped', 'kill-switch')
-      // Remote control stops here, including prompts scheduled through Remora for later.
-      await this.removeRemoteSchedules('kill-switch')
-    } else {
-      await this.saveSettings({ ...previous, killSwitch: false }, local, 'kill-switch:off')
-      await this.startLink()
+      // A secondary tab must not report success before the connection owner has
+      // stopped its link, background clones, and scheduled prompts.
+      await this.waitForOwnerStop()
+      await this.cleanStoppedSchedules('kill-switch')
+    }
+  }
+
+  private async waitForOwnerStop(): Promise<void> {
+    const deadline = Date.now() + 10_000
+    while (await this.lock.occupied()) {
+      if (Date.now() >= deadline) throw new RpcError('stop-pending')
+      await delay(10)
     }
   }
 
@@ -656,53 +809,54 @@ export class RemoraCore {
   async updateSettings(patch: unknown, local: boolean): Promise<void> {
     if (typeof patch !== 'object' || patch === null) throw new RpcError('invalid-payload')
     const input = patch as { hostName?: unknown; scope?: Record<string, unknown> }
-    const previous = this.settingsDoc.value
-    const next: RemoraSettings = { ...previous, scope: { ...previous.scope } }
-    if (input.hostName !== undefined) {
-      if (typeof input.hostName !== 'string' || input.hostName.trim() === '' || input.hostName.length > 100) throw new RpcError('invalid-payload', 'hostName')
-      next.hostName = input.hostName.trim()
-    }
-    const scope = input.scope
-    if (scope !== undefined) {
-      if (typeof scope !== 'object' || scope === null) throw new RpcError('invalid-payload', 'scope')
-      const list = (key: keyof ScopeSettings, check: (item: string) => boolean, map: (item: string) => string = item => item) => {
-        const value = scope[key]
-        if (value === undefined) return
-        if (!Array.isArray(value) || value.length > 500 || !value.every(item => typeof item === 'string' && check(map(item)))) throw new RpcError('invalid-payload', key)
-        ;(next.scope as unknown as Record<string, unknown>)[key] = [...new Set(value.map(item => map(item as string)))]
+    await this.saveSettings(previous => {
+      const next: RemoraSettings = { ...previous, scope: { ...previous.scope } }
+      if (input.hostName !== undefined) {
+        if (typeof input.hostName !== 'string' || input.hostName.trim() === '' || input.hostName.length > 100) throw new RpcError('invalid-payload', 'hostName')
+        next.hostName = input.hostName.trim()
       }
-      const id = (item: string) => item.length > 0 && item.length <= 200
-      list('workspaces', id)
-      list('skills', item => /^[A-Za-z0-9._:-]{1,100}$/.test(item))
-      list('agentPresets', id)
-      list('commands', item => COMMAND_PATTERN.test(item), item => (item.startsWith('/') ? item : `/${item}`).toLowerCase())
-      list('gitHosts', item => HOST_PATTERN.test(item), item => item.trim().toLowerCase())
-      list('untrustedWorkspaces', id)
-      if (scope.outsideWorkspace !== undefined) {
-        if (typeof scope.outsideWorkspace !== 'boolean') throw new RpcError('invalid-payload', 'outsideWorkspace')
-        next.scope.outsideWorkspace = scope.outsideWorkspace
-      }
-      if (scope.exceptions !== undefined) {
-        if (!Array.isArray(scope.exceptions) || scope.exceptions.length > 500) throw new RpcError('invalid-payload', 'exceptions')
-        const exceptions: SessionException[] = []
-        for (const item of scope.exceptions as unknown[]) {
-          const entry = item as { sessionId?: unknown; allow?: unknown }
-          if (typeof entry?.sessionId !== 'string' || !id(entry.sessionId) || typeof entry.allow !== 'boolean') throw new RpcError('invalid-payload', 'exceptions')
-          if (!exceptions.some(e => e.sessionId === entry.sessionId)) exceptions.push({ sessionId: entry.sessionId, allow: entry.allow })
+      const scope = input.scope
+      if (scope !== undefined) {
+        if (typeof scope !== 'object' || scope === null) throw new RpcError('invalid-payload', 'scope')
+        const list = (key: 'workspaces' | 'skills' | 'agentPresets' | 'commands' | 'gitHosts' | 'untrustedWorkspaces', check: (item: string) => boolean, map: (item: string) => string = item => item) => {
+          const value = scope[key]
+          if (value === undefined) return
+          if (!Array.isArray(value) || value.length > 500 || !value.every(item => typeof item === 'string' && check(map(item)))) throw new RpcError('invalid-payload', key)
+          next.scope[key] = [...new Set(value.map(item => map(item as string)))]
         }
-        next.scope.exceptions = exceptions
-      }
-      if (scope.aliases !== undefined) {
-        if (typeof scope.aliases !== 'object' || scope.aliases === null || Array.isArray(scope.aliases)) throw new RpcError('invalid-payload', 'aliases')
-        const aliases: Record<string, string> = {}
-        for (const [alias, sessionId] of Object.entries(scope.aliases as Record<string, unknown>)) {
-          if (!ALIAS_PATTERN.test(alias) || typeof sessionId !== 'string' || !id(sessionId)) throw new RpcError('invalid-payload', 'aliases')
-          aliases[alias] = sessionId
+        const id = (item: string) => item.length > 0 && item.length <= 200
+        list('workspaces', id)
+        list('skills', item => /^[A-Za-z0-9._:-]{1,100}$/.test(item))
+        list('agentPresets', id)
+        list('commands', item => COMMAND_PATTERN.test(item), item => (item.startsWith('/') ? item : `/${item}`).toLowerCase())
+        list('gitHosts', item => HOST_PATTERN.test(item), item => item.trim().toLowerCase())
+        list('untrustedWorkspaces', id)
+        if (scope.outsideWorkspace !== undefined) {
+          if (typeof scope.outsideWorkspace !== 'boolean') throw new RpcError('invalid-payload', 'outsideWorkspace')
+          next.scope.outsideWorkspace = scope.outsideWorkspace
         }
-        next.scope.aliases = aliases
+        if (scope.exceptions !== undefined) {
+          if (!Array.isArray(scope.exceptions) || scope.exceptions.length > 500) throw new RpcError('invalid-payload', 'exceptions')
+          const exceptions: SessionException[] = []
+          for (const item of scope.exceptions as unknown[]) {
+            const entry = item as { sessionId?: unknown; allow?: unknown }
+            if (typeof entry?.sessionId !== 'string' || !id(entry.sessionId) || typeof entry.allow !== 'boolean') throw new RpcError('invalid-payload', 'exceptions')
+            if (!exceptions.some(e => e.sessionId === entry.sessionId)) exceptions.push({ sessionId: entry.sessionId, allow: entry.allow })
+          }
+          next.scope.exceptions = exceptions
+        }
+        if (scope.aliases !== undefined) {
+          if (typeof scope.aliases !== 'object' || scope.aliases === null || Array.isArray(scope.aliases)) throw new RpcError('invalid-payload', 'aliases')
+          const aliases: Record<string, string> = {}
+          for (const [alias, sessionId] of Object.entries(scope.aliases as Record<string, unknown>)) {
+            if (!ALIAS_PATTERN.test(alias) || typeof sessionId !== 'string' || !id(sessionId)) throw new RpcError('invalid-payload', 'aliases')
+            aliases[alias] = sessionId
+          }
+          next.scope.aliases = aliases
+        }
       }
-    }
-    await this.saveSettings(next, local, 'settings')
+      return next
+    }, local, 'settings')
   }
 
   /**
@@ -713,22 +867,25 @@ export class RemoraCore {
   async setAnswers(patch: unknown, local: boolean): Promise<void> {
     if (typeof patch !== 'object' || patch === null) throw new RpcError('invalid-payload')
     const input = patch as { waitMinutes?: unknown; approvalsFromRemote?: unknown }
-    const previous = this.settingsDoc.value
-    const next: RemoraSettings = { ...previous }
-    const actions: string[] = []
-    if (input.waitMinutes !== undefined) {
-      const minutes = input.waitMinutes
-      if (typeof minutes !== 'number' || !Number.isInteger(minutes) || minutes < 0 || minutes * 60_000 > MAX_REMOTE_ANSWER_WAIT_MS) throw new RpcError('invalid-payload', 'waitMinutes')
-      next.remoteAnswerWaitMs = minutes * 60_000
-      if (next.remoteAnswerWaitMs !== previous.remoteAnswerWaitMs) actions.push(`answer-wait:${minutes}m`)
-    }
-    if (input.approvalsFromRemote !== undefined) {
-      if (typeof input.approvalsFromRemote !== 'boolean') throw new RpcError('invalid-payload', 'approvalsFromRemote')
-      next.approvalsFromRemote = input.approvalsFromRemote
-      if (next.approvalsFromRemote !== previous.approvalsFromRemote) actions.push(`approvals-from-remote:${next.approvalsFromRemote ? 'on' : 'off'}`)
-    }
-    if (actions.length === 0) return
-    await this.saveSettings(next, local, actions.join(','))
+    await this.saveSettings(previous => {
+      const next: RemoraSettings = { ...previous }
+      const actions: string[] = []
+      if (input.waitMinutes !== undefined) {
+        const minutes = input.waitMinutes
+        if (typeof minutes !== 'number' || !Number.isInteger(minutes) || minutes < 0 || minutes * 60_000 > MAX_REMOTE_ANSWER_WAIT_MS) throw new RpcError('invalid-payload', 'waitMinutes')
+        next.remoteAnswerWaitMs = minutes * 60_000
+        if (next.remoteAnswerWaitMs !== previous.remoteAnswerWaitMs) actions.push(`answer-wait:${minutes}m`)
+      }
+      if (input.approvalsFromRemote !== undefined) {
+        if (typeof input.approvalsFromRemote !== 'boolean') throw new RpcError('invalid-payload', 'approvalsFromRemote')
+        next.approvalsFromRemote = input.approvalsFromRemote
+        if (next.approvalsFromRemote !== previous.approvalsFromRemote) actions.push(`approvals-from-remote:${next.approvalsFromRemote ? 'on' : 'off'}`)
+      }
+      return actions.length === 0 ? previous : next
+    }, local, (previous, saved) => [
+      ...(previous.remoteAnswerWaitMs !== saved.remoteAnswerWaitMs ? [`answer-wait:${saved.remoteAnswerWaitMs / 60_000}m`] : []),
+      ...(previous.approvalsFromRemote !== saved.approvalsFromRemote ? [`approvals-from-remote:${saved.approvalsFromRemote ? 'on' : 'off'}`] : []),
+    ].join(','))
   }
 
   async addPlacement(path: unknown, local: boolean): Promise<void> {
@@ -740,16 +897,14 @@ export class RemoraCore {
       if (error instanceof PlacementError) throw new RpcError(`placement-${error.code}`)
       throw error
     }
-    const previous = this.settingsDoc.value
-    if (previous.scope.placements.some(p => p.path === real)) return
-    await this.saveSettings({ ...previous, scope: { ...previous.scope, placements: [...previous.scope.placements, newPlacement(real, this.clock.now())] } }, local, 'placement-added')
-    await this.scope.revalidatePlacements(this.roots())
+    await this.saveSettings(previous => previous.scope.placements.some(p => p.path === real)
+      ? previous
+      : { ...previous, scope: { ...previous.scope, placements: [...previous.scope.placements, newPlacement(real, this.clock.now())] } }, local, 'placement-added')
   }
 
   async removePlacement(placementId: unknown, local: boolean): Promise<void> {
     if (typeof placementId !== 'string') throw new RpcError('invalid-payload', 'placementId')
-    const previous = this.settingsDoc.value
-    await this.saveSettings({ ...previous, scope: { ...previous.scope, placements: previous.scope.placements.filter(p => p.placementId !== placementId) } }, local, 'placement-removed')
+    await this.saveSettings(previous => ({ ...previous, scope: { ...previous.scope, placements: previous.scope.placements.filter(p => p.placementId !== placementId) } }), local, 'placement-removed')
   }
 
   /** Full access lapses into 依頼できる after its expiry. */
@@ -763,14 +918,12 @@ export class RemoraCore {
   }
 
   private async expireFullAccess(): Promise<void> {
-    const current = this.settingsDoc.value
-    if (current.ceiling.level !== 'full' || current.ceiling.fullAccessExpiresAt === undefined) return
-    if (current.ceiling.fullAccessExpiresAt > this.clock.now()) { this.scheduleExpiry(); return }
-    const { fullAccessExpiresAt: _expired, ...rest } = current.ceiling
-    await this.settingsDoc.update(value => ({ ...value, ceiling: { ...rest, level: 'request' } }))
-    this.audit({ kind: 'settings', action: 'full-access-expired', outcome: 'ok' })
-    this.sendHostStatus()
-    this.settingsChanged()
+    if (this.disposed) return
+    await this.saveSettings(current => {
+      if (current.ceiling.level !== 'full' || current.ceiling.fullAccessExpiresAt === undefined || current.ceiling.fullAccessExpiresAt > this.clock.now()) return current
+      const { fullAccessExpiresAt: _expired, ...rest } = current.ceiling
+      return { ...current, ceiling: { ...rest, level: 'request' } }
+    }, false, 'full-access-expired')
   }
 
   // --- reads ----------------------------------------------------------------------
@@ -787,9 +940,9 @@ export class RemoraCore {
     return detectFeatures(service => adapter.has(service), new Set(Object.keys(adapter.handlers) as OperationId[]))
   }
 
-  private audit(entry: AuditInput): void {
-    if (!this.auditLog) return
-    this.auditLog.append(entry).catch(error => this.ctx.logger.warn('Remora: audit write failed', error))
+  private audit(entry: AuditInput): Promise<void> {
+    if (!this.auditLog) return Promise.resolve()
+    return this.auditLog.append(entry).then(() => undefined, error => this.ctx.logger.warn('Remora: audit write failed', error))
   }
 
   auditEntries(limit = 200): AuditEntry[] {

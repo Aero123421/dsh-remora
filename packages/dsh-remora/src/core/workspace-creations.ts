@@ -17,6 +17,14 @@ function parseRecord(value: unknown, index: number): WorkspaceCreationRecord {
   if (typeof raw.key !== 'string' || typeof raw.path !== 'string' || typeof raw.name !== 'string' || typeof raw.state !== 'string' || !STATES.has(raw.state)) {
     throw new Error(`creations[${index}] is invalid`)
   }
+  let directory: WorkspaceCreationRecord['directory']
+  if (raw.directory !== undefined) {
+    const identity = asObject(raw.directory, `creations[${index}].directory`)
+    if (typeof identity.placementId !== 'string' || typeof identity.placementPath !== 'string'
+      || typeof identity.dev !== 'string' || !/^\d+$/.test(identity.dev)
+      || typeof identity.ino !== 'string' || !/^\d+$/.test(identity.ino)) throw new Error(`creations[${index}].directory is invalid`)
+    directory = { placementId: identity.placementId, placementPath: identity.placementPath, dev: identity.dev, ino: identity.ino }
+  }
   return {
     key: raw.key,
     workspaceId: typeof raw.workspaceId === 'string' ? raw.workspaceId : null,
@@ -26,6 +34,7 @@ function parseRecord(value: unknown, index: number): WorkspaceCreationRecord {
     ...(typeof raw.message === 'string' ? { message: raw.message } : {}),
     createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : 0,
     updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : 0,
+    ...(directory ? { directory } : {}),
   }
 }
 
@@ -52,6 +61,10 @@ export class FileWorkspaceCreationStore implements WorkspaceCreationStore {
 
   list(): WorkspaceCreationRecord[] {
     return this.document.value.creations.map(record => ({ ...record }))
+  }
+
+  async refresh(): Promise<void> {
+    await this.document.refresh()
   }
 
   async put(record: WorkspaceCreationRecord): Promise<void> {

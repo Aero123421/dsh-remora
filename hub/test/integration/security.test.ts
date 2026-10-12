@@ -22,6 +22,7 @@ async function pairedHost(name = 'pc') {
   await host.pair(owner, name)
   host.respond = frame => frame.op === 'task.start'
     ? { ok: true, result: { taskId: frame.taskId, state: 'accepted', createdAt: Date.now(), updatedAt: Date.now() } }
+    : frame.op === 'task.get' ? { ok: true, result: { taskId: frame.taskId, state: 'accepted' } }
     : { ok: true, result: {} }
   await host.connect({ ceiling: { level: 'request' } })
   await host.next('ready')

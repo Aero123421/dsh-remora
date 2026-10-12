@@ -1,5 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { fork } from 'node:child_process'
+import { once } from 'node:events'
+import { fileURLToPath } from 'node:url'
 import { readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { JsonDocument, StorageError, remoraDataDir, resolveDshHome, type DocumentSpec } from '../src/core/storage.ts'
@@ -65,6 +68,53 @@ test('concurrent updates are serialized', async () => {
     assert.equal(doc.value.count, 20)
     const reopened = await JsonDocument.open(dir, spec)
     assert.equal(reopened.value.count, 20)
+  } finally { await cleanup() }
+})
+
+test('independent documents reload before mutation and preserve each other\'s edits', async () => {
+  const { dir, cleanup } = await tempDir()
+  try {
+    const first = await JsonDocument.open(dir, spec)
+    const second = await JsonDocument.open(dir, spec)
+    await first.update(value => ({ ...value, count: 1 }))
+    await second.update(value => ({ ...value, tags: ['new'] }))
+    assert.deepEqual(await first.refresh(), { name: 'new', tags: ['new'], count: 1 })
+  } finally { await cleanup() }
+})
+
+test('document read-transform-write is serialized across real processes', async () => {
+  const { dir, cleanup } = await tempDir()
+  const children: ReturnType<typeof fork>[] = []
+  const exits: Promise<[number | null, NodeJS.Signals | null]>[] = []
+  try {
+    for (let i = 0; i < 2; i++) {
+      const child = fork(fileURLToPath(new URL('./fixtures/document-writer.ts', import.meta.url)), [dir], { execArgv: ['--disable-warning=ExperimentalWarning'], stdio: ['ignore', 'pipe', 'pipe', 'ipc'] })
+      children.push(child)
+      exits.push(new Promise(resolve => child.once('close', (code, signal) => resolve([code, signal]))))
+      await Promise.race([once(child, 'message'), exits[exits.length - 1]!.then(() => { throw new Error('document writer exited before its ready barrier') })])
+    }
+    for (const child of children) child.send('start')
+    assert.deepEqual(await Promise.all(exits), [[0, null], [0, null]])
+    assert.equal((await JsonDocument.open(dir, settingsSpec('0'))).value.hostName, '20')
+  } finally {
+    for (const child of children) if (child.exitCode === null) child.kill()
+    await Promise.all(exits)
+    await cleanup()
+  }
+})
+
+test('audit writers in separate instances continue one shared hash chain', async () => {
+  const { dir, cleanup } = await tempDir()
+  try {
+    const first = await AuditLog.open(dir)
+    const second = await AuditLog.open(dir)
+    await Promise.all([
+      first.append({ kind: 'settings', action: 'kill-switch:on', outcome: 'ok' }),
+      second.append({ kind: 'settings', action: 'renamed', outcome: 'ok' }),
+    ])
+    const stored = await AuditLog.open(dir)
+    assert.equal(stored.intact, true)
+    assert.deepEqual(stored.entries().map(entry => entry.seq), [1, 2])
   } finally { await cleanup() }
 })
 

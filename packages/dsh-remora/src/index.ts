@@ -19,7 +19,7 @@ export interface ApplyOptions extends Partial<RemoraOptions> {}
 export function apply(ctx: HostContext, _config?: unknown, options: ApplyOptions = {}): RemoraCore {
   const core = new RemoraCore(ctx, { createAdapter, ...options })
   registerRoutes(ctx, core)
-  ctx.effect(() => () => { void core.dispose() }, 'dsh-remora: core')
+  ctx.effect(() => () => core.dispose(), 'dsh-remora: core')
   void core.ready.then(() => ctx.logger.info(`Remora: ready (data in ${core.dataDir})`))
   return core
 }

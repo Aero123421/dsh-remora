@@ -5,6 +5,7 @@ import { loadProfile, normalizeHubUrl } from './config.ts'
 import { CliError, EXIT, fromHttpError, missingScope, notLoggedIn, usageError } from './errors.ts'
 import { refresh, toAccess } from './oauth.ts'
 import { openTokenStore, type StoredTokens, type TokenStore } from './tokens.ts'
+import { withTokenLock } from './token-lock.ts'
 
 export type Audience = 'api' | 'mcp'
 export type OpId = keyof OperationParams & keyof OperationResults
@@ -38,41 +39,43 @@ export class Hub {
     return this.tokens?.resources[audience] ? audience : 'default'
   }
 
-  async token(audience: Audience, forceRefresh = false): Promise<string> {
+  async token(audience: Audience, forceRefresh = false, rejectedToken?: string): Promise<string> {
     if (this.staticToken) return this.staticToken
     if (!this.tokens) throw notLoggedIn()
-    const key = this.key(audience)
-    const fresh = (t: StoredTokens) => {
+    const used = rejectedToken ?? this.tokens.access[this.key(audience)]?.token
+    const fresh = (t: StoredTokens, key: string) => {
       const current = t.access[key]
       return current && (current.expiresAt === null || current.expiresAt - EXPIRY_MARGIN_MS > this.ctx.now()) ? current.token : null
     }
     if (!forceRefresh) {
-      const token = fresh(this.tokens)
+      const token = fresh(this.tokens, this.key(audience))
       if (token) return token
     }
-    // Another remora process (e.g. a long-running `remora mcp`) may have
-    // refreshed — and rotated the refresh token — since we loaded it.
-    if (this.store) {
-      const latest = await this.store.load(this.url)
-      if (latest && latest.refreshToken !== this.tokens.refreshToken) {
-        const used = this.tokens.access[key]?.token
-        this.tokens = latest
-        const token = fresh(latest)
-        if (token && token !== used) return token
+    return withTokenLock(this.ctx, this.url, async () => {
+      // Read only after taking the lock: another process or MCP request may
+      // have rotated the refresh token while this request was waiting.
+      const tokens = this.store ? await this.store.load(this.url) : this.tokens
+      if (!tokens) throw notLoggedIn()
+      this.tokens = tokens
+      const key = this.key(audience)
+      const token = fresh(tokens, key)
+      if (token && (!forceRefresh || token !== used)) return token
+      const response = await refresh(this.ctx, tokens, tokens.resources[audience])
+      const next: StoredTokens = {
+        ...tokens,
+        access: { ...tokens.access, [key]: toAccess(this.ctx, response) },
+        refreshToken: response.refresh_token ?? tokens.refreshToken,
+        scope: response.scope ?? tokens.scope,
       }
-    }
-    const tokens = this.tokens
-    const response = await refresh(this.ctx, tokens, tokens.resources[audience])
-    tokens.access[key] = toAccess(this.ctx, response)
-    if (response.refresh_token) tokens.refreshToken = response.refresh_token
-    if (this.store) await this.store.save(tokens)
-    return response.access_token
+      if (this.store) await this.store.save(next)
+      this.tokens = next
+      return response.access_token
+    })
   }
 
   /** fetch with the bearer token; on 401 refresh once and retry. */
   async authorizedFetch(audience: Audience, url: string, init: RequestInit): Promise<Response> {
-    const attempt = async (force: boolean) => {
-      const token = await this.token(audience, force)
+    const attempt = async (token: string) => {
       try {
         return await this.ctx.fetch(url, { ...init, headers: { ...(init.headers as Record<string, string>), authorization: `Bearer ${token}` } })
       } catch (error) {
@@ -81,10 +84,11 @@ export class Hub {
         throw new CliError(`ハブに接続できません（${this.url}）: ${cause?.code ?? (error as Error).message}`, EXIT.unavailable, { code: 'network' })
       }
     }
-    let response = await attempt(false)
+    const token = await this.token(audience)
+    let response = await attempt(token)
     if (response.status === 401 && !this.staticToken && this.tokens?.refreshToken) {
       await response.body?.cancel().catch(() => {})
-      response = await attempt(true)
+      response = await attempt(await this.token(audience, true, token))
     }
     return response
   }

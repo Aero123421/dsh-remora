@@ -13,7 +13,7 @@
  */
 import { createHash } from 'node:crypto'
 import {
-  remoraRequestId, TASK_WAIT_MAX_MS, TERMINAL_TASK_STATES,
+  OWNER_CLIENT_ID, remoraRequestId, TASK_WAIT_MAX_MS, TERMINAL_TASK_STATES,
   type AttentionItem, type DeliverableRef, type OperationParams, type OperationResults, type RemoraError, type TaskInfo, type TaskState,
 } from '@dsh-remora/protocol'
 import type { OperationContext, TaskRecord } from '../ops/types.ts'
@@ -66,10 +66,50 @@ export class Tasks {
 
   // --- records ---------------------------------------------------------------
 
-  private own(taskId: string, context: OperationContext): TaskRecord {
+  private own(taskId: string, context: OperationContext, ownerMayInspect = false): TaskRecord {
     const record = this.rt.deps.tasks.get(taskId)
-    if (!record || record.clientId !== context.actor.clientId) throw notFound(`task ${taskId} not found on this host`)
+    if (!record || (record.clientId !== context.actor.clientId && !(ownerMayInspect && context.actor.clientId === OWNER_CLIENT_ID))) {
+      throw notFound(`task ${taskId} not found on this host`)
+    }
     return record
+  }
+
+  private async checkScope(record: TaskRecord, signal: AbortSignal): Promise<boolean> {
+    if (record.sessionId === null) return true
+    try {
+      await this.rt.row(record.sessionId, signal)
+      return true
+    } catch (error) {
+      if (!(error instanceof OperationError) || error.code !== 'gone') throw error
+      if (!TERMINAL_TASK_STATES.has(record.state)) await this.save(record, 'failed', { code: 'gone', message: error.message })
+      return false
+    }
+  }
+
+  /** A disappeared session settles its active tasks without inspecting any log. */
+  async sessionGone(sessionId: string, message: string): Promise<void> {
+    for (const record of this.active(sessionId)) await this.save(record, 'failed', { code: 'gone', message })
+  }
+
+  private summary(record: TaskRecord): TaskInfo {
+    return {
+      taskId: record.taskId,
+      hostId: '',
+      sessionId: record.sessionId,
+      state: record.state,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      ...(record.error ? { error: record.error } : {}),
+    }
+  }
+
+  private missingInfo(record: TaskRecord): TaskInfo {
+    return this.summary(this.rt.deps.tasks.get(record.taskId) ?? record)
+  }
+
+  /** Wake waits so they can apply a narrowed scope without waiting for a session event. */
+  settingsChanged(): void {
+    for (const waiters of this.waiters.values()) for (const wake of waiters) wake()
   }
 
   private async save(record: TaskRecord, state: TaskState, error?: RemoraError): Promise<TaskRecord> {
@@ -172,15 +212,8 @@ export class Tasks {
   }
 
   async info(record: TaskRecord, context: OperationContext, evaluation?: Evaluation): Promise<TaskInfo> {
-    const info: TaskInfo = {
-      taskId: record.taskId,
-      hostId: '',
-      sessionId: record.sessionId,
-      state: record.state,
-      createdAt: record.createdAt,
-      updatedAt: record.updatedAt,
-      ...(record.error ? { error: record.error } : {}),
-    }
+    if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
+    const info = this.summary(record)
     if (record.sessionId === null) return info
     info.hasLiveClient = this.rt.hasLiveClient(record.sessionId)
     if (record.state === 'needs_attention') {
@@ -208,6 +241,8 @@ export class Tasks {
         info.result = { reply: null }
       }
     }
+    // A long wait or content read must not return data after its session left scope.
+    if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
     return info
   }
 
@@ -330,6 +365,7 @@ export class Tasks {
   }
 
   private async finish(record: TaskRecord, context: OperationContext): Promise<TaskInfo> {
+    if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
     const { record: next, evaluation } = await this.refresh(record, context.signal).catch(() => ({ record, evaluation: undefined }))
     return this.info(next, context, evaluation)
   }
@@ -388,11 +424,12 @@ export class Tasks {
   }
 
   async get(params: Params<'task.get'>, context: OperationContext): Promise<Result<'task.get'>> {
-    return this.finish(this.own(params.taskId, context), context)
+    return this.finish(this.own(params.taskId, context, true), context)
   }
 
   async wait(params: Params<'task.wait'>, context: OperationContext): Promise<Result<'task.wait'>> {
-    let record = this.own(params.taskId, context)
+    let record = this.own(params.taskId, context, true)
+    if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
     const deadline = Date.now() + Math.min(params.timeoutMs ?? TASK_WAIT_MAX_MS, TASK_WAIT_MAX_MS)
     const settled = (state: TaskState): boolean => TERMINAL_TASK_STATES.has(state) || state === 'needs_attention'
     let evaluation: Evaluation | undefined
@@ -401,6 +438,7 @@ export class Tasks {
     } catch {
       // keep the stored state
     }
+    if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
     while (!settled(record.state) && Date.now() < deadline && !context.signal.aborted) {
       await new Promise<void>((resolveWait) => {
         const set = this.waiters.get(record.taskId) ?? new Set()
@@ -416,6 +454,7 @@ export class Tasks {
         context.signal.addEventListener('abort', done, { once: true })
       })
       record = this.rt.deps.tasks.get(record.taskId) ?? record
+      if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
       evaluation = undefined
     }
     return this.info(record, context, evaluation)
@@ -472,30 +511,33 @@ export class Tasks {
   }
 
   async cancel(params: Params<'task.cancel'>, context: OperationContext): Promise<Result<'task.cancel'>> {
-    let record = this.own(params.taskId, context)
+    let record = this.own(params.taskId, context, true)
+    if (!await this.checkScope(record, context.signal)) return { cancelled: false, how: 'already-finished' }
     if (TERMINAL_TASK_STATES.has(record.state)) return { cancelled: false, how: 'already-finished' }
     if (!record.sessionId) {
       await this.save(record, 'cancelled')
       return { cancelled: true, how: 'removed-from-queue' }
     }
     const sessionId = record.sessionId
-    await this.rt.row(sessionId, context.signal)
     const values = await this.rt.projections(sessionId, context.signal)
     const inbox = [...values?.inbox?.['next-turn'] ?? [], ...values?.inbox?.['next-step'] ?? []]
     const queued = inbox.find(item => rpcIdOf(item) === record.requestId) as { id?: unknown } | undefined
     if (queued && typeof queued.id === 'string') {
       try {
         await this.rt.sessions.updateQueue({ sessionId, itemId: queued.id, action: { kind: 'remove' } })
+        await this.save(record, 'cancelled')
+        return { cancelled: true, how: 'removed-from-queue' }
       } catch (error) {
         const failure = fromDsh(error, 'removing the queued prompt failed')
         if (failure.code !== 'not_found') throw failure
       }
-      await this.save(record, 'cancelled')
-      return { cancelled: true, how: 'removed-from-queue' }
+      // DSH may have claimed it after the inbox snapshot. Read the turn again;
+      // losing the queue item is not proof that the task was cancelled.
     }
     const events = await this.rt.events(sessionId, context.signal)
     const turn = findTaskTurn(events, record.requestId)
-    if (turn && !turn.end && this.rt.liveAgent(sessionId)) {
+    const latest = events.findLast(event => event.type === 'turn/start' || event.type === 'turn/end')
+    if (turn && !turn.end && latest?.type === 'turn/start' && turn.turns.at(-1) === latest.data?.turn && this.rt.isRunning(sessionId)) {
       try {
         await this.rt.sessions.cancel({ sessionId })
       } catch (error) {
@@ -504,7 +546,8 @@ export class Tasks {
       record = await this.save(record, 'cancelled')
       return { cancelled: true, how: 'stopped-session' }
     }
-    await this.refresh(record, context.signal).catch(() => undefined)
-    return { cancelled: false, how: 'already-finished' }
+    const refreshed = await this.refresh(record, context.signal)
+    if (TERMINAL_TASK_STATES.has(refreshed.record.state)) return { cancelled: false, how: 'already-finished' }
+    throw new OperationError('conflict', 'the task is changing turns; retry cancellation')
   }
 }

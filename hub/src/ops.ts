@@ -4,7 +4,7 @@
  * the host Durable Object (or answer hub operations here).
  */
 import { stampAnswerUrls } from './attention.ts'
-import { AUDIT_MAX_ROWS, FREE_TIER, RATE_LIMITS, dcrEnabled } from './config.ts'
+import { AUDIT_MAX_ROWS, FREE_TIER, OWNER_CLIENT_ID, RATE_LIMITS, dcrEnabled } from './config.ts'
 import type { ConfirmationView, ExecuteResult, HostLive } from './host-do.ts'
 import { denied } from './host-do.ts'
 import { APPROVAL_RESULT_MS, type ApprovalRecord } from './hub-do.ts'
@@ -75,6 +75,7 @@ function withAnswerLinks(outcome: ExecuteResult, origin: string): ExecuteResult 
 }
 
 async function runOperationInner(env: Env, caller: Caller, op: string, rawParams: unknown, options: RunOptions): Promise<ExecuteResult> {
+  if (caller.kind === 'client' && caller.clientId === OWNER_CLIENT_ID) return err('denied', 'This client id is reserved for the signed-in owner.')
   const spec = findOperation(op)
   if (!spec) return err('not_found', `Unknown operation: ${op}`)
   const params = (rawParams ?? {}) as Record<string, unknown>

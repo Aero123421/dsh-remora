@@ -34,8 +34,7 @@ export function hubOrigin(request: Request, env: Env): string {
   return new URL(request.url).origin
 }
 
-/** The client id the owner UI acts as. Its tasks are visible to the owner only. */
-export const OWNER_CLIENT_ID = 'hub-ui'
+export { OWNER_CLIENT_ID } from './vendor/protocol/index.ts'
 /** Audit rows kept per log (hub and each host); older rows are dropped. */
 export const AUDIT_MAX_ROWS = AUDIT_KEPT_ROWS
 

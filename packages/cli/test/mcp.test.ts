@@ -1,6 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { rm } from 'node:fs/promises'
 import { main } from '../src/main.ts'
+import { Hub } from '../src/hub.ts'
+import { McpForwarder, runMcpBridge } from '../src/mcp.ts'
 import { FakeHub, seedLogin, testCtx } from './helpers.ts'
 
 const lines = (...messages: unknown[]) => messages.map(m => (typeof m === 'string' ? m : JSON.stringify(m))).join('\n') + '\n'
@@ -106,4 +109,64 @@ test('mcp bridge adds the 2026-07-28 headers and passes JSON-RPC errors through'
   } finally {
     await hub.stop()
   }
+})
+
+function resetResponse(type: string, firstChunk: string): Response {
+  let first = true
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (first) { first = false; controller.enqueue(new TextEncoder().encode(firstChunk)) }
+      else controller.error(new Error('connection reset with private fixture detail'))
+    },
+  }, { highWaterMark: 0 })
+  return new Response(body, { headers: { 'content-type': type } })
+}
+
+test('MCP JSON body reset replies to the request and a later request still works after failed initialize', async t => {
+  let calls = 0
+  const fixture = await testCtx({
+    stdinText: lines({ jsonrpc: '2.0', id: 1, method: 'initialize' }, { jsonrpc: '2.0', id: 2, method: 'tools/list' }),
+    fetch: async () => ++calls === 1
+      ? resetResponse('application/json', '{"jsonrpc":"2.0",')
+      : Response.json({ jsonrpc: '2.0', id: 2, result: { tools: [] } }),
+  })
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+  const hub = new Hub(fixture.ctx, 'https://hub.example.com', null, null, 'fixture-access')
+  assert.equal(await runMcpBridge(fixture.ctx, hub), 0)
+  const replies = fixture.out.map(line => JSON.parse(line))
+  assert.equal(replies.length, 2)
+  assert.equal(replies.find(reply => reply.id === 1)?.error?.code, -32000)
+  assert.deepEqual(replies.find(reply => reply.id === 2)?.result, { tools: [] })
+  assert.ok(!fixture.stdout().includes('private fixture detail'), 'transport errors do not expose raw body failures')
+})
+
+test('MCP SSE reset replies only to unanswered batch IDs and preserves notifications', async t => {
+  const fixture = await testCtx({
+    fetch: async () => resetResponse('text/event-stream', [
+      'data: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n\n',
+      'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}\n\n',
+    ].join('')),
+  })
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+  const hub = new Hub(fixture.ctx, 'https://hub.example.com', null, null, 'fixture-access')
+  const replies: unknown[] = []
+  await new McpForwarder(hub).send([
+    { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+    { jsonrpc: '2.0', id: 'pending', method: 'tools/call' },
+    { jsonrpc: '2.0', method: 'notifications/initialized' },
+  ], reply => { replies.push(reply) })
+  assert.deepEqual(replies, [
+    { jsonrpc: '2.0', id: 1, result: { ok: true } },
+    { jsonrpc: '2.0', method: 'notifications/progress', params: { progress: 1 } },
+    { jsonrpc: '2.0', id: 'pending', error: { code: -32000, message: 'Remora: ハブとの接続が応答の途中で切れました' } },
+  ])
+})
+
+test('MCP notification-only request gets no response on body reset', async t => {
+  const fixture = await testCtx({ fetch: async () => resetResponse('application/json', '{') })
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+  const replies: unknown[] = []
+  await new McpForwarder(new Hub(fixture.ctx, 'https://hub.example.com', null, null, 'fixture-access'))
+    .send({ jsonrpc: '2.0', method: 'notifications/initialized' }, reply => { replies.push(reply) })
+  assert.deepEqual(replies, [])
 })

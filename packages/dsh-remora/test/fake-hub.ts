@@ -27,7 +27,6 @@ async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
 }
 
 export class FakeHub {
-  readonly origin: string
   readonly options: FakeHubOptions
   readonly hostId = 'host_test1'
   publicKey: string | null = null
@@ -55,7 +54,6 @@ export class FakeHub {
 
   constructor(options: FakeHubOptions) {
     this.options = options
-    this.origin = `http://127.0.0.1:${options.port}`
     this.server = createServer((req, res) => { void this.http(req, res) })
     this.wss = new WebSocketServer({ noServer: true })
     this.server.on('upgrade', (req, socket, head) => {
@@ -64,8 +62,17 @@ export class FakeHub {
     })
   }
 
+  get origin(): string {
+    const address = this.server.address()
+    const port = typeof address === 'object' && address !== null ? address.port : this.options.port
+    return `http://127.0.0.1:${port}`
+  }
+
   listen(): Promise<void> {
-    return new Promise(resolve => this.server.listen(this.options.port, '127.0.0.1', () => resolve()))
+    return new Promise((resolve, reject) => {
+      this.server.once('error', reject)
+      this.server.listen(this.options.port, '127.0.0.1', () => { this.server.off('error', reject); resolve() })
+    })
   }
 
   async close(): Promise<void> {

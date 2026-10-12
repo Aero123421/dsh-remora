@@ -26,6 +26,7 @@ describe('owner pages', () => {
           { attentionId: 'q2', hostId: host.hostId, sessionId: 's1', kind: 'question', title: 'Legacy question', answerable: false, createdAt: now },
         ] } }
         case 'task.start': return { ok: true, result: { taskId: frame.taskId, state: 'accepted', sessionId: 's1', createdAt: now, updatedAt: now } }
+        case 'task.get': return { ok: true, result: { taskId: frame.taskId, state: 'accepted', sessionId: 's1', createdAt: now, updatedAt: now } }
         default: return { ok: true, result: { accepted: true } }
       }
     }

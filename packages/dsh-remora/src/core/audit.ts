@@ -11,6 +11,7 @@ import { appendFile, mkdir, readFile, rename, stat } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { canonicalJson, type DenialLayer, type DenialReason } from '@dsh-remora/protocol'
+import { withFileLock } from './lock.ts'
 
 export const GENESIS_HASH = '0'.repeat(64)
 
@@ -100,7 +101,14 @@ export class AuditLog {
 
   /** Append one entry. Resolves once it is written. Failures are reported to the caller. */
   append(input: AuditInput): Promise<AuditEntry> {
-    const run = this.queue.then(async () => {
+    const run = this.queue.then(() => withFileLock(this.dir, 'audit.lock', async () => {
+      // Settings can be edited in several DSH processes; continue the chain
+      // written by the last writer while holding the shared mutation lock.
+      const stored = await AuditLog.open(this.dir, { keep: this.keep, maxBytes: this.maxBytes, now: this.now })
+      this.recent = stored.recent
+      this.last = stored.last
+      this.size = stored.size
+      this.intact = this.intact && stored.intact
       const body = { ...input, seq: this.last.seq + 1, at: this.now(), prev: this.last.hash }
       const entry: AuditEntry = { ...body, hash: hashOf(body) }
       const line = `${JSON.stringify(entry)}\n`
@@ -111,7 +119,7 @@ export class AuditLog {
       this.recent.push(entry)
       if (this.recent.length > this.keep) this.recent.splice(0, this.recent.length - this.keep)
       return entry
-    })
+    }))
     this.queue = run.then(() => undefined, () => undefined)
     return run
   }
@@ -120,6 +128,9 @@ export class AuditLog {
   entries(): readonly AuditEntry[] {
     return this.recent
   }
+
+  /** Await writes before the plugin's shared storage is torn down. */
+  flush(): Promise<void> { return this.queue }
 
   private async rotate(): Promise<void> {
     const target = join(this.dir, `audit-${new Date(this.now()).toISOString().replace(/[:.]/g, '-')}.jsonl`)

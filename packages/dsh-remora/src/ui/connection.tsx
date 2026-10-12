@@ -37,7 +37,7 @@ export function ConnectionSection({ snapshot, t, run, busy }: SectionProps) {
           {link.lastError && link.state !== 'connected' ? <span className="rmr-faint">{t('conn.lastError', { error: link.lastError })}</span> : null}
         </div>
         <div className="rmr-row-actions">
-          <Button variant="outline" size="sm" disabled={busy || snapshot.settings.killSwitch} onClick={() => { void run('reconnect') }}>{t('conn.reconnect')}</Button>
+          <Button variant="outline" size="sm" disabled={busy || snapshot.settings.killSwitch || hub.lock === 'restart'} onClick={() => { void run('reconnect') }}>{t('conn.reconnect')}</Button>
         </div>
       </div>
       <div className="rmr-row">
@@ -47,7 +47,7 @@ export function ConnectionSection({ snapshot, t, run, busy }: SectionProps) {
           <span className="rmr-faint">{t('conn.hostId')}: <span className="rmr-mono">{hub.hostId}</span> · {t('conn.passkeys', { count: hub.ownerCredentials })}</span>
         </div>
         <div className="rmr-row-actions">
-          <Button variant="outline" size="sm" disabled={busy || waiting} onClick={() => setRepairing(value => !value)}>{t('conn.repair')}</Button>
+          <Button variant="outline" size="sm" disabled={busy || waiting || hub.lock === 'restart' || hub.lock === 'other'} onClick={() => setRepairing(value => !value)}>{t('conn.repair')}</Button>
           <Button variant="ghost" size="sm" disabled={busy} onClick={() => setConfirmUnpair(true)}>{t('conn.unpair')}</Button>
         </div>
       </div>
@@ -56,6 +56,7 @@ export function ConnectionSection({ snapshot, t, run, busy }: SectionProps) {
       ? <p className="rmr-notice" data-tone={snapshot.lastUnpair.hub === 'removed' ? 'info' : undefined}>{t(snapshot.lastUnpair.hub === 'removed' ? 'conn.unpairedHub' : 'conn.unpairedLocalOnly')}</p> : null}
 
     {hub.lock === 'other' ? <p className="rmr-notice">{t('conn.lockOther')}</p> : null}
+    {hub.lock === 'restart' ? <p className="rmr-notice">{t('conn.restart')}</p> : null}
     {hub.revoked ? <p className="rmr-notice" data-tone="danger">{t('conn.revoked')}</p> : null}
     {link.lastError === 'protocol_mismatch' ? <p className="rmr-notice" data-tone="danger">{t('conn.protocolMismatch')}</p> : null}
 
@@ -89,7 +90,7 @@ export function ConnectionSection({ snapshot, t, run, busy }: SectionProps) {
           <Input className="rmr-grow" data-testid="remora-hub-url" value={hubUrl} placeholder="https://remora-hub.example.workers.dev" aria-label={t('conn.hubUrl')} disabled={waiting} onChange={event => setHubUrl(event.target.value)} />
           {waiting
             ? <Button variant="outline" size="sm" onClick={() => { void run('pairing-cancel') }}>{t('cancel')}</Button>
-            : <Button variant="primary" size="sm" data-testid="remora-pair-start" disabled={busy || hubUrl.trim() === '' || !snapshot.local} title={snapshot.local ? undefined : t('err.local-only')}
+            : <Button variant="primary" size="sm" data-testid="remora-pair-start" disabled={busy || hubUrl.trim() === '' || !snapshot.local || hub.lock === 'restart' || hub.lock === 'other'} title={snapshot.local ? undefined : t('err.local-only')}
               onClick={() => { void run('pairing-start', { hubUrl }).then(ok => { if (ok) setRepairing(false) }) }}>{hub.paired ? t('conn.repair') : t('conn.pair')}</Button>}
         </div>
       </div>

@@ -1,9 +1,13 @@
 import { createHash, generateKeyPairSync, sign, type KeyObject } from 'node:crypto'
+import { IncomingMessage, ServerResponse } from 'node:http'
+import { Socket } from 'node:net'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { confirmationChallenge, toBase64Url, type Confirmation, type OwnerCredential } from '@dsh-remora/protocol'
 import type { FetchRoute, HostContext } from '../src/dsh.ts'
+
+const peers = new WeakMap<Request, string>()
 
 export async function tempDir(prefix = 'remora-test-'): Promise<{ dir: string; cleanup: () => Promise<void> }> {
   const dir = await mkdtemp(join(tmpdir(), prefix))
@@ -89,37 +93,64 @@ export async function makeConfirmation(passkey: Passkey, options: AssertionOptio
 export interface FakeHost {
   ctx: HostContext
   routes: Map<string, FetchRoute>
-  disposers: (() => void)[]
+  disposers: (() => void | Promise<void>)[]
   dispose(): void
   warnings: unknown[][]
 }
 
 export function fakeHost(services: Record<string, unknown> = {}): FakeHost {
   const routes = new Map<string, FetchRoute>()
-  const disposers: (() => void)[] = []
+  const disposers: (() => void | Promise<void>)[] = []
   const warnings: unknown[][] = []
+  type Listener = Parameters<HostContext['on']>[1]
+  const listeners = new Map<string, Listener[]>()
   const ctx: HostContext = {
-    connection: { fetch: { register: route => { routes.set(route.path, route) } } },
+    connection: { fetch: { register: route => { routes.set(route.path, { ...route, fetch: async request => {
+      const socket = new Socket()
+      Object.defineProperty(socket, 'remoteAddress', { value: peers.get(request) ?? '127.0.0.1' })
+      const incoming = new IncomingMessage(socket)
+      const outgoing = new ServerResponse(incoming)
+      let response: Response | undefined
+      const run = async (index: number): Promise<void> => {
+        const listener = listeners.get('connection/request')?.[index]
+        if (listener) await listener(incoming, outgoing, () => run(index + 1))
+        else response = await route.fetch(request)
+      }
+      await run(0)
+      if (!response) throw new Error('request waterfall did not delegate')
+      return response
+    } }) } } },
     get: service => services[service],
     effect: setup => { disposers.push(setup()) },
+    on: (_event, listener, options) => {
+      const list = listeners.get(_event) ?? []
+      if (options?.prepend) list.unshift(listener)
+      else list.push(listener)
+      listeners.set(_event, list)
+      const dispose = () => { const index = list.indexOf(listener); if (index >= 0) list.splice(index, 1) }
+      disposers.push(dispose)
+      return dispose
+    },
     logger: { info: () => {}, warn: (...args) => { warnings.push(args) } },
   }
   return { ctx, routes, disposers, warnings, dispose: () => { for (const d of disposers.splice(0)) d() } }
 }
 
-export async function rpc<T = unknown>(routes: Map<string, FetchRoute>, method: string, payload: unknown = {}, init: { contentType?: string; envelopeMethod?: string; host?: string; origin?: string; headers?: Record<string, string> } = {}): Promise<{ ok: true; value: T } | { ok: false; error: { code: string; details: { detail?: string } } }> {
+export async function rpc<T = unknown>(routes: Map<string, FetchRoute>, method: string, payload: unknown = {}, init: { peer?: string; contentType?: string; envelopeMethod?: string; host?: string; origin?: string; headers?: Record<string, string> } = {}): Promise<{ ok: true; value: T } | { ok: false; error: { code: string; details: { detail?: string } } }> {
   const response = await rawRpc(routes, method, payload, init)
   const body = await response.json() as { result: { ok: true; value: T } | { ok: false; error: { code: string; details: { detail?: string } } } }
   return body.result
 }
 
-export async function rawRpc(routes: Map<string, FetchRoute>, method: string, payload: unknown = {}, init: { contentType?: string; envelopeMethod?: string; host?: string; origin?: string; headers?: Record<string, string> } = {}): Promise<Response> {
+export async function rawRpc(routes: Map<string, FetchRoute>, method: string, payload: unknown = {}, init: { peer?: string; contentType?: string; envelopeMethod?: string; host?: string; origin?: string; headers?: Record<string, string> } = {}): Promise<Response> {
   const route = routes.get(`/api/remora/${method}`)
   if (!route) throw new Error(`no route for ${method}`)
   const body = JSON.stringify({ type: 'client-request', rpcId: 'r1', method: init.envelopeMethod ?? `remora/${method}`, payload })
   const headers: Record<string, string> = { 'content-type': init.contentType ?? 'application/json', host: init.host ?? '127.0.0.1:5173', ...init.headers }
   if (init.origin !== undefined) headers.origin = init.origin
-  return route.fetch(new Request(`http://dsh.internal/api/remora/${method}`, { method: 'POST', headers, body }))
+  const request = new Request(`http://dsh.internal/api/remora/${method}`, { method: 'POST', headers, body })
+  peers.set(request, init.peer ?? '127.0.0.1')
+  return route.fetch(request)
 }
 
 export async function until(check: () => boolean, timeoutMs = 3000, what = 'condition'): Promise<void> {

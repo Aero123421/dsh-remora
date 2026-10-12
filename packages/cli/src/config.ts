@@ -1,6 +1,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import type { Ctx } from './ctx.ts'
 import { usageError } from './errors.ts'
 
@@ -36,10 +37,14 @@ export async function loadProfile(ctx: Pick<Ctx, 'env' | 'platform'>): Promise<P
 export async function writePrivate(path: string, content: string): Promise<void> {
   const dir = join(path, '..')
   await mkdir(dir, { recursive: true, mode: 0o700 })
-  const tmp = `${path}.${process.pid}.tmp`
-  await writeFile(tmp, content, { mode: 0o600 })
-  await chmod(tmp, 0o600).catch(() => {})
-  await rename(tmp, path)
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await writeFile(tmp, content, { mode: 0o600, flag: 'wx' })
+    await chmod(tmp, 0o600).catch(() => {})
+    await rename(tmp, path)
+  } finally {
+    await rm(tmp, { force: true })
+  }
 }
 
 export async function saveProfile(ctx: Pick<Ctx, 'env' | 'platform'>, profile: Profile): Promise<void> {

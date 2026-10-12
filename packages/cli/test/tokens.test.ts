@@ -1,8 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readdir, stat } from 'node:fs/promises'
+import { readdir, readFile, rm, stat } from 'node:fs/promises'
 import type { ExecOptions, ExecResult } from '../src/ctx.ts'
-import { openTokenStore, type StoredTokens } from '../src/tokens.ts'
+import { FileBackend, LayeredTokenStore, openTokenStore, type SecretBackend, type StoredTokens } from '../src/tokens.ts'
+import { writePrivate } from '../src/config.ts'
 import { testCtx } from './helpers.ts'
 
 const tokens: StoredTokens = {
@@ -98,4 +99,75 @@ test('macOS and Windows backends pass secrets on stdin only', async () => {
   assert.deepEqual(await (await openTokenStore(win.ctx)).load(tokens.hubUrl), tokens)
   const files = await readdir(win.dir)
   assert.ok(files[0]?.endsWith('.dpapi'))
+})
+
+for (const failure of ['throw', 'read-back'] as const) {
+  test(`fresh file fallback wins over an old readable keychain after ${failure}`, async t => {
+    const fixture = await testCtx()
+    t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+    const file = new FileBackend(fixture.dir)
+    let value: string | null = null
+    let broken = false
+    const keychain: SecretBackend = {
+      name: 'libsecret',
+      get: async () => value,
+      set: async (_account, next) => {
+        if (broken) {
+          if (failure === 'throw') throw new Error('locked')
+          return
+        }
+        value = next
+      },
+      delete: async () => { throw new Error('locked') },
+    }
+    const store = new LayeredTokenStore(keychain, file, () => {})
+    await store.save(tokens)
+    broken = true
+    const updated: StoredTokens = { ...tokens, scope: 'dsh.read dsh.admin', refreshToken: 'rt-updated' }
+    assert.equal(await store.save(updated), 'file')
+    const reopened = new LayeredTokenStore(keychain, file, () => {})
+    assert.deepEqual(await reopened.load(tokens.hubUrl), updated)
+    assert.equal(reopened.location, 'file')
+
+    broken = false
+    assert.equal(await reopened.save(updated), 'libsecret')
+    assert.equal(await file.get(tokens.hubUrl), null, 'a verified keychain write removes the fallback')
+    await reopened.clear(tokens.hubUrl)
+    assert.equal(await new LayeredTokenStore(keychain, file, () => {}).load(tokens.hubUrl), null, 'failed deletion cannot restore old credentials')
+    assert.ok(!(await file.get(tokens.hubUrl))?.includes('rt-'), 'logout retains only a nonsecret tombstone')
+  })
+}
+
+test('concurrent atomic writes use private independent temporary files', async t => {
+  const fixture = await testCtx()
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+  const path = `${fixture.dir}/tokens.json`
+  const contents = Array.from({ length: 24 }, (_, i) => JSON.stringify({ i, payload: 'x'.repeat(4096) }))
+  await Promise.all(contents.map(content => writePrivate(path, content)))
+  assert.ok(contents.includes(await readFile(path, 'utf8')))
+  assert.deepEqual(await readdir(fixture.dir), ['tokens.json'])
+})
+
+test('a logout tombstone does not suppress the first plaintext fallback warning', async t => {
+  const fixture = await testCtx()
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+  const file = new FileBackend(fixture.dir)
+  let value: string | null = null
+  let failed = false
+  const keychain: SecretBackend = {
+    name: 'libsecret',
+    get: async () => value,
+    set: async (_account, next) => { if (failed) throw new Error('locked'); value = next },
+    delete: async () => { value = null },
+  }
+  const initial = new LayeredTokenStore(keychain, file, () => {})
+  await initial.save(tokens)
+  await initial.clear(tokens.hubUrl)
+  const warnings: string[] = []
+  const reopened = new LayeredTokenStore(keychain, file, message => { warnings.push(message) })
+  failed = true
+  assert.equal(await reopened.save(tokens), 'file')
+  assert.equal(await reopened.save({ ...tokens, refreshToken: 'next-refresh' }), 'file')
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0] ?? '', /0600.*暗号化なし/)
 })

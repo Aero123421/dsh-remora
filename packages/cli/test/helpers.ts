@@ -77,8 +77,8 @@ export interface FakeHubOptions {
 }
 
 export class FakeHub {
-  readonly port: number
-  readonly url: string
+  port: number
+  url: string
   readonly options: FakeHubOptions
   server: Server | null = null
   ops: Record<string, OpHandler> = {}
@@ -93,7 +93,7 @@ export class FakeHub {
   devicePolls: string[]
   private counter = 0
 
-  constructor(port: number, options: FakeHubOptions = {}) {
+  constructor(port = 0, options: FakeHubOptions = {}) {
     this.port = port
     this.url = `http://127.0.0.1:${port}`
     this.options = options
@@ -103,6 +103,10 @@ export class FakeHub {
   async start(): Promise<this> {
     this.server = createServer((req, res) => { this.handle(req, res).catch(error => { res.writeHead(500); res.end(String(error)) }) })
     await new Promise<void>(resolve => this.server!.listen(this.port, '127.0.0.1', resolve))
+    const address = this.server.address()
+    if (!address || typeof address === 'string') throw new Error('fake hub has no TCP address')
+    this.port = address.port
+    this.url = `http://127.0.0.1:${this.port}`
     return this
   }
 

@@ -132,6 +132,7 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 | `maintenance.audit` | ハブの設定画面で `dsh.read`・`dsh.admin` の個人トークンを発行し、HTTP API の `audit.export` を呼ぶと `pending`（`/confirm/hub/<ID>`）で返る。承認前の `confirmation.get` には結果が無い。そのページでパスキーを使って承認すると `done` になり、受け取ったハブとホストの監査ログのハッシュ連鎖が、ハブの外（`packages/protocol/src/audit.ts`）で計算し直して正しい |
 | `maintenance.rotate-key` | ハブのホスト画面の「ホスト鍵の更新」をパスキーの再確認つきで押すと、実際のプラグインが新しい鍵を証明してつなぎ直し、`msg=key-rotated` になる。DSH の Remora タブは再び「Connected」になり、そのあとタスクが完了する。古い鍵のファイルは残らない |
 | `kill-switch.enforced` | DSH 側で緊急停止を入れると `task.start` が 403（`denied`、層は dsh）で拒否され、切ると再接続してタスクがまた完了する。`schedule.create` で残しておいた Remora 経由のスケジュールは消えている |
+| `host.safety` | 同じデータを使う npm 版 DSH を 2 プロセス起動し、別プロセスから緊急停止する。停止後の新規依頼と Hub で取り消したスケジュールがモデルへ届かないこと、LAN 接続で Host・Origin をループバックに偽装しても権限を上げられないことを確認する |
 
 ハブは `http://localhost:8788` として使います。WebAuthn は IP アドレスを RP ID にできないためです。ハブの状態は一時ディレクトリに置くので、毎回オーナー未登録の状態から始まります。`wrangler dev` には `WRANGLER_SEND_METRICS=false` と `CLOUDFLARE_CF_FETCH_ENABLED=false`（`Request.cf` を取りに行かない）を渡します。
 

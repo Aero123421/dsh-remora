@@ -16,7 +16,8 @@
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
+import { withFileLock } from './lock.ts'
 
 /** `$DSH_HOME` > `~/.dsh`, as DSH resolves it (`@deepseek-ai/dsh-home-paths`). */
 export function resolveDshHome(env: Record<string, string | undefined> = process.env): string {
@@ -106,13 +107,24 @@ export class JsonDocument<T> {
   static async open<T>(dir: string, spec: DocumentSpec<T>): Promise<JsonDocument<T>> {
     if (spec.migrations.length !== spec.version - 1) throw new Error(`${spec.file}: expected ${spec.version - 1} migrations`)
     const path = join(dir, spec.file)
+    const document = new JsonDocument(path, spec, spec.initial())
+    await withFileLock(dir, `${spec.file}.lock`, async () => {
+      const loaded = await document.read()
+      document.current = loaded.value
+      if (loaded.migrated) await document.write(loaded.value)
+    })
+    return document
+  }
+
+  private async read(): Promise<{ value: T; migrated: boolean }> {
+    const spec = this.spec
     let text: string | undefined
     try {
-      text = await readFile(path, 'utf8')
+      text = await readFile(this.path, 'utf8')
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
-    if (text === undefined) return new JsonDocument(path, spec, spec.initial())
+    if (text === undefined) return { value: spec.initial(), migrated: false }
     let envelope: Envelope
     try {
       const raw = JSON.parse(text) as Partial<Envelope>
@@ -136,9 +148,7 @@ export class JsonDocument<T> {
     } catch (error) {
       throw new StorageError('malformed', `${spec.file}: ${(error as Error).message}`)
     }
-    const document = new JsonDocument(path, spec, value)
-    if (envelope.version !== spec.version) await document.write(value)
-    return document
+    return { value, migrated: envelope.version !== spec.version }
   }
 
   get value(): T {
@@ -148,10 +158,23 @@ export class JsonDocument<T> {
   /** Apply `change` to the current value and persist it. Resolves after the write is durable. */
   update(change: (current: T) => T): Promise<T> {
     const run = this.queue.then(async () => {
-      const next = change(this.current)
-      await this.write(next)
-      this.current = next
-      return next
+      return withFileLock(dirname(this.path), `${basename(this.path)}.lock`, async () => {
+        const current = (await this.read()).value
+        const next = change(current)
+        if (next !== current) await this.write(next)
+        this.current = next
+        return next
+      })
+    })
+    this.queue = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  /** Reload an atomic file replacement made by another DSH process. */
+  refresh(): Promise<T> {
+    const run = this.queue.then(async () => {
+      this.current = (await this.read()).value
+      return this.current
     })
     this.queue = run.then(() => undefined, () => undefined)
     return run
@@ -160,8 +183,10 @@ export class JsonDocument<T> {
   /** Remove the file and return to the initial value. */
   reset(): Promise<void> {
     const run = this.queue.then(async () => {
-      await rm(this.path, { force: true })
-      this.current = this.spec.initial()
+      await withFileLock(dirname(this.path), `${basename(this.path)}.lock`, async () => {
+        await rm(this.path, { force: true })
+        this.current = this.spec.initial()
+      })
     })
     this.queue = run.then(() => undefined, () => undefined)
     return run
