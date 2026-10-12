@@ -31,7 +31,7 @@ function manualClock() {
 class FakeSocket implements SocketLike {
   readyState = 1
   sent: string[] = []
-  closed: { code?: number; reason?: string } | null = null
+  closed: { code: number | undefined; reason: string | undefined } | null = null
   private listeners: Record<string, ((event: never) => void)[]> = {}
   addEventListener(type: string, listener: (event: never) => void): void {
     (this.listeners[type] ??= []).push(listener)
@@ -113,7 +113,7 @@ test('a challenge for another origin is never signed', () => {
   assert.ok((t.link.status.retryAt ?? 0) >= SLOW_RETRY_MS)
 })
 
-test('auth failures back off slowly; protocol mismatch and revocation stop', () => {
+test('auth failures back off slowly; a protocol mismatch stops reconnecting', () => {
   const t = setup()
   t.link.start()
   ;(t.sockets[0] as FakeSocket).receive(JSON.stringify({ t: 'close', reason: 'auth_failed' }))
