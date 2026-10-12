@@ -50,12 +50,16 @@ export function RemoraPage({ ctx }: { ctx: ClientContext }) {
       {snapshot.local ? null : <p className="rmr-notice" data-tone="info">{t('remoteNotice')}</p>}
       <KillSwitch snapshot={snapshot} t={t} run={run} busy={busy} />
       {error ? <p className="rmr-error" role="alert">{error}</p> : null}
-      <SegmentedControl id="rmr-tabs" className="rmr-tabs" value={tab} label={t('title')} options={TABS.map(value => ({ value, label: t(`tab.${value}`) }))} onChange={setTab} />
-      {tab === 'connection' ? <ConnectionSection snapshot={snapshot} t={t} run={run} busy={busy} /> : null}
-      {tab === 'permissions' ? <PermissionsSection snapshot={snapshot} t={t} run={run} busy={busy} /> : null}
-      {tab === 'scope' ? <ScopeSection snapshot={snapshot} t={t} run={run} busy={busy} ctx={ctx} /> : null}
-      {tab === 'activity' ? <ActivitySection snapshot={snapshot} t={t} ctx={ctx} /> : null}
-      {tab === 'compat' ? <CompatSection snapshot={snapshot} t={t} ctx={ctx} busy={busy} /> : null}
+      <div className="rmr-tabs-scroll">
+        <SegmentedControl id="rmr-tabs" className="rmr-tabs" value={tab} label={t('title')} options={TABS.map(value => ({ value, label: t(`tab.${value}`) }))} onChange={setTab} />
+      </div>
+      <div id={`rmr-tabs-${tab}-panel`} role="tabpanel" aria-labelledby={`rmr-tabs-${tab}`}>
+        {tab === 'connection' ? <ConnectionSection snapshot={snapshot} t={t} run={run} busy={busy} /> : null}
+        {tab === 'permissions' ? <PermissionsSection snapshot={snapshot} t={t} run={run} busy={busy} /> : null}
+        {tab === 'scope' ? <ScopeSection snapshot={snapshot} t={t} run={run} busy={busy} ctx={ctx} /> : null}
+        {tab === 'activity' ? <ActivitySection snapshot={snapshot} t={t} ctx={ctx} /> : null}
+        {tab === 'compat' ? <CompatSection snapshot={snapshot} t={t} ctx={ctx} busy={busy} /> : null}
+      </div>
     </> : null}
   </div>
 }
