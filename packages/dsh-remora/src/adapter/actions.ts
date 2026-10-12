@@ -124,6 +124,15 @@ export function createActions(rt: Runtime) {
           return { accepted: true }
         }
         case 'question': {
+          // Legacy mode (tool-ask-user's default): `userQuestions.ask` dispatches the
+          // `user-questions/request` waterfall and blocks until a listener answers.
+          // DSH Web's client listener holds the question; with no client attached,
+          // the waterfall falls through to NO_PROVIDER and the tool call fails at
+          // once. A host-side listener could race `next()`, but it cannot withdraw
+          // the Web card (`next()` takes no signal) and would turn "no UI → fail
+          // fast" into "wait forever", so Remora does not answer legacy questions.
+          // Timed mode records `continued` questions in the `userQuestions`
+          // projection, and `userQuestions.answer` is the supported way to answer.
           if (!item.answerable) {
             throw unavailable('this question is held by DSH Web (legacy ask_user_question mode); answer it there, or switch tool-ask-user to timed mode to answer remotely')
           }
