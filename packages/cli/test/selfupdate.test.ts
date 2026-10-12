@@ -105,3 +105,21 @@ test('Windows: the running binary is moved aside, then replaced', async () => {
   await replaceBinary(join(dir, 'remora.exe'), join(dir, 'new'), 'win32')
   assert.equal(await readFile(join(dir, 'remora.exe'), 'utf8'), 'fresh')
 })
+
+test('install scripts download the asset names from RELEASE_ASSETS', async () => {
+  const { RELEASE_ASSETS } = await import('@dsh-remora/protocol')
+  const root = join(import.meta.dirname, '../../..')
+  const sh = await readFile(join(root, 'scripts/install.sh'), 'utf8')
+  const ps1 = await readFile(join(root, 'scripts/install.ps1'), 'utf8')
+  // install.sh builds `remora-${os}-${arch}` with os ∈ {linux, darwin}, arch ∈ {x64, arm64}.
+  assert.match(sh, /asset="remora-\$\{os\}-\$\{arch\}"/)
+  for (const [os, arch] of [['linux', 'x64'], ['linux', 'arm64'], ['darwin', 'x64'], ['darwin', 'arm64']]) {
+    assert.ok(sh.includes(os === 'linux' ? 'Linux) os=linux' : 'Darwin) os=darwin'))
+    assert.ok(sh.includes(arch === 'x64' ? 'arch=x64' : 'arch=arm64'))
+    assert.equal(RELEASE_ASSETS.cli(os!, arch!), `remora-${os}-${arch}`)
+  }
+  assert.match(sh, new RegExp(`/${RELEASE_ASSETS.checksums}"`))
+  assert.match(ps1, /\$asset = "remora-win32-\$cpu\.exe"/)
+  assert.equal(RELEASE_ASSETS.cli('win32', 'x64'), 'remora-win32-x64.exe')
+  assert.match(ps1, new RegExp(`/${RELEASE_ASSETS.checksums}"`))
+})

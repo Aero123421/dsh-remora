@@ -11,7 +11,13 @@ import type { Ctx } from './ctx.ts'
 import { CliError } from './errors.ts'
 import type { Hub } from './hub.ts'
 
-export const MCP_CLIENT_PROTOCOL_VERSION = '2025-06-18'
+/** Tried first by `mcp probe`: no handshake, `_meta` + header checks. */
+export const MCP_MODERN_VERSION = '2026-07-28'
+/** Fallback with the classic `initialize` handshake. */
+export const MCP_LEGACY_VERSION = '2025-06-18'
+/** @deprecated kept for callers of round 1 */
+export const MCP_CLIENT_PROTOCOL_VERSION = MCP_LEGACY_VERSION
+const META_VERSION = 'io.modelcontextprotocol/protocolVersion'
 
 type Json = Record<string, unknown>
 
@@ -25,6 +31,27 @@ function requestIds(message: unknown): (string | number)[] {
 
 function isInitialize(message: unknown): boolean {
   return !Array.isArray(message) && (message as Json | null)?.method === 'initialize'
+}
+
+/** RFC 2047-style encoding the hub decodes for non-ASCII header values. */
+function headerValue(value: string): string {
+  return /^[\x20-\x7e]*$/.test(value) ? value : `=?base64?${Buffer.from(value, 'utf8').toString('base64')}?=`
+}
+
+/**
+ * MCP 2026-07-28 requests declare their version in `_meta` and must repeat
+ * it (plus the method and tool name) in headers. The bridge derives those
+ * headers from the message so a modern client works through it unchanged.
+ */
+function modernHeaders(message: unknown): Record<string, string> | null {
+  if (Array.isArray(message)) return null
+  const m = message as Json | null
+  const params = (m?.params ?? {}) as Json
+  const version = ((params._meta ?? {}) as Json)[META_VERSION]
+  if (typeof version !== 'string' || typeof m?.method !== 'string') return null
+  const headers: Record<string, string> = { 'mcp-protocol-version': version, 'mcp-method': m.method }
+  if (m.method === 'tools/call' && typeof params.name === 'string') headers['mcp-name'] = headerValue(params.name)
+  return headers
 }
 
 function rpcError(id: string | number | null, code: number, message: string): Json {
@@ -82,6 +109,7 @@ export class McpForwarder {
     const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }
     if (this.protocolVersion) headers['mcp-protocol-version'] = this.protocolVersion
     if (this.sessionId) headers['mcp-session-id'] = this.sessionId
+    Object.assign(headers, modernHeaders(message) ?? {})
     let response: Response
     try {
       response = await this.hub.authorizedFetch('mcp', this.hub.url + ENDPOINTS.mcp, { method: 'POST', headers, body: JSON.stringify(message) })
@@ -102,7 +130,9 @@ export class McpForwarder {
     if (!response.ok) {
       let detail = ''
       try {
-        const body = await response.json() as { error?: { message?: unknown } | string, error_description?: unknown }
+        const body = await response.json() as { jsonrpc?: unknown; error?: { message?: unknown } | string, error_description?: unknown }
+        // A JSON-RPC error with an HTTP status (e.g. 400 unsupported version) goes to the client as is.
+        if (body?.jsonrpc === '2.0' && ids.length > 0) { watch(body); return }
         const e = body?.error
         detail = typeof e === 'string' ? e : typeof e?.message === 'string' ? e.message : ''
       } catch { /* not JSON */ }
@@ -176,22 +206,42 @@ export interface ProbeResult {
   tools: { name: string; description?: string; annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean } }[]
 }
 
-/** initialize + tools/list (following cursors). */
+/**
+ * Try MCP 2026-07-28 (`server/discover`, no handshake) first; when the hub
+ * refuses it, fall back to the 2025-06-18 `initialize` handshake. Then list
+ * every tool (following cursors).
+ */
 export async function probe(hub: Hub): Promise<ProbeResult> {
   const forwarder = new McpForwarder(hub)
   let nextId = 1
+  let modern = false
   const call = async (method: string, params: Json): Promise<Json> => {
     const id = nextId++
     const replies: unknown[] = []
-    await forwarder.send({ jsonrpc: '2.0', id, method, params }, reply => { replies.push(...(Array.isArray(reply) ? reply : [reply])) })
+    const withMeta = modern ? { ...params, _meta: { ...(params._meta as Json | undefined), [META_VERSION]: MCP_MODERN_VERSION } } : params
+    await forwarder.send({ jsonrpc: '2.0', id, method, params: withMeta }, reply => { replies.push(...(Array.isArray(reply) ? reply : [reply])) })
     const reply = replies.find(r => (r as Json | null)?.id === id) as Json | undefined
     if (!reply) throw new CliError(`${method} の応答がありません。`)
     if (reply.error) throw new CliError(`${method} が失敗しました: ${String((reply.error as Json).message)}`)
     return reply.result as Json
   }
-  const init = await call('initialize', { protocolVersion: MCP_CLIENT_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'remora-cli', version: '0' } })
-  if (typeof init.protocolVersion === 'string') forwarder.protocolVersion = init.protocolVersion
-  await forwarder.send({ jsonrpc: '2.0', method: 'notifications/initialized' }, () => {})
+  let serverInfo: unknown
+  let protocolVersion: unknown
+  modern = true
+  try {
+    const discovered = await call('server/discover', {})
+    const versions = discovered.supportedVersions
+    if (Array.isArray(versions) && !versions.includes(MCP_MODERN_VERSION)) throw new CliError('2026-07-28 is not supported')
+    serverInfo = ((discovered._meta ?? {}) as Json)['io.modelcontextprotocol/serverInfo'] ?? discovered.serverInfo
+    protocolVersion = MCP_MODERN_VERSION
+  } catch {
+    modern = false
+    const init = await call('initialize', { protocolVersion: MCP_LEGACY_VERSION, capabilities: {}, clientInfo: { name: 'remora-cli', version: '0' } })
+    if (typeof init.protocolVersion === 'string') forwarder.protocolVersion = init.protocolVersion
+    await forwarder.send({ jsonrpc: '2.0', method: 'notifications/initialized' }, () => {})
+    serverInfo = init.serverInfo
+    protocolVersion = init.protocolVersion
+  }
   const tools: ProbeResult['tools'] = []
   let cursor: string | undefined
   for (let page = 0; page < 50; page++) {
@@ -200,5 +250,5 @@ export async function probe(hub: Hub): Promise<ProbeResult> {
     cursor = typeof result.nextCursor === 'string' ? result.nextCursor : undefined
     if (!cursor) break
   }
-  return { serverInfo: init.serverInfo, protocolVersion: init.protocolVersion, tools }
+  return { serverInfo, protocolVersion, tools }
 }

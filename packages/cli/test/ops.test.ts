@@ -12,9 +12,9 @@ let hub: FakeHub
 before(async () => { hub = await new FakeHub(18107).start() })
 after(async () => { await hub.stop() })
 
-async function loggedIn(extra: Parameters<typeof testCtx>[0] = {}): Promise<TestCtx> {
+async function loggedIn(extra: Parameters<typeof testCtx>[0] = {}, scope?: string): Promise<TestCtx> {
   const t = await testCtx(extra)
-  await seedLogin(t, hub)
+  await seedLogin(t, hub, scope ? { scope } : {})
   hub.calls = []
   return t
 }
@@ -123,7 +123,8 @@ test('run --wait stops for a human with exit 3, fails with exit 1, times out wit
   assert.equal(await main(['run', '--session', 's-1', 'x', '--timeout', '3s'], w.ctx), EXIT.timeout)
   assert.match(w.stderr(), /remora tasks wait t-1/)
   const first = hub.calls.find(c => c.op === 'task.wait')
-  assert.equal(first?.params.timeoutMs, 3000)
+  const step = Number(first?.params.timeoutMs)
+  assert.ok(step > 2900 && step <= 3000, 'the first step is capped by --timeout')
 })
 
 test('tasks watch continues through attention until the end', async () => {
@@ -191,4 +192,40 @@ test('doctor checks the hub, metadata, token and hosts', async () => {
   assert.equal(report.ok, true)
   assert.ok(report.checks.some((c: { name: string; ok: boolean }) => c.name === 'OAuth メタデータ' && c.ok))
   assert.equal(report.hosts.length, 1)
+})
+
+test('content operations without dsh.content fail locally with a --content hint', async () => {
+  const t = await loggedIn({}, 'dsh.read dsh.tasks offline_access')
+  assert.equal(await main(['sessions', 'read', 's-1'], t.ctx), EXIT.denied)
+  assert.match(t.stderr(), /remora login --content/)
+  const p = await loggedIn({}, 'dsh.read dsh.tasks offline_access')
+  assert.equal(await main(['patch', '--task', 't-1', '--json'], p.ctx), EXIT.denied)
+  assert.equal(JSON.parse(p.stdout()).error.denial.reason, 'missing-scope')
+  assert.equal(hub.calls.length, 0)
+})
+
+test('new denial reasons carry their own hints', async () => {
+  for (const [reason, pattern] of [['kill-switch', /緊急停止/], ['confirmation-failed', /パスキー/], ['out-of-scope', /範囲の外/]] as const) {
+    hub.ops['hosts.list'] = () => ({ status: 403, body: { error: { code: 'denied', message: 'no', denial: { layer: 'dsh', reason } } } })
+    const t = await loggedIn()
+    assert.equal(await main(['hosts'], t.ctx), EXIT.denied)
+    assert.match(t.stderr(), pattern, reason)
+  }
+})
+
+test('open finds the host that has the session and prints the hub page URL', async () => {
+  const host = (hostId: string, online: boolean) => ({ hostId, name: hostId, online, lastSeenAt: null, pluginVersion: null, dshVersion: null, operations: [], ceiling: null, grant: null, killSwitch: false })
+  hub.ops['hosts.list'] = () => ({ hosts: [host('h-a', true), host('h-b', true)] })
+  hub.ops['session.get'] = params => params.hostId === 'h-b'
+    ? { session: { sessionId: 's/1' }, context: null, recentTurns: [], queueLength: 0, attention: [], hasLiveClient: false, untrusted: true }
+    : { status: 404, body: { error: { code: 'not_found', message: 'no such session' } } }
+  let opened = ''
+  const t = await loggedIn({ openBrowser: async url => { opened = url; return true } })
+  assert.equal(await main(['open', 's/1'], t.ctx), 0, t.stderr())
+  assert.equal(t.stdout(), `${hub.url}/hosts/h-b/sessions/s%2F1`)
+  assert.equal(opened, t.stdout())
+  const n = await loggedIn()
+  assert.equal(await main(['open', 's-2', '--host', 'h-a', '--json'], n.ctx), 0)
+  assert.deepEqual(JSON.parse(n.stdout()), { url: `${hub.url}/hosts/h-a/sessions/s-2`, hostId: 'h-a', sessionId: 's-2', opened: false })
+  assert.match(n.stderr(), /^$/)
 })

@@ -42,6 +42,7 @@ switch ($arch) {
   'ARM64' { $cpu = 'x64'; Write-Host 'Windows on Arm: installing the x64 build (runs under emulation).' }
   default { throw "remora install: unsupported CPU architecture: $arch" }
 }
+# Must match RELEASE_ASSETS.cli in packages/protocol/src/endpoints.ts.
 $asset = "remora-win32-$cpu.exe"
 
 if ($env:REMORA_DOWNLOAD_BASE) {

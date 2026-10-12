@@ -42,6 +42,7 @@ esac
 if [ "$os" = darwin ] && [ "$arch" = x64 ] && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 1 ]; then
   arch=arm64
 fi
+# Must match RELEASE_ASSETS.cli in packages/protocol/src/endpoints.ts.
 asset="remora-${os}-${arch}"
 
 if [ -n "${REMORA_DOWNLOAD_BASE:-}" ]; then
