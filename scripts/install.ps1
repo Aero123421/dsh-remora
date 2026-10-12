@@ -5,7 +5,7 @@
 .DESCRIPTION
   Two forms, both verified against SHA256SUMS before anything is installed:
 
-    node    remora.mjs (~130 KB) plus a small remora.cmd launcher, used when
+    node    remora.mjs (~135 KB) plus a small remora.cmd launcher, used when
             Node.js 22.19 or later is available. The default whenever possible.
     binary  the standalone remora-win32-x64.exe (~100 MB, embeds Node.js) as
             remora.exe, used when Node.js is missing or too old, or with -Form binary.

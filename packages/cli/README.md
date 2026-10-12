@@ -15,7 +15,7 @@ irm https://raw.githubusercontent.com/Aero123421/dsh-remora/main/scripts/install
 
 | 形 | 中身 | 大きさ | 選ばれる条件 |
 | --- | --- | --- | --- |
-| Node.js 版（主） | `remora.mjs` ＋ 小さな起動スクリプト（`remora`／`remora.cmd`） | 約 130 KB | Node.js 22.19 以上がある |
+| Node.js 版（主） | `remora.mjs` ＋ 小さな起動スクリプト（`remora`／`remora.cmd`） | 約 135 KB | Node.js 22.19 以上がある |
 | 単体実行ファイル | `remora-<os>-<arch>[.exe]`（Node.js を内蔵） | 約 100 MB（Linux は strip 済み） | Node.js が無いか古い、または `--form binary`／`-Form binary` |
 
 - 起動スクリプトは `$REMORA_NODE` → インストール時に見つけた node → `PATH` の node の順に使います。`remora.mjs` の先頭で版を確かめ、22.19 未満なら案内を出して終わります。
@@ -123,7 +123,7 @@ node packages/cli/scripts/build-binaries.mjs [--out-dir artifacts/cli] [--node <
 
 | もの | 以前 | 今 |
 | --- | --- | --- |
-| `remora.mjs`（Node.js 版） | — | 127 KB（gzip 36 KB）。日本語を `\u` エスケープしない UTF-8 出力で 142 KB から縮小 |
+| `remora.mjs`（Node.js 版） | — | 135 KB（gzip 38 KB）。日本語を `\u` エスケープしない UTF-8 出力で 142 KB から縮小 |
 | `remora-linux-x64` | 117.9 MiB | 101.1 MiB（`strip --strip-all`） |
 
 単体実行ファイルは Node.js 本体がほとんどを占めます。gzip すると約 39 MB（xz なら約 26 MB）になりますが、既存の `remora self-update` が生の実行ファイル名を探すため、圧縮版は配っていません。
