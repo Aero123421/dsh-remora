@@ -57,5 +57,8 @@ export function wideningReasons(previous: RemoraSettings, next: RemoraSettings, 
   if (added(a.gitHosts, b.gitHosts).length > 0) reasons.push('git-hosts')
   if (a.untrustedWorkspaces.some(id => !b.untrustedWorkspaces.includes(id))) reasons.push('trust')
   if (previous.hubUrl !== next.hubUrl && next.hubUrl !== null) reasons.push('hub-url')
+  // Holding questions and approvals for outside answers, and approvals without a passkey.
+  if (previous.remoteAnswerWaitMs === 0 && next.remoteAnswerWaitMs > 0) reasons.push('remote-answers')
+  if (!previous.approvalsFromRemote && next.approvalsFromRemote) reasons.push('approvals-from-remote')
   return [...new Set(reasons)]
 }

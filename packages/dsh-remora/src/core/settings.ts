@@ -8,6 +8,10 @@ import type { TaskRecord } from '../ops/types.ts'
 import { asObject, optionalNumber, optionalString, stringArray, type DocumentSpec } from './storage.ts'
 
 export const FULL_ACCESS_TTL_MS = 24 * 60 * 60_000
+/** Default time Remora keeps a question, plan review or approval open for an answer from outside. */
+export const DEFAULT_REMOTE_ANSWER_WAIT_MS = 10 * 60_000
+/** Longest wait the settings tab accepts. */
+export const MAX_REMOTE_ANSWER_WAIT_MS = 24 * 60 * 60_000
 
 export interface SessionException {
   sessionId: string
@@ -52,6 +56,19 @@ export interface RemoraSettings {
   /** Operation ids the user has seen; new ones start switched off unless the ceiling is full. */
   knownOperations: string[]
   scope: ScopeSettings
+  /**
+   * How long Remora keeps a question, plan review or approval open for an
+   * answer from outside (hub, MCP, CLI) when nothing else on this PC answers
+   * it. After that DSH continues without an answer (approvals count as
+   * rejected). 0: Remora does not take part, as before.
+   */
+  remoteAnswerWaitMs: number
+  /**
+   * Approvals may be answered from MCP and CLI without the owner's passkey.
+   * Off by default (the hub page then asks for the passkey); only a browser
+   * on this PC can turn it on.
+   */
+  approvalsFromRemote: boolean
 }
 
 export const ALL_OPERATION_IDS: readonly OperationId[] = OPERATIONS.map(op => op.id)
@@ -75,6 +92,8 @@ export function defaultSettings(hostName = 'DSH'): RemoraSettings {
       gitHosts: [],
       untrustedWorkspaces: [],
     },
+    remoteAnswerWaitMs: DEFAULT_REMOTE_ANSWER_WAIT_MS,
+    approvalsFromRemote: false,
   }
 }
 
@@ -140,8 +159,16 @@ export function parseSettings(value: unknown): RemoraSettings {
     killSwitch: raw.killSwitch === true,
     knownOperations: stringArray(raw.knownOperations, 'knownOperations'),
     scope: parseScope(raw.scope),
+    remoteAnswerWaitMs: parseWait(raw.remoteAnswerWaitMs),
+    approvalsFromRemote: raw.approvalsFromRemote === true,
   }
   return settings
+}
+
+/** A stored wait: whole milliseconds within 0 … 24 h; anything else (or a file from before it existed) means the default. */
+function parseWait(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > MAX_REMOTE_ANSWER_WAIT_MS) return DEFAULT_REMOTE_ANSWER_WAIT_MS
+  return value
 }
 
 /**

@@ -291,7 +291,7 @@ export type Disposer = () => void
  * defensively; a context without them disables watching.
  */
 export interface EventfulContext {
-  on?(name: string, listener: (...args: any[]) => unknown, options?: { global?: boolean }): Disposer
+  on?(name: string, listener: (...args: any[]) => unknown, options?: { global?: boolean; prepend?: boolean }): Disposer
   waterfall?(name: string, ...args: unknown[]): Promise<unknown>
 }
 

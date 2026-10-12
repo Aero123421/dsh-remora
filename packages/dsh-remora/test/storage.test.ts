@@ -84,6 +84,13 @@ test('settings parse rejects bad ceilings and new operations start switched off'
   assert.equal(full.ceiling.overrides, undefined)
   assert.equal(adoptNewOperations(adopted), adopted)
   assert.equal(settingsSpec('x').version, 1)
+  // Settings files from before answers from outside: 10 minutes, approvals need the passkey.
+  const old = parseSettings({ ceiling: { level: 'request' } })
+  assert.equal(old.remoteAnswerWaitMs, 10 * 60_000)
+  assert.equal(old.approvalsFromRemote, false)
+  assert.equal(parseSettings({ remoteAnswerWaitMs: 0, approvalsFromRemote: true }).remoteAnswerWaitMs, 0)
+  assert.equal(parseSettings({ remoteAnswerWaitMs: -5 }).remoteAnswerWaitMs, 10 * 60_000)
+  assert.equal(parseSettings({ remoteAnswerWaitMs: 'soon' }).remoteAnswerWaitMs, 10 * 60_000)
 })
 
 test('task records are durable when put resolves and old finished tasks are pruned', async () => {

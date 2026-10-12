@@ -42,7 +42,11 @@ const lastUserText = (options) => {
   for (let i = options.messages.length - 1; i >= 0; i--) {
     const message = options.messages[i]
     if (message.role === 'tool') return { tool: true, text: message.content.map(b => b.text ?? '').join('') }
-    if (message.role === 'user') return { tool: false, text: message.content.map(b => b.text ?? '').join('') }
+    if (message.role !== 'user') continue
+    const text = message.content.map(b => b.text ?? '').join('')
+    // The runtime-context snapshot (e.g. the approval policy) arrives as a user message too.
+    if (text.startsWith('Current runtime context')) continue
+    return { tool: false, text }
   }
   return { tool: false, text: '' }
 }
@@ -51,9 +55,11 @@ const respond = (options) => {
   if (!last.tool && /ask me/.test(last.text)) {
     return dsh.toolCallResponse(`call-${options.messages.length}`, 'ask_user_question', {
       questions: [{ id: 'db', question: 'Which database?', options: [{ label: 'Postgres' }, { label: 'SQLite' }] }],
+      // "must": an indefinite (blocking) ask, like the default legacy tool.
+      ...(/must ask me/.test(last.text) ? { timeout: -1 } : {}),
     })
   }
-  if (last.tool) return dsh.textResponse('waiting for your answer')
+  if (last.tool) return dsh.textResponse(/"answers"/.test(last.text) ? `answered: ${last.text.includes('Postgres') ? 'Postgres' : 'other'}` : 'waiting for your answer')
   if (/answer_to_pending_question/.test(last.text)) return dsh.textResponse(`thanks: ${last.text.includes('SQLite') ? 'SQLite' : 'other'}`)
   return dsh.textResponse(`pong: ${last.text.slice(0, 40)} OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx`)
 }
@@ -89,6 +95,7 @@ async function boot() {
   await ctx.plugin(dsh.SessionTitleService, { fallbackMaxWords: 5, fallbackMaxBytes: 40, maxTitleBytes: 80 })
   await ctx.plugin(dsh.UserQuestionService)
   await ctx.plugin(dsh.ToolAskUser, { mode: 'timed', timeout: 1 })
+  await ctx.plugin(dsh.ApprovalService, { policy: 'ask' })
   // Host services the Session Controller injects but the compat run does not exercise
   // (same stand-ins as DSH's own session-controller test harness).
   ctx.provide('typert', { lookups: { configure: () => () => {} }, contexts: { configureHost: () => () => {} } })
@@ -106,7 +113,7 @@ async function boot() {
   ctx.provide('fs', {})
   await ctx.plugin(dsh.CompatSessionQuery)
   await ctx.plugin(dsh.SessionController, {})
-  for (const name of ['sessionController', 'workspaceRegistry', 'agents', 'userQuestions', 'sessionQuery', 'sessionTitle']) {
+  for (const name of ['sessionController', 'workspaceRegistry', 'agents', 'userQuestions', 'sessionQuery', 'sessionTitle', 'approval']) {
     assert.ok(ctx.get(name) !== undefined, `${name} is mounted`)
   }
 
@@ -126,6 +133,8 @@ const outside = await ctx.workspaceRegistry.create(outsidePath)
 const emitted = []
 const records = new Map()
 const putOrder = []
+/** How long Remora holds a request for an outside answer in this run (no DSH Web: nothing else answers). */
+let answerWait = 30_000
 const deps = {
   scope: {
     canAccessWorkspace: id => id === workspace.id,
@@ -144,6 +153,7 @@ const deps = {
     list: () => [...records.values()],
     put: async (record) => { putOrder.push(`${record.taskId}:${record.state}:${record.sessionId ?? '-'}`); records.set(record.taskId, { ...record }) },
   },
+  answers: { waitMs: () => answerWait, approvalsFromRemote: () => false, allows: () => true, linked: () => true },
   emit: event => emitted.push(event),
   logger: { info: () => {}, warn: (...args) => console.warn('  [adapter warn]', ...args) },
 }
@@ -287,6 +297,40 @@ await step('task.cancel removes a queued prompt through session.updateQueue', as
   assert.deepEqual(await h['task.cancel']({ taskId: 't7' }, context()), { cancelled: true, how: 'removed-from-queue' })
   assert.equal((await h['session.get']({ sessionId }, context())).queueLength, 0)
   assert.deepEqual(await h['task.cancel']({ taskId: 't6' }, context()), { cancelled: true, how: 'stopped-session' })
+  await waitFor('agent idle', () => ctx.agents.get(sessionId)?.status !== 'running')
+})
+
+await step('blocking ask_user_question: Remora holds it in the user-questions chain; attention.respond answers it', async () => {
+  await h['task.start']({ target: { sessionId }, prompt: 'you must ask me first', idempotencyKey: 'k10' }, context('t10'))
+  const item = await waitFor('held question', async () => {
+    const list = await h['attention.list']({ sessionId }, context())
+    return list.items.find(candidate => candidate.kind === 'question' && candidate.answerVia === 'remote')
+  })
+  assert.equal(item.answerable, true)
+  assert.equal(typeof item.expiresAt, 'number', 'nothing else can answer here, so the wait has a deadline')
+  await h['attention.respond']({ sessionId, attentionId: item.attentionId, answer: { optionId: '0' } }, context())
+  await waitFor('t10 completed', () => records.get('t10')?.state === 'completed')
+  assert.equal((await h['task.get']({ taskId: 't10' }, context())).result.reply, 'answered: Postgres')
+})
+
+await step('approvals: a DSH approval request is held; approval.respond allows it once; an unanswered one comes back unavailable', async () => {
+  model.script.unshift({ hangAfter: dsh.textResponse('long').slice(0, 2) })
+  await h['task.start']({ target: { sessionId }, prompt: 'hold the turn open', idempotencyKey: 'k11' }, context('t11'))
+  await waitFor('t11 running', () => ctx.agents.get(sessionId)?.status === 'running')
+  const agent = ctx.agents.get(sessionId)
+  const decided = () => ctx.sessions.get(sessionId).snapshotEvents().filter(e => e.type === 'approval/decided').map(e => e.data.outcome)
+  const first = ctx.approval.request({ agent, toolName: 'shell', reason: 'compat: write outside the workspace', signal: AbortSignal.timeout(20_000) })
+  const item = await waitFor('held approval', async () => (await h['attention.list']({ sessionId }, context())).items.find(candidate => candidate.kind === 'approval' && candidate.answerable))
+  assert.equal(item.answerVia, 'hub-passkey', 'approvals need the owner\'s passkey unless allowed from MCP and CLI')
+  assert.match(item.attentionId, /^approval:/)
+  await h['approval.respond']({ sessionId, attentionId: item.attentionId, answer: { approve: true } }, context())
+  assert.equal(await first, 'allowed-once')
+  assert.equal(decided().at(-1), 'allowed-once', 'DSH logged the outside decision')
+  answerWait = 200
+  assert.equal(await ctx.approval.request({ agent, toolName: 'shell', signal: AbortSignal.timeout(20_000) }), 'unavailable')
+  assert.equal(decided().at(-1), 'unavailable')
+  answerWait = 30_000
+  await h['task.cancel']({ taskId: 't11' }, context())
   await waitFor('agent idle', () => ctx.agents.get(sessionId)?.status !== 'running')
 })
 

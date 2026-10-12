@@ -22,7 +22,8 @@ loop); `JsonlSessionPersistence` (real files in a temp dir);
 `session-checkpoint-policy`; `SessionProjectionCache`; `Storage` +
 `storage-json` + `StorageDomain`; `WorkspaceRegistry`; `session-turn-outline`;
 `TokenMeter`; `SessionTitleService`; `UserQuestionService`; `tool-ask-user`
-in **timed** mode (1 s); `SessionQueryEngine` (point reads and listings);
+in **timed** mode (1 s); `ApprovalService` (`dsh-user-approval`, policy
+`ask`); `SessionQueryEngine` (point reads and listings);
 `SessionController` (list, inspect, projections, create, rename, prompt with
 requestId dedupe, updateQueue, cancel, resolveAgent / resume).
 
@@ -36,6 +37,8 @@ requestId dedupe, updateQueue, cancel, resolveAgent / resume).
 | live reads | sessions.list (workspace, title), session.get (turn outline, queue), session.read page, session.usage (token-meter), attention.list |
 | restart | after disposing the whole host and booting a new one on the same folders: the cold session is listed with its workspace and cached title, read at every depth and its finished task result rebuilt, **without** a live Agent appearing; task.start (target `latest`) then resumes it from JSONL and completes |
 | timed question | the model calls `ask_user_question`; after the 1 s window the question is `continued`; the task goes `needs_attention` with an answerable item; an AttentionEvent without `detail` is emitted; attention.respond → `userQuestions.answer` steers the reply and the task completes with the follow-up turn's reply; a second answer is refused |
+| blocking question | the model calls `ask_user_question` with `timeout: -1` (a blocking ask, as in the default legacy mode): Remora's answerer, first in the real `user-questions/request` chain, holds it (nothing else answers in this run, so with a deadline); attention.list shows it answerable from outside; attention.respond answers through the chain and the tool result carries the answer |
+| approvals | during an open turn, `ctx.approval.request(...)` logs `approval/asked` and runs the real `approval/request` chain: Remora holds it (route `hub-passkey`), approval.respond resolves it `allowed-once` and DSH logs that outcome; a second request nobody answers comes back `unavailable` after the wait |
 | resubmit / steer | resubmit re-sends the prompt read back from the log; steer on an idle session is queued |
 | cancel | a prompt queued behind a running turn is removed through `session.updateQueue`; the running one is stopped through `session.cancel` |
 | scope / archive | a workspace outside the scope is `denied`; an archived session (real `archiveSession`) is refused before DSH and hidden from sessions.list |
@@ -50,6 +53,6 @@ requestId dedupe, updateQueue, cancel, resolveAgent / resume).
 ## Not covered
 
 - Loading through the DSH plugin loader / `cordis.patch.yml`, the Remora core, the hub connection.
-- Legacy-mode `ask_user_question` and `exit_plan_mode` plan reviews (no remote answer API: attention only), approvals (`approval/asked` from a real permission prompt), goals (`ctx.goals`), slash commands (`ctx.commands`), background jobs (`ctx.jobs`), workspace changes and deliverables (`workspaceChanges`, `present` tool), the skill catalog (`sessionSkillCatalog` needs `workingDirectory`, not composed), `selectModel` / `modelCatalog` against real providers, agent presets other than the default, subagent sessions, `workspace.create` with a real `git` (covered by unit tests with a fake git).
-- DSH Web presence (`hasLiveClient` is a heuristic), multiple processes, Windows.
+- The legacy-mode `ask_user_question` tool itself (it passes no call id; covered by unit tests and the E2E run), `exit_plan_mode` plan reviews (plan mode is not composed; unit tests only), DSH Web's card being withdrawn when an outside answer wins (no gateway here; unit tests and the E2E run), approvals asked by a real tool's permission prompt (the request is made directly), goals (`ctx.goals`), slash commands (`ctx.commands`), background jobs (`ctx.jobs`), workspace changes and deliverables (`workspaceChanges`, `present` tool), the skill catalog (`sessionSkillCatalog` needs `workingDirectory`, not composed), `selectModel` / `modelCatalog` against real providers, agent presets other than the default, subagent sessions, `workspace.create` with a real `git` (covered by unit tests with a fake git).
+- DSH Web presence (`hasLiveClient` is a heuristic; the gateway's `hasLiveClient()` that decides the answer deadline is not composed), multiple processes, Windows.
 - Unpinned DSH versions: run with `DSH_UPSTREAM_DIR` pointing at another checkout to try one.

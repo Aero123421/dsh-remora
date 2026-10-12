@@ -24,6 +24,7 @@ function fakeAdapter() {
         'task.start': async (_params, context) => ({ task: { taskId: context.taskId, state: 'accepted' } }) as never,
         'task.get': (_params, context) => new Promise((_, reject) => context.signal.addEventListener('abort', () => reject(new Error('aborted')))),
         'terminal.run': async () => ({ output: 'done', exitCode: 0 }) as never,
+        'approval.respond': async () => ({ accepted: true }),
       },
       has: () => true,
       start: () => { started++ },
@@ -73,7 +74,7 @@ test('pair, connect, dispatch with permission checks, events, kill switch and pa
     assert.equal(adapter.started(), 1)
     const hello = hub.hellos[0] as { name: string; operations: string[]; ceiling: Grant; killSwitch: boolean }
     assert.deepEqual(hello.ceiling, { level: 'view' })
-    assert.deepEqual([...hello.operations].sort(), ['session.get', 'session.read', 'sessions.list', 'task.get', 'task.start', 'terminal.run'])
+    assert.deepEqual([...hello.operations].sort(), ['approval.respond', 'session.get', 'session.read', 'sessions.list', 'task.get', 'task.start', 'terminal.run'])
 
     const full: Grant = { level: 'full', fullAccessExpiresAt: Date.now() + 60_000 }
     hub.send(request('r1', 'sessions.list', {}, full, ['dsh.read']))
@@ -224,6 +225,71 @@ test('pairing that the owner denies is reported', async () => {
     assert.equal(core.snapshot(true).hub.paired, false)
     const bad = await rpc(host.routes, 'pairing-start', { hubUrl: 'ftp://example.com' })
     assert.equal(bad.ok ? null : bad.error.code, 'remora/pairing-invalid-hub-url')
+  } finally {
+    host.dispose()
+    await core.dispose()
+    await hub.close()
+    await cleanup()
+  }
+})
+
+test('approvals need the owner\'s passkey unless this PC allows them from MCP and CLI', async () => {
+  const { dir, cleanup } = await tempDir()
+  const passkey = makePasskey('es256', 'owner-1')
+  const hub = new FakeHub({ port: PORT + 3, owner: [passkey.credential] })
+  await hub.listen()
+  const host = fakeHost()
+  const adapter = fakeAdapter()
+  const core = apply(host.ctx, undefined, { dataDir: dir, createAdapter: adapter.create })
+  try {
+    await core.ready
+    assert.ok((await rpc(host.routes, 'pairing-start', { hubUrl: hub.origin })).ok)
+    await until(() => core.internals.link.connected, 8000, 'hub connection')
+    assert.ok((await rpc(host.routes, 'permission', { level: 'request' })).ok)
+    const answers = adapter.deps()!.answers!
+    assert.equal(answers.waitMs(), 10 * 60_000, 'Remora waits 10 minutes by default')
+    assert.equal(answers.approvalsFromRemote(), false)
+    assert.equal(answers.allows('approval.respond'), true)
+    assert.equal(answers.linked(), true)
+
+    const grant: Grant = { level: 'request' }
+    const params = { sessionId: 's1', attentionId: 'approval:a1', answer: { approve: true } }
+    hub.send(request('a1', 'approval.respond', params, grant, ['dsh.tasks']))
+    const refused = await hub.response('a1')
+    assert.equal(refused.error?.code, 'denied')
+    assert.deepEqual(refused.error?.denial, { layer: 'dsh', reason: 'confirmation-failed' })
+    assert.match(refused.error?.message ?? '', /Allow approvals from MCP and CLI/)
+
+    // The hub page sends the owner's passkey: accepted, and checked like any confirmation.
+    const confirmation = await makeConfirmation(passkey, { hubOrigin: hub.origin, rpId: '127.0.0.1', hostId: hub.hostId, requestId: 'a2', operation: 'approval.respond', params, issuedAt: Date.now() })
+    hub.send(request('a2', 'approval.respond', params, grant, ['dsh.tasks'], { confirmation }))
+    assert.deepEqual((await hub.response('a2')).result, { accepted: true })
+    hub.send(request('a3', 'approval.respond', { ...params, answer: { approve: false } }, grant, ['dsh.tasks'], { confirmation }))
+    assert.equal((await hub.response('a3')).error?.denial?.reason, 'confirmation-failed', 'a confirmation is bound to its request')
+
+    // Allowing approvals without a passkey, or turning waiting back on, needs this PC; turning them off does not.
+    const remoteOn = await rpc(host.routes, 'answers', { approvalsFromRemote: true }, remote)
+    assert.equal(remoteOn.ok ? null : remoteOn.error.code, 'remora/local-only')
+    const on = await rpc<RemoraSnapshot>(host.routes, 'answers', { approvalsFromRemote: true, waitMinutes: 5 })
+    assert.ok(on.ok && on.value.settings.approvalsFromRemote && on.value.settings.remoteAnswerWaitMs === 5 * 60_000)
+    assert.equal(answers.approvalsFromRemote(), true)
+    hub.send(request('a4', 'approval.respond', params, grant, ['dsh.tasks']))
+    assert.deepEqual((await hub.response('a4')).result, { accepted: true })
+    const bad = await rpc(host.routes, 'answers', { waitMinutes: 2000 })
+    assert.equal(bad.ok ? null : bad.error.code, 'remora/invalid-payload')
+    assert.ok((await rpc(host.routes, 'answers', { approvalsFromRemote: false, waitMinutes: 0 }, remote)).ok)
+    assert.equal(answers.waitMs(), 0)
+    const remoteWait = await rpc(host.routes, 'answers', { waitMinutes: 10 }, remote)
+    assert.equal(remoteWait.ok ? null : remoteWait.error.code, 'remora/local-only')
+    hub.send(request('a5', 'approval.respond', params, grant, ['dsh.tasks']))
+    assert.equal((await hub.response('a5')).error?.denial?.reason, 'confirmation-failed')
+
+    // The kill switch and a ceiling without the operation stop outside answers.
+    assert.ok((await rpc(host.routes, 'permission', { level: 'view' }, remote)).ok)
+    assert.equal(answers.allows('approval.respond'), false)
+    const audit = await rpc<{ entries: { action: string; outcome: string; reason?: string }[] }>(host.routes, 'audit')
+    assert.ok(audit.ok && audit.value.entries.some(e => e.action === 'approval.respond' && e.outcome === 'denied' && e.reason === 'confirmation-failed'))
+    assert.ok(audit.ok && audit.value.entries.some(e => e.action === 'approvals-from-remote:on,answer-wait:5m' || e.action === 'answer-wait:5m,approvals-from-remote:on'))
   } finally {
     host.dispose()
     await core.dispose()

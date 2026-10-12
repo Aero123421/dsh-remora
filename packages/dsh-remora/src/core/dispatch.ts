@@ -5,8 +5,10 @@
  *   2. params match the operation's input schema
  *   3. the kill switch is off
  *   4. decide(DSH ceiling, hub grant, token scopes) allows it
- *   5. for REQUIRES_CONFIRMATION: the owner's passkey assertion verifies
- *      against the pinned credentials, and its requestId is recorded as used
+ *   5. for REQUIRES_CONFIRMATION, and for CONFIRMATION_UNLESS_ALLOWED unless
+ *      the settings tab allows it without one (approvals from MCP and CLI):
+ *      the owner's passkey assertion verifies against the pinned
+ *      credentials, and its requestId is recorded as used
  *   6. the adapter handler runs with a timeout before `frame.deadline`
  *
  * `OperationError` becomes a structured error; anything else becomes
@@ -14,7 +16,7 @@
  * request is written to the local audit log.
  */
 import {
-  CONFIRMATION_TTL_MS, OPERATIONS, REQUIRES_CONFIRMATION, decide, fixFor, validateParams,
+  CONFIRMATION_TTL_MS, CONFIRMATION_UNLESS_ALLOWED, OPERATIONS, REQUIRES_CONFIRMATION, decide, fixFor, validateParams,
   type DenialLayer, type DenialReason, type Grant, type OperationId, type RemoraError, type RequestFrame, type ResponseFrame,
 } from '@dsh-remora/protocol'
 import { OperationError, type HostOperationId, type OperationContext, type OperationHandler, type OperationHandlers } from '../ops/types.ts'
@@ -33,6 +35,8 @@ export interface DispatchDeps {
   handlers: () => OperationHandlers
   ceiling: () => Grant
   killSwitch: () => boolean
+  /** For CONFIRMATION_UNLESS_ALLOWED operations: whether the DSH tab lets them run without the owner's passkey. */
+  allowsWithoutConfirmation?: (operation: OperationId) => boolean
   pinned: () => PairedHub | null
   confirmations: ConfirmationLedger
   audit: (entry: AuditInput) => void
@@ -53,6 +57,16 @@ const DENIAL_MESSAGES: Readonly<Record<DenialLayer, string>> = {
 
 export function denialError(layer: DenialLayer, reason: DenialReason, message = DENIAL_MESSAGES[layer]): RemoraError {
   return { code: 'denied', message, denial: { layer, reason }, fix: fixFor(layer) }
+}
+
+/** An approval sent without the owner's passkey while the DSH tab requires one. */
+export function passkeyRequiredError(): RemoraError {
+  return {
+    code: 'denied',
+    message: 'This DSH host accepts approvals from MCP and CLI only when "Allow approvals from MCP and CLI" is on in its Remora tab; until then the owner allows or rejects each approval on the hub with a passkey.',
+    denial: { layer: 'dsh', reason: 'confirmation-failed' },
+    fix: 'hub:/attention',
+  }
 }
 
 export function killSwitchError(): RemoraError {
@@ -127,7 +141,11 @@ export class Dispatcher {
     if (this.deps.killSwitch()) throw new Refusal(killSwitchError())
     const decision = decide({ operation: op, ceiling: this.deps.ceiling(), hubGrant: frame.grant, tokenScopes: Array.isArray(frame.scopes) ? frame.scopes : [], now: now() })
     if (!decision.allowed) throw new Refusal(denialError(decision.layer, decision.reason))
-    if (REQUIRES_CONFIRMATION.has(op)) {
+    const optional = CONFIRMATION_UNLESS_ALLOWED.has(op)
+    const required = REQUIRES_CONFIRMATION.has(op) || (optional && this.deps.allowsWithoutConfirmation?.(op as OperationId) !== true)
+    if (optional && required && frame.confirmation === undefined) throw new Refusal(passkeyRequiredError())
+    // A confirmation sent along anyway (the hub page always asks for the passkey) is still checked.
+    if (required || (optional && frame.confirmation !== undefined)) {
       const pinned = this.deps.pinned()
       if (!pinned) throw new OperationError('unavailable', 'this host is not paired')
       const verdict = await verifyConfirmation({

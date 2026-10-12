@@ -22,6 +22,7 @@ export { default as TokenMeter } from '@deepseek-ai/dsh-token-meter'
 export { default as SessionTitleService } from '@deepseek-ai/dsh-session-title'
 export { default as UserQuestionService } from '@deepseek-ai/dsh-user-questions'
 export * as ToolAskUser from '@deepseek-ai/dsh-tool-ask-user'
+export { default as ApprovalService } from '@deepseek-ai/dsh-user-approval'
 // DSH's own scripted model adapter (packages/core/agent-loop/tests/mock-adapter.ts).
 export { MockAdapter, textResponse, toolCallResponse } from '@dsh-compat/mock-adapter'
 

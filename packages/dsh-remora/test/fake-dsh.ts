@@ -31,7 +31,9 @@ export class FakeDsh {
   archived: string[] = []
   pinned: string[] = []
   calls: { method: string; args: unknown }[] = []
-  listeners = new Map<string, Set<(...args: any[]) => void>>()
+  listeners = new Map<string, ((...args: any[]) => any)[]>()
+  /** Present when a test simulates DSH Web's gateway: whether a DSH Web tab is connected. */
+  webConnected: boolean | undefined = undefined
   answers: { callId: string; answer: unknown }[] = []
   activity: string[] = []
   log: string[] = []
@@ -75,7 +77,7 @@ export class FakeDsh {
   }
 
   fire(name: string, ...args: unknown[]): void {
-    for (const listener of this.listeners.get(name) ?? []) listener(...args)
+    for (const listener of [...this.listeners.get(name) ?? []]) listener(...args)
   }
 
   /** Simulate the agent loop taking the next queued prompt through one turn. */
@@ -240,6 +242,7 @@ export class FakeDsh {
   }
 
   ctx(): any {
+    const self = this
     const services: Record<string, unknown> = {
       sessionController: this.sessionController,
       workspaceRegistry: this.workspaceRegistry,
@@ -250,14 +253,20 @@ export class FakeDsh {
     }
     return {
       connection: { fetch: { register: () => undefined } },
-      get: (name: string) => services[name],
+      get: (name: string) => name === 'typertGateway'
+        ? (self.webConnected === undefined ? undefined : { hasLiveClient: () => self.webConnected })
+        : services[name],
       effect: () => undefined,
       logger: { info: () => undefined, warn: () => undefined },
-      on: (name: string, listener: (...args: any[]) => void) => {
-        const set = this.listeners.get(name) ?? new Set()
-        set.add(listener)
-        this.listeners.set(name, set)
-        return () => set.delete(listener)
+      on: (name: string, listener: (...args: any[]) => any, options?: { prepend?: boolean }) => {
+        const list = this.listeners.get(name) ?? []
+        if (options?.prepend) list.unshift(listener)
+        else list.push(listener)
+        this.listeners.set(name, list)
+        return () => {
+          const index = list.indexOf(listener)
+          if (index >= 0) list.splice(index, 1)
+        }
       },
       waterfall: async (name: string, request: { sessionId: string }) => {
         if (name !== 'workspace/session-activity') return []
@@ -265,6 +274,19 @@ export class FakeDsh {
       },
     }
   }
+}
+
+/**
+ * Dispatch a Cordis waterfall through the listeners registered for `name`, in
+ * order, ending in `fallback` (DSH's own `noAnswerer` / `'unavailable'`).
+ */
+export function waterfall<T>(dsh: FakeDsh, name: string, request: unknown, fallback: () => Promise<T>): Promise<T> {
+  const chain = [...dsh.listeners.get(name) ?? []]
+  const next = (): Promise<T> => {
+    const listener = chain.shift()
+    return listener ? Promise.resolve(listener(request, next)) : fallback()
+  }
+  return next()
 }
 
 export function createFake(): FakeDsh {

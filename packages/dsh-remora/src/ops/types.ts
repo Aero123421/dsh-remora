@@ -113,9 +113,26 @@ export interface WorkspaceCreationStore {
   put(record: WorkspaceCreationRecord): Promise<void>
 }
 
+/**
+ * Whether and how Remora takes part in DSH's answerer chains for questions,
+ * plan reviews and approvals. Implemented by the core from the settings tab.
+ */
+export interface AnswerPolicy {
+  /** How long Remora keeps a request open for an outside answer when nothing on this PC answers it (ms). 0: Remora does not take part. */
+  waitMs(): number
+  /** Approvals may be answered from MCP and CLI without the owner's passkey (otherwise only on the hub page, with it). */
+  approvalsFromRemote(): boolean
+  /** The kill switch is off and the DSH ceiling allows the operation that answers it. */
+  allows(operation: 'attention.respond' | 'approval.respond'): boolean
+  /** The hub link is up, so an outside answer can arrive. */
+  linked(): boolean
+}
+
 export interface AdapterDeps {
   scope: ScopePolicy
   tasks: TaskStore
+  /** Remote answering of held questions, plan reviews and approvals. Without it Remora never holds them. */
+  answers?: AnswerPolicy
   /** Durable workspace.create ledger. Without it the adapter keeps one in memory. */
   workspaceCreations?: WorkspaceCreationStore
   /** Queue an event for the hub. The core sends task completion and attention changes at once and batches the rest (≥ 30 s). */
@@ -129,6 +146,8 @@ export interface Adapter {
   has(service: string): boolean
   /** Begin watching sessions for task progress and attention. Called once the host is paired and connected. */
   start(): void
+  /** The settings tab changed something the adapter reads through its deps (answer policy, kill switch). */
+  settingsChanged?(): void
   dispose(): void
 }
 

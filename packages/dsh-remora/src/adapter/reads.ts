@@ -17,7 +17,7 @@ import type {
 import { SERVICES } from './dsh-types.ts'
 import { denied, fromDsh, invalid, notFound, unavailable } from './errors.ts'
 import {
-  changesEvents, computeAttention, countTurns, findTaskTurn, lastReply, presentedFiles, transcriptItems, turnPreviews,
+  changesEvents, countTurns, findTaskTurn, lastReply, presentedFiles, transcriptItems, turnPreviews,
 } from './events.ts'
 import { hasContent, type Runtime, type SessionRow } from './runtime.ts'
 import { failedClones } from './workspace-create.ts'
@@ -68,9 +68,9 @@ export function forCaller(items: AttentionItem[], context: Pick<OperationContext
 /** Full attention of one session. Live sessions read the log; cold ones only projections (approvals and tool calls cannot be pending there). */
 export async function sessionAttention(rt: Runtime, sessionId: string, signal: AbortSignal, cold?: DshProjectionValues): Promise<AttentionItem[]> {
   const live = rt.liveAgent(sessionId) !== undefined
-  if (!live && cold) return computeAttention(sessionId, { events: null, values: cold, loginError: rt.loginErrors.get(sessionId) ?? null })
+  if (!live && cold) return rt.attention(sessionId, null, cold)
   const [events, values] = await Promise.all([rt.events(sessionId, signal), rt.projections(sessionId, signal)])
-  return computeAttention(sessionId, { events, values, loginError: rt.loginErrors.get(sessionId) ?? null })
+  return rt.attention(sessionId, events, values)
 }
 
 export function sortSidebar(rows: SessionRow[], pinnedOrder: readonly string[], workspaceOrder: readonly { sessionIds: readonly string[] }[]): SessionRow[] {
@@ -209,7 +209,7 @@ export function createReads(rt: Runtime) {
       const values = (await rt.projections(row.sessionId, context.signal)) ?? row.values
       // inspect() reads the log without waking the session.
       const events = await rt.events(row.sessionId, context.signal)
-      const attention = computeAttention(row.sessionId, { events, values, loginError: rt.loginErrors.get(row.sessionId) ?? null })
+      const attention = rt.attention(row.sessionId, events, values)
       const content = hasContent(context)
       const recentTurns: TurnPreview[] = turnPreviews(events, values).slice(-5).map(turn => ({
         index: turn.index,

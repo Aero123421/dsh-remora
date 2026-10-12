@@ -2,7 +2,7 @@ import { Button, Tag } from 'remora-official-primitives'
 import type { RemoraSnapshot } from '../state.ts'
 import type { Translate } from './api.ts'
 
-const TONE = { legacy: 'warning', timed: 'success', absent: 'quiet', unknown: 'quiet' } as const
+const TONE = { legacy: 'neutral', timed: 'neutral', absent: 'quiet', unknown: 'quiet' } as const
 
 /** Mode per agent preset, as tags. */
 export function QuestionModeTags({ snapshot, t }: { snapshot: RemoraSnapshot; t: Translate }) {

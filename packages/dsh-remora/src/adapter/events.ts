@@ -190,12 +190,28 @@ export function transcriptItems(events: readonly DshSessionEvent[]): (Transcript
 
 // --- attention ------------------------------------------------------------------
 
+/** A request Remora is holding open for an outside answer (see answerer.ts), keyed by attention id. */
+export interface HeldAttention {
+  via: 'remote' | 'hub-passkey'
+  expiresAt: number | null
+}
+
 export interface AttentionInputs {
   events: readonly DshSessionEvent[] | null
   values: DshProjectionValues | null
   /** Message of the latest `api-session/error` seen for this session, when it looks like an auth failure. */
   loginError?: { message: string; at: number } | null
+  /** Requests Remora holds right now; they become answerable from outside. */
+  held?: ReadonlyMap<string, HeldAttention> | undefined
 }
+
+/** `answerable`, `answerVia` and `expiresAt` of an item Remora may be holding. */
+function route(held: HeldAttention | undefined): { answerable: boolean; answerVia: NonNullable<AttentionItem['answerVia']>; expiresAt?: number | null } {
+  return held ? { answerable: true, answerVia: held.via, expiresAt: held.expiresAt } : { answerable: false, answerVia: 'dsh-web' }
+}
+
+export const APPROVAL_OPTIONS: readonly AttentionOption[] = [{ id: 'allow-once', label: 'Allow once' }, { id: 'reject', label: 'Reject' }]
+export const PLAN_OPTIONS: readonly AttentionOption[] = [{ id: 'approve', label: 'Approve' }, { id: 'keep-planning', label: 'Keep planning' }]
 
 /** Questions parsed from an `ask_user_question` call's raw JSON arguments. */
 export function parseQuestions(argumentsJson: unknown): DshQuestionItem[] {
@@ -281,6 +297,10 @@ export function isLoginFailure(error: { code?: unknown; status?: unknown; messag
  *   projection still lists (those already have a timeout result)
  * - goal-stopped: goal projection phase `blocked`
  * - login-expired: the last turn failed with a credential error, or `api-session/error` said so
+ *
+ * Approvals, plan reviews and legacy questions are answerable from outside
+ * only while Remora holds them (`input.held`); timed questions once they are
+ * `continued`; stopped goals always.
  */
 export function computeAttention(sessionId: string, input: AttentionInputs): AttentionItem[] {
   const items: AttentionItem[] = []
@@ -328,7 +348,8 @@ export function computeAttention(sessionId: string, input: AttentionInputs): Att
       kind: 'approval',
       title: redactLine(`Approve ${tool}${reason ? `: ${reason}` : ''}`),
       ...(reason ? { detail: redact(reason) } : {}),
-      answerable: false,
+      options: [...APPROVAL_OPTIONS],
+      ...route(input.held?.get(`approval:${id}`)),
       createdAt: event.time,
     })
   }
@@ -346,20 +367,21 @@ export function computeAttention(sessionId: string, input: AttentionInputs): Att
         kind: 'plan-review',
         title: redactLine(`Plan review: ${planTitle(plan)}`),
         detail: redact(plan),
-        options: [{ id: 'approve', label: 'Approve' }, { id: 'keep-planning', label: 'Keep planning' }],
-        // DSH asks plan reviews through the blocking user-questions waterfall only; no answer API exists.
-        answerable: false,
+        options: [...PLAN_OPTIONS],
+        // DSH asks plan reviews through the blocking user-questions waterfall only:
+        // answerable from outside while Remora holds the request.
+        ...route(input.held?.get(callId)),
         createdAt: event.time,
       })
       continue
     }
     const pending = continued.get(callId)
     const questions = pending?.questions.length ? [...pending.questions] : parseQuestions(event.data?.arguments)
-    items.push(questionItem(sessionId, callId, questions, pending?.state === 'continued', event.time))
+    items.push(questionItem(sessionId, callId, questions, pending?.state === 'continued', input.held?.get(callId), event.time))
     continued.delete(callId)
   }
   for (const [callId, pending] of continued) {
-    items.push(questionItem(sessionId, callId, [...pending.questions], pending.state === 'continued', null))
+    items.push(questionItem(sessionId, callId, [...pending.questions], pending.state === 'continued', input.held?.get(callId), null))
   }
 
   const goal = input.values?.goal
@@ -374,6 +396,7 @@ export function computeAttention(sessionId: string, input: AttentionInputs): Att
       detail: redact(`${goal.goal.objective}\n\n${reason}`),
       options: [{ id: 'resume', label: 'Resume' }, { id: 'clear', label: 'Clear' }],
       answerable: true,
+      answerVia: 'remote',
       createdAt: goal.updatedAt,
     })
   }
@@ -390,13 +413,15 @@ export function computeAttention(sessionId: string, input: AttentionInputs): Att
       kind: 'login-expired',
       title: redactLine(`Provider login expired: ${message}`),
       answerable: false,
+      answerVia: 'dsh-web',
       createdAt: turnLogin ? lastTurnEnd!.time : input.loginError!.at,
     })
   }
   return items
 }
 
-function questionItem(sessionId: string, callId: string, questions: DshQuestionItem[], answerable: boolean, createdAt: number | null): AttentionItem {
+/** A question: timed ones answer through `userQuestions.answer` once `continued`; legacy ones while Remora holds them. */
+function questionItem(sessionId: string, callId: string, questions: DshQuestionItem[], continued: boolean, held: HeldAttention | undefined, createdAt: number | null): AttentionItem {
   const first = questions[0]
   const options = questions.length === 1 ? optionsOf(first) : undefined
   return {
@@ -407,7 +432,7 @@ function questionItem(sessionId: string, callId: string, questions: DshQuestionI
     title: redactLine(first ? (first.header ? `${first.header}: ${first.question}` : first.question) : 'Question from the agent'),
     detail: redact(questionDetail(questions)),
     ...(options ? { options } : {}),
-    answerable,
+    ...(continued ? { answerable: true, answerVia: 'remote' as const } : route(held)),
     createdAt,
   }
 }

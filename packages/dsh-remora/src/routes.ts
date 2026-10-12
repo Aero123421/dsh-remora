@@ -107,6 +107,10 @@ export function createMethods(core: RemoraCore): Record<string, Method> {
       await core.updateSettings(payload, local)
       return core.snapshot(local)
     },
+    answers: async (payload, { local }) => {
+      await core.setAnswers(payload, local)
+      return core.snapshot(local)
+    },
     'placement-add': async (payload, { local }) => {
       await core.addPlacement(field(payload, 'path'), local)
       return core.snapshot(local)

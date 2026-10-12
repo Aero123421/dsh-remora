@@ -27,7 +27,7 @@ import { ceilingAllows, fullAccessActive, wideningReasons } from './permissions.
 import { RpcError } from './rpc-error.ts'
 import { PlacementError, SettingsScopePolicy, newPlacement, validatePlacement, type ForbiddenRoots } from './scope.ts'
 import {
-  ALL_OPERATION_IDS, FULL_ACCESS_TTL_MS, adoptNewOperations, confirmationsSpec, pairingSpec, settingsSpec, tasksSpec,
+  ALL_OPERATION_IDS, FULL_ACCESS_TTL_MS, MAX_REMOTE_ANSWER_WAIT_MS, adoptNewOperations, confirmationsSpec, pairingSpec, settingsSpec, tasksSpec,
   type ConfirmationsDocument, type PairingState, type RemoraSettings, type ScopeSettings, type SessionException,
 } from './settings.ts'
 import { JsonDocument, remoraDataDir, resolveDshHome } from './storage.ts'
@@ -233,6 +233,7 @@ export class RemoraCore {
       handlers: () => this.adapter?.handlers ?? {},
       ceiling: () => this.settingsDoc.value.ceiling,
       killSwitch: () => this.settingsDoc.value.killSwitch,
+      allowsWithoutConfirmation: op => op === 'approval.respond' && this.settingsDoc.value.approvalsFromRemote,
       pinned: () => this.pairingDoc.value.paired,
       confirmations: {
         isUsed: id => Object.hasOwn(this.confirmationsDoc.value.used, id),
@@ -261,6 +262,12 @@ export class RemoraCore {
       scope: this.scope,
       tasks: this.tasks,
       workspaceCreations: this.workspaceCreations,
+      answers: {
+        waitMs: () => this.settingsDoc.value.remoteAnswerWaitMs,
+        approvalsFromRemote: () => this.settingsDoc.value.approvalsFromRemote,
+        allows: op => !this.settingsDoc.value.killSwitch && ceilingAllows(this.settingsDoc.value.ceiling, this.clock.now()).has(op),
+        linked: () => this.link.connected,
+      },
       emit: event => this.emit(event),
       logger: this.ctx.logger,
     })
@@ -473,7 +480,12 @@ export class RemoraCore {
     if (canonicalJson(previous.ceiling) !== canonicalJson(saved.ceiling) || previous.killSwitch !== saved.killSwitch) this.sendHostStatus()
     this.scheduleExpiry()
     if (previous.hostName !== saved.hostName && this.link.connected) this.link.reconnect()
+    this.settingsChanged()
     return saved
+  }
+
+  private settingsChanged(): void {
+    try { this.adapter?.settingsChanged?.() } catch (error) { this.ctx.logger.warn('Remora: adapter settings update failed', error) }
   }
 
   async setPermission(input: { level: PermissionLevel; overrides?: Partial<Record<OperationId, boolean>>; confirmFull?: boolean }, local: boolean): Promise<void> {
@@ -571,6 +583,32 @@ export class RemoraCore {
     await this.saveSettings(next, local, 'settings')
   }
 
+  /**
+   * Answers from outside: how long Remora holds questions, plan reviews and
+   * approvals (minutes, 0 = off), and whether approvals may be answered from
+   * MCP and CLI without the owner's passkey. Turning either on needs this PC.
+   */
+  async setAnswers(patch: unknown, local: boolean): Promise<void> {
+    if (typeof patch !== 'object' || patch === null) throw new RpcError('invalid-payload')
+    const input = patch as { waitMinutes?: unknown; approvalsFromRemote?: unknown }
+    const previous = this.settingsDoc.value
+    const next: RemoraSettings = { ...previous }
+    const actions: string[] = []
+    if (input.waitMinutes !== undefined) {
+      const minutes = input.waitMinutes
+      if (typeof minutes !== 'number' || !Number.isInteger(minutes) || minutes < 0 || minutes * 60_000 > MAX_REMOTE_ANSWER_WAIT_MS) throw new RpcError('invalid-payload', 'waitMinutes')
+      next.remoteAnswerWaitMs = minutes * 60_000
+      if (next.remoteAnswerWaitMs !== previous.remoteAnswerWaitMs) actions.push(`answer-wait:${minutes}m`)
+    }
+    if (input.approvalsFromRemote !== undefined) {
+      if (typeof input.approvalsFromRemote !== 'boolean') throw new RpcError('invalid-payload', 'approvalsFromRemote')
+      next.approvalsFromRemote = input.approvalsFromRemote
+      if (next.approvalsFromRemote !== previous.approvalsFromRemote) actions.push(`approvals-from-remote:${next.approvalsFromRemote ? 'on' : 'off'}`)
+    }
+    if (actions.length === 0) return
+    await this.saveSettings(next, local, actions.join(','))
+  }
+
   async addPlacement(path: unknown, local: boolean): Promise<void> {
     if (typeof path !== 'string' || path.length > 4096) throw new RpcError('invalid-payload', 'path')
     let real: string
@@ -610,6 +648,7 @@ export class RemoraCore {
     await this.settingsDoc.update(value => ({ ...value, ceiling: { ...rest, level: 'request' } }))
     this.audit({ kind: 'settings', action: 'full-access-expired', outcome: 'ok' })
     this.sendHostStatus()
+    this.settingsChanged()
   }
 
   // --- reads ----------------------------------------------------------------------

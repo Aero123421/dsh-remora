@@ -25,7 +25,7 @@ import type {
 import { SERVICES } from './dsh-types.ts'
 import { denied, fromDsh, invalid, notFound } from './errors.ts'
 import {
-  changesEvents, computeAttention, contentText, findTaskTurn, presentedFiles, rpcIdOf, skillGestures, spanReply,
+  changesEvents, contentText, findTaskTurn, presentedFiles, rpcIdOf, skillGestures, spanReply,
 } from './events.ts'
 import { forCaller } from './reads.ts'
 import { hasContent, type Runtime, type SessionRow } from './runtime.ts'
@@ -117,7 +117,7 @@ export class Tasks {
     const sessionId = record.sessionId
     const events = preloaded?.events ?? await this.rt.events(sessionId, signal)
     const values = preloaded ? preloaded.values : await this.rt.projections(sessionId, signal)
-    const attention = computeAttention(sessionId, { events, values, loginError: this.rt.loginErrors.get(sessionId) ?? null })
+    const attention = this.rt.attention(sessionId, events, values)
     const turn = findTaskTurn(events, record.requestId)
     const base = { attention, events, turns: turn?.turns ?? [] }
     if (!turn) {
@@ -184,11 +184,11 @@ export class Tasks {
     if (record.sessionId === null) return info
     info.hasLiveClient = this.rt.hasLiveClient(record.sessionId)
     if (record.state === 'needs_attention') {
-      info.attention = forCaller(evaluation?.attention ?? computeAttention(record.sessionId, {
-        events: await this.rt.events(record.sessionId, context.signal).catch(() => null),
-        values: await this.rt.projections(record.sessionId, context.signal).catch(() => null),
-        loginError: this.rt.loginErrors.get(record.sessionId) ?? null,
-      }), context)
+      info.attention = forCaller(evaluation?.attention ?? this.rt.attention(
+        record.sessionId,
+        await this.rt.events(record.sessionId, context.signal).catch(() => null),
+        await this.rt.projections(record.sessionId, context.signal).catch(() => null),
+      ), context)
     }
     if (TERMINAL_TASK_STATES.has(record.state)) {
       const events = evaluation?.events.length ? evaluation.events : await this.rt.events(record.sessionId, context.signal).catch(() => [] as const)

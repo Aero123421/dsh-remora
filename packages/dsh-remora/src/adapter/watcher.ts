@@ -7,7 +7,7 @@
  */
 import { TERMINAL_TASK_STATES, type AttentionEvent } from '@dsh-remora/protocol'
 import type { Disposer, DshWorkspace } from './dsh-types.ts'
-import { computeAttention, isLoginFailure } from './events.ts'
+import { isLoginFailure } from './events.ts'
 import { withoutDetail } from './reads.ts'
 import type { Runtime } from './runtime.ts'
 import type { Tasks } from './tasks.ts'
@@ -140,7 +140,7 @@ export class Watcher {
       })
     }
     if (!this.scopeAllows(sessionId, inspection.meta)) return
-    const items = computeAttention(sessionId, { events, values, loginError: this.rt.loginErrors.get(sessionId) ?? null }).map(withoutDetail)
+    const items = this.rt.attention(sessionId, events, values).map(withoutDetail)
     const key = JSON.stringify(items)
     if (this.sent.get(sessionId) === key) return
     if (!this.sent.has(sessionId) && items.length === 0) {

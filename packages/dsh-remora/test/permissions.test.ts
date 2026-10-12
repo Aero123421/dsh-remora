@@ -40,4 +40,11 @@ test('raising, full access and widening the scope are reported; lowering is not'
   assert.deepEqual(wideningReasons(base, withScope(base, { exceptions: [{ sessionId: 's', allow: false }] }), now), [])
   assert.deepEqual(wideningReasons(withScope(base, { untrustedWorkspaces: ['w'] }), base, now), ['trust'])
   assert.deepEqual(wideningReasons(base, withScope(base, { commands: ['/compact'] }), now), ['commands'])
+  // Answers from outside: approvals without a passkey, and holding requests again after "off".
+  assert.deepEqual(wideningReasons(base, { ...base, approvalsFromRemote: true }, now), ['approvals-from-remote'])
+  assert.deepEqual(wideningReasons({ ...base, approvalsFromRemote: true }, base, now), [])
+  const off = { ...base, remoteAnswerWaitMs: 0 }
+  assert.deepEqual(wideningReasons(base, off, now), [])
+  assert.deepEqual(wideningReasons(off, base, now), ['remote-answers'])
+  assert.deepEqual(wideningReasons(base, { ...base, remoteAnswerWaitMs: 60 * 60_000 }, now), [])
 })

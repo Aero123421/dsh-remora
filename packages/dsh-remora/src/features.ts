@@ -32,8 +32,9 @@ export const SERVICE_REQUIREMENTS: Readonly<Record<OperationId, readonly string[
   'workspace.create': ['workspaceRegistry'],
   'model.select': ['sessionController'],
   'command.run': ['sessionController', 'commands'],
-  // P2, not implemented: DSH 0.2.1 has no host API to answer an approval, and the rest stay off.
-  'approval.respond': ['approval'],
+  // Answered by holding the `approval/request` chain (adapter/answerer.ts).
+  'approval.respond': ['sessionController', 'approval'],
+  // P2, not implemented.
   'terminal.run': ['terminals'],
   'job.stop': ['jobs'],
   'schedule.manage': ['schedule'],
@@ -52,7 +53,7 @@ export const IMPLEMENTED: ReadonlySet<OperationId> = new Set<OperationId>([
   // P1
   'attention.respond', 'changes.get', 'patch.get', 'deliverable.read', 'session.usage',
   'task.steer', 'task.cancel', 'task.resubmit', 'goal.manage', 'job.output',
-  'workspace.create', 'model.select', 'command.run',
+  'workspace.create', 'model.select', 'command.run', 'approval.respond',
 ])
 
 export interface FeatureReport {

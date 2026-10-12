@@ -3,7 +3,7 @@
  * reads), scope checks, and tombstones for sessions that disappeared.
  */
 import { realpath } from 'node:fs/promises'
-import type { ModelChoice, SessionSummary } from '@dsh-remora/protocol'
+import type { AttentionItem, ModelChoice, SessionSummary } from '@dsh-remora/protocol'
 import type { HostContext } from '../dsh.ts'
 import type { AdapterDeps, OperationContext, SessionScopeInput, WorkspaceCreationRecord, WorkspaceCreationStore } from '../ops/types.ts'
 import { OperationError } from '../ops/types.ts'
@@ -14,6 +14,7 @@ import type {
 } from './dsh-types.ts'
 import { SERVICES } from './dsh-types.ts'
 import { denied, fromDsh, notFound, unavailable } from './errors.ts'
+import { computeAttention, type HeldAttention } from './events.ts'
 
 export const CONTENT_SCOPE = 'dsh.content'
 /** Where the owner trusts a cloned workspace. */
@@ -57,6 +58,8 @@ export class Runtime {
 
   /** Durable workspace.create ledger (memory fallback when the core gives none). */
   readonly creations: WorkspaceCreationStore
+  /** Requests Remora holds open for outside answers, per session (installed by the answerer). */
+  heldFor: (sessionId: string) => ReadonlyMap<string, HeldAttention> | undefined = () => undefined
 
   constructor(ctx: HostContext, deps: AdapterDeps) {
     this.ctx = ctx as HostContext & EventfulContext
@@ -235,6 +238,11 @@ export class Runtime {
       agentPreset: typeof row.values.agentPreset === 'string' ? row.values.agentPreset : null,
       model: modelOf(row.values),
     }
+  }
+
+  /** Everything waiting for a human in one session, with the routes Remora can answer it by. */
+  attention(sessionId: string, events: readonly DshSessionEvent[] | null, values: DshProjectionValues | null): AttentionItem[] {
+    return computeAttention(sessionId, { events, values, loginError: this.loginErrors.get(sessionId) ?? null, held: this.heldFor(sessionId) })
   }
 
   // --- non-waking reads --------------------------------------------------------

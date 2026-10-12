@@ -9,11 +9,12 @@ import { OperationError } from '../ops/types.ts'
 import { redactTruncate } from '../redact.ts'
 import type { DshCommands, DshGoals, DshModelCatalog, DshUserQuestions } from './dsh-types.ts'
 import { SERVICES } from './dsh-types.ts'
+import type { Answerer, HeldRequest, QuestionWithIntent } from './answerer.ts'
 import { denied, fromDsh, invalid, unavailable } from './errors.ts'
-import { computeAttention } from './events.ts'
 import { hasContent, modelOf, type Runtime, type SessionRow } from './runtime.ts'
 
 type Params<Op extends keyof OperationParams> = OperationParams[Op]
+const NOT_HELD = 'Remora is not holding this item open for an answer from outside (the wait time on the DSH Remora tab is 0, it reached its limit, or Remora started after DSH asked); answer it in DSH Web'
 type Result<Op extends keyof OperationResults> = OperationResults[Op]
 
 function promptable(row: SessionRow): void {
@@ -49,7 +50,52 @@ export function catalogChoices(catalog: DshModelCatalog, provider?: string): Mod
     .slice(0, 100)
 }
 
-export function createActions(rt: Runtime) {
+type Answer = Params<'attention.respond'>['answer']
+
+/** The answer batch for a held question: one question, an option by position and/or free text. */
+export function questionAnswer(questions: readonly QuestionWithIntent[], answer: Answer): { answers: { id: string; selected: string[]; custom?: string }[] } {
+  if (questions.length !== 1) throw invalid('this question has several parts; answer it in DSH Web')
+  const question = questions[0]!
+  const selected: string[] = []
+  if (answer.optionId !== undefined) {
+    const option = /^\d+$/.test(answer.optionId) ? question.options?.[Number(answer.optionId)] : undefined
+    if (!option) throw invalid(`option ${answer.optionId} does not exist`)
+    selected.push(option.label)
+  }
+  const text = answer.text !== undefined && answer.text.trim() !== '' ? answer.text : undefined
+  if (selected.length === 0 && text === undefined) throw invalid('give optionId or text')
+  return { answers: [{ id: question.id, selected, ...(text !== undefined ? { custom: text } : {}) }] }
+}
+
+/**
+ * The answer batch for a held plan review: approve (`approve: true` or
+ * optionId `approve`) picks the question's approve label; anything else keeps
+ * planning, with the text as feedback for the model.
+ */
+export function planAnswer(questions: readonly QuestionWithIntent[], answer: Answer): { answers: { id: string; selected: string[]; custom?: string }[] } {
+  const question = questions.find(item => item.intent?.kind === 'plan-review')
+  if (!question?.intent) throw invalid('this plan review cannot be answered remotely')
+  const approve = answer.approve ?? (answer.optionId === 'approve' ? true : answer.optionId === 'keep-planning' ? false : undefined)
+  if (approve === undefined) throw invalid('give approve (true or false) or optionId approve / keep-planning')
+  if (approve) return { answers: [{ id: question.id, selected: [question.intent.approve] }] }
+  const other = question.options?.find(option => option.label !== question.intent!.approve)?.label
+  const text = answer.text !== undefined && answer.text.trim() !== '' ? answer.text : undefined
+  return { answers: [{ id: question.id, selected: other ? [other] : [], ...(text !== undefined ? { custom: text } : {}) }] }
+}
+
+/** Allow once or reject: `approve`, or optionId `allow-once` / `reject`. */
+export function approvalOutcome(answer: Answer): 'allowed-once' | 'rejected' {
+  const approve = answer.approve ?? (answer.optionId === 'allow-once' ? true : answer.optionId === 'reject' ? false : undefined)
+  if (approve === undefined) throw invalid('give approve (true to allow once, false to reject) or optionId allow-once / reject')
+  return approve ? 'allowed-once' : 'rejected'
+}
+
+function deliver(held: HeldRequest, value: unknown): { accepted: true } {
+  if (!held.answer(value)) throw new OperationError('conflict', 'this item was already answered or is no longer waiting')
+  return { accepted: true }
+}
+
+export function createActions(rt: Runtime, answerer?: Answerer) {
   /**
    * The session an acting operation targets. `drives` marks operations that can
    * start or continue agent turns; those are refused in cloning or untrusted
@@ -114,57 +160,42 @@ export function createActions(rt: Runtime) {
       // untrusted or cloning workspaces like a prompt; the owner answers on DSH Web.
       rt.assertCanDriveTurns(row.workspace?.id ?? null)
       const [events, values] = await Promise.all([rt.events(row.sessionId, context.signal), rt.projections(row.sessionId, context.signal)])
-      const item = computeAttention(row.sessionId, { events, values, loginError: rt.loginErrors.get(row.sessionId) ?? null })
-        .find(candidate => candidate.attentionId === params.attentionId)
+      const item = rt.attention(row.sessionId, events, values).find(candidate => candidate.attentionId === params.attentionId)
       // Answered on DSH Web first (or never existed): refuse instead of answering twice.
       if (!item) throw new OperationError('conflict', 'this item was already answered or is no longer waiting')
       const answer = params.answer
+      const held = answerer?.find(row.sessionId, params.attentionId)
       switch (item.kind) {
         case 'approval':
-          throw invalid('approvals are answered with approval.respond (P2), not attention.respond')
+          throw invalid('approvals are answered with approval.respond (MCP: dsh_approval_respond), not attention.respond')
         case 'login-expired':
           throw unavailable('sign in to the provider again on DSH; this cannot be done remotely')
         case 'plan-review':
-          // DSH 0.2.1 asks plan reviews through the blocking `user-questions/request`
-          // waterfall only; there is no API to answer one from the host side.
-          throw unavailable('plan reviews cannot be answered remotely on this DSH version; answer it in DSH Web')
+          // Plan reviews block in the `user-questions/request` chain; Remora answers
+          // the ones it holds (see answerer.ts).
+          if (!held) throw unavailable(NOT_HELD)
+          return deliver(held, planAnswer(held.questions, answer))
         case 'goal-stopped': {
           const action = answer.optionId === 'clear' || answer.approve === false ? 'clear' : 'resume'
           await manageGoal({ sessionId: row.sessionId, action }, context)
           return { accepted: true }
         }
         case 'question': {
-          // Legacy mode (tool-ask-user's default): `userQuestions.ask` dispatches the
-          // `user-questions/request` waterfall and blocks until a listener answers.
-          // DSH Web's client listener holds the question; with no client attached,
-          // the waterfall falls through to NO_PROVIDER and the tool call fails at
-          // once. A host-side listener could race `next()`, but it cannot withdraw
-          // the Web card (`next()` takes no signal) and would turn "no UI → fail
-          // fast" into "wait forever", so Remora does not answer legacy questions.
+          // Legacy mode (tool-ask-user's default) blocks in the `user-questions/request`
+          // chain: Remora answers the questions it holds.
+          if (held) return deliver(held, questionAnswer(held.questions, answer))
           // Timed mode records `continued` questions in the `userQuestions`
           // projection, and `userQuestions.answer` is the supported way to answer.
-          if (!item.answerable) {
-            throw unavailable('this question is held by DSH Web (legacy ask_user_question mode); answer it there, or switch tool-ask-user to timed mode to answer remotely')
-          }
           const pending = values?.userQuestions?.active.find(question => question.callId === params.attentionId)
-          if (!pending || pending.state !== 'continued') throw new OperationError('conflict', 'this question is no longer waiting')
-          if (pending.questions.length !== 1) throw invalid('this question has several parts; answer it in DSH Web')
-          const question = pending.questions[0]!
-          const selected: string[] = []
-          if (answer.optionId !== undefined) {
-            const option = question.options?.[Number(answer.optionId)]
-            if (!option || !/^\d+$/.test(answer.optionId)) throw invalid(`option ${answer.optionId} does not exist`)
-            selected.push(option.label)
-          }
-          if (selected.length === 0 && (answer.text === undefined || answer.text.trim() === '')) throw invalid('give optionId or text')
+          if (!pending) throw unavailable(NOT_HELD)
+          if (pending.state !== 'continued') throw new OperationError('conflict', 'this question is still open in DSH Web; try again once it is waiting for a late answer')
+          const batch = questionAnswer(pending.questions, answer)
           const service = rt.get<DshUserQuestions>(SERVICES.userQuestions)
           if (!service) throw unavailable('DSH user questions are not available')
           const agent = await rt.agent(row.sessionId)
           let accepted: boolean
           try {
-            accepted = service.answer(agent, params.attentionId, {
-              answers: [{ id: question.id, selected, ...(answer.text !== undefined && answer.text.trim() !== '' ? { custom: answer.text } : {}) }],
-            })
+            accepted = service.answer(agent, params.attentionId, batch)
           } catch (error) {
             throw fromDsh(error, 'the answer was not accepted')
           }
@@ -172,6 +203,20 @@ export function createActions(rt: Runtime) {
           return { accepted: true }
         }
       }
+    },
+
+    async 'approval.respond'(params: Params<'approval.respond'>, context: OperationContext): Promise<Result<'approval.respond'>> {
+      const row = await rt.row(params.sessionId, context.signal)
+      rt.assertCanDriveTurns(row.workspace?.id ?? null)
+      // The core already required the owner's passkey unless approvals from MCP and CLI are allowed.
+      const outcome = approvalOutcome(params.answer)
+      const held = answerer?.find(row.sessionId, params.attentionId)
+      if (held?.kind === 'approval') return deliver(held, outcome)
+      const events = await rt.events(row.sessionId, context.signal)
+      const item = rt.attention(row.sessionId, events, null).find(candidate => candidate.attentionId === params.attentionId)
+      if (!item) throw new OperationError('conflict', 'this approval was already decided or is no longer waiting')
+      if (item.kind !== 'approval') throw invalid(`this item is a ${item.kind}; answer it with attention.respond`)
+      throw unavailable(NOT_HELD)
     },
 
     async 'model.select'(params: Params<'model.select'>, context: OperationContext): Promise<Result<'model.select'>> {
