@@ -17,9 +17,10 @@ import { OWNER_CLIENT_ID, PARKED_TASK_TTL_MS, RELAY_TIMEOUT_MS } from './config.
 import { HUB_OBJECT_NAME } from './hub-do.ts'
 import { newTaskId, parseJson, randomToken, verifyEd25519 } from './util.ts'
 import {
-  KEEPALIVE_PING, KEEPALIVE_PONG, TASK_WAIT_MAX_MS, TERMINAL_TASK_STATES, decide, fixFor, hostAuthMessage, isSupportedProtocol, parseHostFrame,
-  type Actor, type AttentionItem, type Confirmation, type DenialLayer, type Grant, type HelloFrame, type HostEvent, type HubFrame, type RemoraError, type ResponseFrame,
-  type TaskInfo, type TaskState,
+  CONFIRMATION_REQUEST_TTL_MS, KEEPALIVE_PING, KEEPALIVE_PONG, REQUIRES_CONFIRMATION, TASK_WAIT_MAX_MS, TERMINAL_TASK_STATES, decide, fixFor, hostAuthMessage,
+  isSupportedProtocol, parseHostFrame,
+  type Actor, type AttentionItem, type Confirmation, type ConfirmationInfo, type ConfirmationState, type DenialLayer, type Grant, type HelloFrame, type HostEvent,
+  type HubFrame, type RemoraError, type ResponseFrame, type TaskInfo, type TaskState,
 } from './vendor/protocol/index.ts'
 
 /** How long a host has to answer the challenge. */
@@ -80,7 +81,35 @@ export interface HostLive {
   duplicateConnections: number
   /** At least one task was ever started on this host through Remora. */
   hadTasks: boolean
+  /** Requests waiting for the owner's passkey (one client's own when listed for that client). */
+  confirmations: PendingConfirmation[]
 }
+
+/** A request parked until the owner confirms it with a passkey, as the hub pages list it. */
+export interface PendingConfirmation {
+  confirmationId: string
+  operation: string
+  clientName: string
+  /** The command, or the operation name when there is none (at most 200 characters). */
+  what: string
+  createdAt: number
+  expiresAt: number
+}
+
+type ConfirmationRow = {
+  id: string; client_id: string; client_name: string; op: string; params: string; scopes: string; state: string; request_id: string | null;
+  result: string | null; error: string | null; created_at: number; expires_at: number; deadline_at: number | null; updated_at: number
+}
+
+/** A confirmation the owner can review, with the requester's name (hub UI). */
+export interface ConfirmationView extends ConfirmationInfo {
+  clientId: string
+  clientName: string
+  params: Record<string, unknown>
+}
+
+/** Time a confirmed command has beyond its own timeout before the hub gives up on the host's answer. */
+const CONFIRMED_RUN_SLACK_MS = 30_000
 
 type TaskRow = {
   task_id: string; client_id: string; idempotency_key: string; op: string; state: string; session_id: string | null; params: string | null;
@@ -108,6 +137,23 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS tasks_delivery ON tasks (delivery_id);
   CREATE TABLE IF NOT EXISTS attention (session_id TEXT PRIMARY KEY, items TEXT NOT NULL, updated_at INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS confirmations (
+    id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    client_name TEXT NOT NULL,
+    op TEXT NOT NULL,
+    params TEXT NOT NULL,
+    scopes TEXT NOT NULL,
+    state TEXT NOT NULL,
+    request_id TEXT,
+    result TEXT,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    deadline_at INTEGER,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS confirmations_request ON confirmations (request_id);
   ${AUDIT_SCHEMA}
 `
 
@@ -462,7 +508,12 @@ export class HostDO extends DurableObject<Env> {
     // A delivery made while no request was waiting (reconnect or retry).
     this.inFlight.delete(frame.id)
     const row = this.sql.exec<TaskRow>('SELECT * FROM tasks WHERE delivery_id = ?', frame.id).toArray()[0]
-    if (row) this.applyDelivery(row, frame)
+    if (row) {
+      this.applyDelivery(row, frame)
+      return
+    }
+    const confirmed = this.sql.exec<ConfirmationRow>("SELECT * FROM confirmations WHERE request_id = ? AND state = 'running'", frame.id).toArray()[0]
+    if (confirmed) this.applyConfirmed(confirmed, frame)
   }
 
   /** Record the host's answer to a task delivery. Returns false when the task was forgotten. */
@@ -609,6 +660,7 @@ export class HostDO extends DurableObject<Env> {
     if (!ceiling) return { ok: false, error: err('host_offline', 'This host has not connected to the hub yet.', { fix: 'dsh:settings/remora#connection' }) }
     const decision = decide({ operation: call.op, ceiling, hubGrant: call.grant, tokenScopes: call.scopes, now: Date.now() })
     if (!decision.allowed) return { ok: false, error: denied(decision.layer, decision.reason, call.op) }
+    if (call.op === 'confirmation.get') return this.confirmationQuery(call)
     if (this.info('kill_switch') === '1') {
       return { ok: false, error: err('denied', 'Remote access is stopped with the emergency switch on the DSH host.', { denial: { layer: 'dsh', reason: 'kill-switch' }, fix: 'dsh:settings/remora#kill-switch' }) }
     }
@@ -632,12 +684,181 @@ export class HostDO extends DurableObject<Env> {
       return { ok: false, error: err('unavailable', `This DSH host cannot serve ${call.op} (not supported by its DSH or plugin version).`, { fix: 'dsh:settings/remora#compatibility' }) }
     }
     if (TASK_CREATING.has(call.op)) return this.createTask(call)
+    // Every call of these needs the owner's passkey: park it until the owner confirms it on the hub.
+    if (REQUIRES_CONFIRMATION.has(call.op) && !call.confirmation) return this.requestConfirmation(call)
     const ws = this.readySockets()[0]
     if (!ws) return { ok: false, error: err('host_offline', 'The DSH host is offline. Start DSH Web on that machine and try again.') }
     const frame = await this.relay(ws, call.requestId ?? `r_${randomToken(12)}`, call, RELAY_TIMEOUT_MS)
     if (!frame) return { ok: false, error: err('unavailable', 'The DSH host did not answer in time.') }
     if (frame.ok) return { ok: true, result: stampHostId(frame.result ?? null, this.hostId ?? '') }
     return { ok: false, error: this.explainRefusal(call, frame.error ?? err('internal', 'The host returned an error without details.')) }
+  }
+
+  // --- confirmations: operations that wait for the owner's passkey -------------------------
+
+  private confirmationRow(id: string): ConfirmationRow | undefined {
+    return this.sql.exec<ConfirmationRow>('SELECT * FROM confirmations WHERE id = ?', id).toArray()[0]
+  }
+
+  /** Pending rows past their deadline become `expired`; running ones the host never answered, `failed`. */
+  private settleOverdue(now = Date.now()): void {
+    const overdue = this.sql.exec<{ id: string; state: string }>(
+      "SELECT id, state FROM confirmations WHERE (state = 'pending' AND expires_at <= ?) OR (state = 'running' AND deadline_at IS NOT NULL AND deadline_at <= ?)", now, now,
+    ).toArray()
+    for (const row of overdue) {
+      if (row.state === 'pending') {
+        this.sql.exec("UPDATE confirmations SET state = 'expired', params = '{}', updated_at = ? WHERE id = ?", now, row.id)
+      } else {
+        this.sql.exec("UPDATE confirmations SET state = 'failed', error = ?, updated_at = ? WHERE id = ?", JSON.stringify(err('unavailable', 'The DSH host did not report the outcome in time.')), now, row.id)
+      }
+      this.notify(`c:${row.id}`)
+    }
+  }
+
+  private confirmationInfo(row: ConfirmationRow, origin?: string): ConfirmationInfo {
+    const info: ConfirmationInfo = {
+      confirmationId: row.id,
+      hostId: this.hostId ?? '',
+      operation: row.op,
+      state: row.state as ConfirmationState,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+    }
+    if (origin) info.confirmUrl = `${origin}/confirm/${this.hostId ?? ''}/${row.id}`
+    const result = parseJson<unknown>(row.result, null)
+    if (result !== null) info.result = result
+    const error = parseJson<RemoraError | null>(row.error, null)
+    if (error) info.error = error
+    return info
+  }
+
+  private async requestConfirmation(call: ExecuteCall): Promise<ExecuteResult> {
+    const now = Date.now()
+    const id = newTaskId(this.hostId as string)
+    this.sql.exec(
+      "INSERT INTO confirmations (id, client_id, client_name, op, params, scopes, state, created_at, expires_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+      id, call.actor.clientId, String(call.actor.clientName).slice(0, 200), call.op, JSON.stringify(call.params), JSON.stringify(call.scopes), now, now + CONFIRMATION_REQUEST_TTL_MS, now,
+    )
+    await this.scheduleAlarm()
+    const what = typeof call.params.command === 'string' ? call.params.command : call.op
+    if (call.actor.clientId !== OWNER_CLIENT_ID) {
+      this.push([{ type: 'attention', kind: 'confirmation', hostId: this.hostId, host: this.displayName(), title: pushText(`${call.actor.clientName}: ${what}`), url: `/confirm/${this.hostId ?? ''}/${id}`, expiresAt: now + CONFIRMATION_REQUEST_TTL_MS }])
+    }
+    return { ok: true, result: this.confirmationInfo(this.confirmationRow(id) as ConfirmationRow, call.origin) }
+  }
+
+  private async confirmationQuery(call: ExecuteCall): Promise<ExecuteResult> {
+    const id = String(call.params.confirmationId ?? '')
+    const visible = (row: ConfirmationRow | undefined) => row !== undefined && (call.actor.clientId === OWNER_CLIENT_ID || row.client_id === call.actor.clientId)
+    this.settleOverdue()
+    let row = this.confirmationRow(id)
+    if (!visible(row)) return { ok: false, error: err('not_found', 'No confirmation with this id is known to the hub for this client.') }
+    const requested = typeof call.params.timeoutMs === 'number' ? call.params.timeoutMs : 0
+    const timeout = Math.max(0, Math.min(TASK_WAIT_MAX_MS, requested))
+    if ((row!.state === 'pending' || row!.state === 'running') && timeout > 0) {
+      await this.waitFor(`c:${id}`, Math.min(timeout, Math.max(0, (row!.state === 'pending' ? row!.expires_at : row!.deadline_at ?? Infinity) - Date.now()) + 50))
+      this.settleOverdue()
+      row = this.confirmationRow(id)
+      if (!row) return { ok: false, error: err('not_found', 'The confirmation was removed while waiting.') }
+    }
+    return { ok: true, result: this.confirmationInfo(row as ConfirmationRow, call.origin) }
+  }
+
+  private waitFor(key: string, timeoutMs: number): Promise<void> {
+    return new Promise<void>(resolve => {
+      const timer = setTimeout(() => {
+        this.waiters.get(key)?.delete(wake)
+        resolve()
+      }, timeoutMs)
+      const wake = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+      const set = this.waiters.get(key) ?? new Set()
+      set.add(wake)
+      this.waiters.set(key, set)
+    })
+  }
+
+  /** One confirmation for the owner's review page. */
+  async confirmationView(id: string, origin?: string): Promise<ConfirmationView | null> {
+    if (!this.schemaReady) return null
+    this.settleOverdue()
+    const row = this.confirmationRow(id)
+    if (!row) return null
+    return { ...this.confirmationInfo(row, origin), clientId: row.client_id, clientName: row.client_name, params: parseJson<Record<string, unknown>>(row.params, {}) }
+  }
+
+  /** Confirmations still waiting for the owner, oldest first. */
+  async pendingConfirmations(origin?: string): Promise<ConfirmationView[]> {
+    if (!this.schemaReady) return []
+    this.settleOverdue()
+    return this.sql.exec<ConfirmationRow>("SELECT * FROM confirmations WHERE state = 'pending' ORDER BY created_at").toArray()
+      .map(row => ({ ...this.confirmationInfo(row, origin), clientId: row.client_id, clientName: row.client_name, params: parseJson<Record<string, unknown>>(row.params, {}) }))
+  }
+
+  /**
+   * The owner confirmed a pending request with a passkey over exactly its
+   * stored params (`requestId` and `confirmation` come from
+   * /auth/confirm/options and the browser). Sends it to the host and returns
+   * at once; the host's response settles the row (onResponse), and an alarm
+   * fails it if no response comes.
+   */
+  async confirmRun(id: string, input: { requestId: string; confirmation: Confirmation; grant: Grant | null; origin?: string }): Promise<ExecuteResult> {
+    if (!this.schemaReady || !this.hostId) return { ok: false, error: err('gone', 'This host is not paired with the hub.') }
+    this.settleOverdue()
+    const row = this.confirmationRow(id)
+    if (!row) return { ok: false, error: err('not_found', 'No such confirmation.') }
+    if (row.state !== 'pending') return { ok: false, error: err('conflict', `This request is already ${row.state}.`) }
+    if (!input.grant) {
+      this.sql.exec("UPDATE confirmations SET state = 'failed', error = ?, params = '{}', updated_at = ? WHERE id = ?", JSON.stringify(denied('hub', 'switched-off', row.op)), Date.now(), id)
+      this.notify(`c:${id}`)
+      return { ok: false, error: denied('hub', 'switched-off', row.op) }
+    }
+    const ws = this.readySockets()[0]
+    if (!ws) return { ok: false, error: err('host_offline', 'The DSH host is offline. Start DSH Web on that machine, then confirm again.') }
+    const params = parseJson<Record<string, unknown>>(row.params, {})
+    const call: ExecuteCall = {
+      op: row.op,
+      params,
+      actor: { clientId: row.client_id, clientName: row.client_name },
+      scopes: parseJson<string[]>(row.scopes, []),
+      grant: input.grant,
+      requestId: input.requestId,
+      confirmation: input.confirmation,
+    }
+    const decision = decide({ operation: call.op, ceiling: this.ceiling() ?? { level: 'view' }, hubGrant: call.grant, tokenScopes: call.scopes, now: Date.now() })
+    if (!decision.allowed) return { ok: false, error: denied(decision.layer, decision.reason, call.op) }
+    const now = Date.now()
+    const timeoutMs = (typeof params.timeoutMs === 'number' ? params.timeoutMs : 60_000) + CONFIRMED_RUN_SLACK_MS
+    this.sql.exec("UPDATE confirmations SET state = 'running', request_id = ?, deadline_at = ?, updated_at = ? WHERE id = ?", input.requestId, now + timeoutMs, now, id)
+    this.sendRequest(ws, input.requestId, call, timeoutMs)
+    await this.scheduleAlarm()
+    await this.audit({ clientId: OWNER_CLIENT_ID, clientName: 'オーナー' }, `${row.op}.confirmed`, 'ok')
+    this.notify(`c:${id}`)
+    return { ok: true, result: this.confirmationInfo(this.confirmationRow(id) as ConfirmationRow, input.origin) }
+  }
+
+  /** The owner refused a pending request. */
+  async denyConfirmation(id: string): Promise<boolean> {
+    if (!this.schemaReady) return false
+    const row = this.confirmationRow(id)
+    if (!row || row.state !== 'pending') return false
+    this.sql.exec("UPDATE confirmations SET state = 'denied', params = '{}', updated_at = ? WHERE id = ?", Date.now(), id)
+    await this.audit({ clientId: OWNER_CLIENT_ID, clientName: 'オーナー' }, `${row.op}.confirmation-denied`, 'denied')
+    this.notify(`c:${id}`)
+    return true
+  }
+
+  /** The host answered a confirmed request. */
+  private applyConfirmed(row: ConfirmationRow, frame: ResponseFrame): void {
+    const now = Date.now()
+    if (frame.ok) {
+      this.sql.exec("UPDATE confirmations SET state = 'done', result = ?, updated_at = ? WHERE id = ?", JSON.stringify(stampHostId(frame.result ?? null, this.hostId ?? '')), now, row.id)
+    } else {
+      this.sql.exec("UPDATE confirmations SET state = 'failed', error = ?, updated_at = ? WHERE id = ?", JSON.stringify(frame.error ?? err('internal', 'The host returned an error without details.')), now, row.id)
+    }
+    this.notify(`c:${row.id}`)
   }
 
   // --- task ledger ------------------------------------------------------------------------------
@@ -750,9 +971,10 @@ export class HostDO extends DurableObject<Env> {
 
   private async scheduleAlarm(retryInMs?: number): Promise<void> {
     const next = this.sql.exec<{ at: number | null }>("SELECT MIN(expires_at) AS at FROM tasks WHERE state = 'parked' AND expires_at IS NOT NULL").one().at
+    const confirmationDue = this.sql.exec<{ at: number | null }>("SELECT MIN(CASE WHEN state = 'pending' THEN expires_at ELSE deadline_at END) AS at FROM confirmations WHERE state IN ('pending', 'running')").one().at
     const offlineSince = Number(this.info('offline_since') ?? '0') || null
     const offlineCheck = offlineSince === null ? null : offlineSince + OFFLINE_NOTIFY_AFTER_MS
-    const candidates = [next, offlineCheck, retryInMs !== undefined ? Date.now() + retryInMs : null, Date.now() + 24 * 60 * 60_000].filter((value): value is number => value !== null)
+    const candidates = [next, confirmationDue, offlineCheck, retryInMs !== undefined ? Date.now() + retryInMs : null, Date.now() + 24 * 60 * 60_000].filter((value): value is number => value !== null)
     const at = Math.min(...candidates)
     const current = await this.ctx.storage.getAlarm()
     if (current === null || current > at) await this.ctx.storage.setAlarm(at)
@@ -783,6 +1005,8 @@ export class HostDO extends DurableObject<Env> {
     if (ws) await this.deliverUndelivered(ws)
     this.sql.exec('DELETE FROM tasks WHERE updated_at < ? AND state IN (\'completed\', \'failed\', \'cancelled\')', now - RETENTION_MS)
     this.sql.exec('DELETE FROM attention WHERE updated_at < ?', now - RETENTION_MS)
+    this.settleOverdue(now)
+    this.sql.exec("DELETE FROM confirmations WHERE updated_at < ? AND state NOT IN ('pending', 'running')", now - RETENTION_MS)
     const pendingDelivery = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE state = 'parked' AND delivered = 0").one().n
     await this.scheduleAlarm(pendingDelivery > 0 && ws ? 60_000 : undefined)
   }
@@ -792,7 +1016,7 @@ export class HostDO extends DurableObject<Env> {
   /** Live view. With `clientId`, running and recent tasks are that client's only. */
   async summary(clientId?: string): Promise<HostLive> {
     if (!this.schemaReady) {
-      return { hostId: '', name: null, reportedName: null, online: false, revoked: false, lastSeenAt: null, pluginVersion: null, dshVersion: null, operations: [], ceiling: null, killSwitch: false, running: [], recent: [], attention: [], duplicateConnections: 0, hadTasks: false }
+      return { hostId: '', name: null, reportedName: null, online: false, revoked: false, lastSeenAt: null, pluginVersion: null, dshVersion: null, operations: [], ceiling: null, killSwitch: false, running: [], recent: [], attention: [], duplicateConnections: 0, hadTasks: false, confirmations: [] }
     }
     const ready = this.readySockets()
     let lastSeen = Number(this.info('last_seen_at') ?? '0') || null
@@ -805,6 +1029,11 @@ export class HostDO extends DurableObject<Env> {
     const running = this.sql.exec<TaskRow>(`SELECT * FROM tasks WHERE state IN ('parked', 'accepted', 'running', 'needs_attention')${mine} ORDER BY created_at DESC LIMIT 50`, ...bind).toArray().map(row => this.taskFromRow(row))
     const recent = this.sql.exec<TaskRow>(`SELECT * FROM tasks WHERE state IN ('completed', 'failed', 'cancelled')${mine} ORDER BY updated_at DESC LIMIT 10`, ...bind).toArray().map(row => this.taskFromRow(row))
     const attention = this.sql.exec<{ items: string }>('SELECT items FROM attention ORDER BY updated_at DESC').toArray().flatMap(row => parseJson<AttentionItem[]>(row.items, []))
+    this.settleOverdue()
+    const confirmations = this.sql.exec<ConfirmationRow>(`SELECT * FROM confirmations WHERE state = 'pending'${mine} ORDER BY created_at LIMIT 50`, ...bind).toArray().map(row => {
+      const params = parseJson<Record<string, unknown>>(row.params, {})
+      return { confirmationId: row.id, operation: row.op, clientName: row.client_name, what: (typeof params.command === 'string' ? params.command : row.op).slice(0, 200), createdAt: row.created_at, expiresAt: row.expires_at }
+    })
     return {
       hostId: this.hostId ?? '',
       name: this.info('name'),
@@ -822,6 +1051,7 @@ export class HostDO extends DurableObject<Env> {
       attention,
       duplicateConnections: Number(this.info('duplicate_connections') ?? '0'),
       hadTasks: running.length > 0 || recent.length > 0 || this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM tasks').one().n > 0,
+      confirmations,
     }
   }
 

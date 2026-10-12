@@ -48,6 +48,8 @@ export interface PageOptions {
   scripts?: string[]
   /** Narrow, centered card for sign-in and approval pages. */
   narrow?: boolean
+  /** Reload the page after this many seconds (a result still on its way). */
+  refreshSeconds?: number
 }
 
 const NAV: [Exclude<NavKey, null>, string, string][] = [
@@ -77,7 +79,7 @@ export function page(options: PageOptions): string {
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Remora">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
-<title>${escapeHtml(options.title)} · Remora</title>
+${options.refreshSeconds ? `<meta http-equiv="refresh" content="${Math.max(1, Math.round(options.refreshSeconds))}">\n` : ''}<title>${escapeHtml(options.title)} · Remora</title>
 <link rel="icon" href="/remora-app.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/remora-180.png">
 <link rel="manifest" href="/manifest.webmanifest">
@@ -138,6 +140,7 @@ export const ATTENTION_LABEL: Readonly<Record<string, string>> = {
   'plan-review': 'プランの確認',
   'goal-stopped': 'ゴールの停止',
   'login-expired': 'ログイン切れ',
+  confirmation: 'パスキーでの確認待ち',
 }
 
 export function flash(message: string | null | undefined, kind: 'ok' | 'error' = 'ok'): Raw {

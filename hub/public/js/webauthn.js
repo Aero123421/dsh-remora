@@ -176,13 +176,16 @@
         let params
         try { params = JSON.parse(form.getAttribute('data-params') || '{}') } catch { params = {} }
         if (submitter && submitter.hasAttribute('data-approve')) params.answer = { approve: submitter.getAttribute('data-approve') === 'true' }
+        // A request a client parked for the owner: the hub signs over its stored params.
+        const pendingId = form.getAttribute('data-pending')
+        const pending = pendingId ? { pendingId } : {}
         try {
           // The hub returns the exact params it signed over (hostId filled in); send those back.
-          const { requestId, issuedAt, params: signed, options } = await post('/auth/confirm/options', { hostId, operation, params })
+          const { requestId, issuedAt, params: signed, options } = await post('/auth/confirm/options', { hostId, operation, params, ...pending })
           const credential = await navigator.credentials.get({ publicKey: requestOptions(options) })
           const json = credentialJson(credential)
           const assertion = { credentialId: json.id, authenticatorData: json.response.authenticatorData, clientDataJSON: json.response.clientDataJSON, signature: json.response.signature, userHandle: json.response.userHandle || null }
-          await post('/ops/confirmed', { hostId, operation, params: signed || params, requestId, issuedAt, assertion })
+          await post('/ops/confirmed', { hostId, operation, params: signed || params, requestId, issuedAt, assertion, ...pending })
           location.assign(form.getAttribute('data-done') || location.href)
         } catch (error) {
           say(form, explain(error), 'error')

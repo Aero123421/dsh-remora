@@ -12,7 +12,7 @@ import { cose, decodeCredentialPublicKey } from '@simplewebauthn/server/helpers'
 import { RATE_LIMITS, SESSION_COOKIE, SESSION_MAX_MS, hubOrigin, secrets } from './config.ts'
 import { clearCookie, clientIp, getCookie, json, readForm, readJson, redirect, sameOrigin, sessionCookie } from './http.ts'
 import { hubStub } from './meter.ts'
-import { finalParams } from './ops.ts'
+import { confirmations, finalParams } from './ops.ts'
 import type { PasskeyRecord } from './types.ts'
 import { randomToken, safeEqual, sha256Hex } from './util.ts'
 import { confirmationChallenge, fromBase64Url, toBase64Url } from './vendor/protocol/index.ts'
@@ -228,7 +228,13 @@ export async function handleAuth(request: Request, env: Env, path: string): Prom
       if (typeof hostId !== 'string' || typeof operation !== 'string') return fail(400, 'hostId and operation are required')
       const requestId = `r_${randomToken(12)}`
       const issuedAt = Date.now()
-      const rawParams = typeof body.params === 'object' && body.params !== null && !Array.isArray(body.params) ? (body.params as Record<string, unknown>) : {}
+      let rawParams = typeof body.params === 'object' && body.params !== null && !Array.isArray(body.params) ? (body.params as Record<string, unknown>) : {}
+      if (typeof body.pendingId === 'string') {
+        // A request a client parked for the owner: sign over exactly what it asked for.
+        const pending = await confirmations(env, hostId).view(body.pendingId)
+        if (!pending || pending.state !== 'pending' || pending.operation !== operation) return fail(409, 'this request is no longer waiting')
+        rawParams = pending.params
+      }
       if (typeof rawParams.hostId === 'string' && rawParams.hostId !== hostId) return fail(400, 'params.hostId does not match hostId')
       // The challenge covers the params the host will see, hostId included.
       const params = finalParams(operation, rawParams, hostId)

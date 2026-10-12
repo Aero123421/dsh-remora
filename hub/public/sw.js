@@ -6,6 +6,7 @@ const LABELS = {
   approval: '承認待ち',
   question: 'AI からの質問',
   'plan-review': 'プランの確認',
+  confirmation: 'パスキーでの確認待ち',
   'task-completed': 'タスクが完了しました',
   'task-failed': 'タスクが失敗しました',
   'host-offline': 'オフラインになりました',
@@ -47,7 +48,7 @@ self.addEventListener('push', event => {
   if (data.title) lines.push(String(data.title).slice(0, 80))
   if (typeof data.expiresAt === 'number') lines.push(left(data.expiresAt))
   if (typeof data.count === 'number' && data.count > 1) lines.push(`ほか ${data.count - 1} 件`)
-  const attention = kind === 'approval' || kind === 'question' || kind === 'plan-review'
+  const attention = kind === 'approval' || kind === 'question' || kind === 'plan-review' || kind === 'confirmation'
   event.waitUntil(self.registration.showNotification(title, {
     body: lines.join('\n'),
     icon: '/remora-192.png',

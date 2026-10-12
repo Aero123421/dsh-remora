@@ -8,11 +8,11 @@ import type { AuditRow } from '../audit.ts'
 import { verifyAuditChain } from '../audit.ts'
 import { getSession, rpIdOf, type OwnerSession } from '../auth.ts'
 import { FREE_TIER, FREE_TIER_WARN, OWNER_CLIENT_ID, dcrEnabled, hubOrigin, secrets } from '../config.ts'
-import type { HostLive } from '../host-do.ts'
+import type { HostLive, PendingConfirmation } from '../host-do.ts'
 import { html, json, readForm, readJson, redirect, sameOrigin } from '../http.ts'
 import { hostStub, hubStub } from '../meter.ts'
 import { oauthEnv, oauthFor, resourcesFor } from '../oauth.ts'
-import { finalParams, liveHosts, refreshParked, revokeHostEverywhere, runOperation, type Caller } from '../ops.ts'
+import { confirmations, finalParams, liveHosts, ownerGrant, refreshParked, revokeHostEverywhere, runOperation, type Caller } from '../ops.ts'
 import { PUSH_TYPES, type ClientWithGrants, type GrantLevel, type PushType } from '../types.ts'
 import { isPushEndpoint, isSubscriptionKey } from '../webpush.ts'
 import { safeNext } from '../next.ts'
@@ -20,8 +20,10 @@ import { randomToken } from '../util.ts'
 import { HUB_VERSION } from '../version.ts'
 import {
   CLI_CLIENT_ID, LEVEL_RANK, PROTOCOL_VERSION, SCOPES,
-  type AttentionItem, type Confirmation, type HostSummary, type RemoraError, type SessionGetResult, type SessionSummary, type TaskInfo, type WorkspaceSummary,
+  type AttentionItem, type Confirmation, type ConfirmationInfo, type HostSummary, type RemoraError, type ScheduleInfo, type SearchHit, type SessionForkResult,
+  type SessionGetResult, type SessionSummary, type TaskInfo, type TerminalRunOutput, type WorkspaceSummary,
 } from '../vendor/protocol/index.ts'
+import { whenFromForm } from './schedule-form.ts'
 import { ATTENTION_LABEL, LEVEL_LABEL, STATE_LABEL, dateTime, flash, h, page, raw, reauthForm, relativeTime, type NavKey, type Raw } from './layout.ts'
 
 const OWNER: Caller = { clientId: OWNER_CLIENT_ID, clientName: 'ハブの画面', scopes: [...SCOPES], kind: 'owner' }
@@ -44,6 +46,14 @@ const MESSAGES: Readonly<Record<string, [string, 'ok' | 'error']>> = {
   'push-saved': ['通知の種類を保存しました。', 'ok'],
   'push-test-sent': ['テスト通知を送りました。数秒で届かないときは、端末の通知設定を確かめてください。', 'ok'],
   'push-test-none': ['テスト通知を送れませんでした。通知を受け取るデバイスが登録されていないか、送信に失敗しました。', 'error'],
+  'confirmation-denied': ['拒否しました。依頼したクライアントには「拒否された」と伝わります。', 'ok'],
+  'confirmation-gone': ['この依頼はもう確認待ちではありません。', 'error'],
+  'forked': ['フォークしました。これが新しいセッションです。', 'ok'],
+  'job-stopped': ['ジョブを止めました。', 'ok'],
+  'job-not-running': ['そのジョブはもう動いていませんでした。', 'ok'],
+  'schedule-created': ['スケジュールを追加しました。', 'ok'],
+  'schedule-deleted': ['スケジュールを削除しました。', 'ok'],
+  'schedule-gone': ['そのスケジュールはもうありませんでした。', 'ok'],
 }
 
 function message(url: URL): Raw {
@@ -180,6 +190,27 @@ function attentionRow(item: AttentionItem, hostName: string): Raw {
 </li>`
 }
 
+/** Operations that wait for the owner's passkey, in words. */
+const CONFIRM_LABEL: Readonly<Record<string, string>> = {
+  'terminal.run': 'ターミナルでコマンドを実行',
+}
+
+const confirmPath = (hostId: string, confirmationId: string) => `/confirm/${hostId}/${confirmationId}`
+
+/** One request a client parked for the owner's passkey. */
+function confirmationRow(item: PendingConfirmation, hostId: string, hostName: string): Raw {
+  return h`<li class="inbox-item kind-confirmation" data-expiring data-testid="hub-confirmation-item">
+  <div class="row"><span class="badge danger">${ATTENTION_LABEL.confirmation}</span> <a href="${confirmPath(hostId, item.confirmationId)}">${CONFIRM_LABEL[item.operation] ?? item.operation}</a> <span class="muted">${item.clientName} から</span></div>
+  <div class="row"><code class="untrusted">${item.what}</code></div>
+  <div class="row muted">${hostName ? h`<span>${hostName}</span>` : ''} ${countdown(item.expiresAt)} <span>${relativeTime(item.createdAt)}</span>
+  <a class="button small primary" href="${confirmPath(hostId, item.confirmationId)}">確認する</a></div>
+</li>`
+}
+
+function confirmationList(entries: { item: PendingConfirmation; hostId: string; name: string }[]): Raw {
+  return entries.length === 0 ? raw('') : h`<ul class="list inbox">${entries.map(entry => confirmationRow(entry.item, entry.hostId, entry.name))}</ul>`
+}
+
 function inbox(items: AttentionItem[], names: Map<string, string>): Raw {
   return h`<ul class="list inbox">${[...items].sort(byUrgency).map(item => attentionRow(item, names.get(item.hostId) ?? item.hostId))}</ul>`
 }
@@ -189,6 +220,8 @@ async function homePage(env: Env, url: URL): Promise<Response> {
   const [state, data, meter] = await Promise.all([hub.state(), overview(env), hub.meterToday()])
   const names = new Map(data.hosts.map(entry => [entry.summary.hostId, entry.summary.name]))
   const attention = data.hosts.flatMap(entry => entry.live.attention)
+  const pending = data.hosts.flatMap(entry => entry.live.confirmations.map(item => ({ item, hostId: entry.summary.hostId, name: entry.summary.name })))
+  const waiting = attention.length + pending.length
   const running = data.hosts.flatMap(entry => entry.live.running)
   const recent = data.hosts.flatMap(entry => entry.live.recent).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 8)
   const steps: [boolean, string, string][] = [
@@ -208,8 +241,8 @@ async function homePage(env: Env, url: URL): Promise<Response> {
   const body = h`${message(url)}
 ${steps.every(([done]) => done) ? '' : h`<section class="card"><h2>はじめに</h2><ol class="checklist">${[...steps, pushStep].map(([done, label, href]) => h`<li class="${done ? 'done' : ''}"><a href="${href}">${label}</a></li>`)}</ol>
 <p class="muted">iPhone・iPad で通知を受け取るには、Safari の共有ボタンから「ホーム画面に追加」し、ホーム画面の Remora から開いてください（iOS 16.4 以降）。</p></section>`}
-<section class="${attention.length > 0 ? 'card inbox-section urgent' : ''}" data-testid="hub-home-attention"><h2>要対応 <span class="count">${attention.length}</span></h2>
-${attention.length === 0 ? h`<p class="muted">人の判断を待っているものはありません。</p>` : inbox(attention, names)}</section>
+<section class="${waiting > 0 ? 'card inbox-section urgent' : ''}" data-testid="hub-home-attention"><h2>要対応 <span class="count">${waiting}</span></h2>
+${waiting === 0 ? h`<p class="muted">人の判断を待っているものはありません。</p>` : h`${confirmationList(pending)}${attention.length > 0 ? inbox(attention, names) : ''}`}</section>
 <section><h2>実行中 <span class="count">${running.length}</span></h2>
 ${running.length === 0 ? h`<p class="muted">実行中のタスクはありません。</p>` : h`<ul class="list">${running.map(task => taskRow(task, names.get(task.hostId) ?? task.hostId))}</ul>`}</section>
 <section><h2>最近の完了</h2>
@@ -231,7 +264,9 @@ async function hostPage(env: Env, url: URL, hostId: string): Promise<Response> {
   if (!host || host.revokedAt) return notFound()
   const live = await hostStub(env, hostId).summary()
   const name = host.name
+  const query = (url.searchParams.get('q') ?? '').trim().slice(0, 200)
   let content: Raw
+  let tools: Raw = raw('')
   if (!live.online) {
     content = h`<p class="muted">ホストがオフラインです。その PC で DSH Web を起動すると、ワークスペースとセッションが表示されます。</p>`
   } else {
@@ -253,13 +288,16 @@ async function hostPage(env: Env, url: URL, hostId: string): Promise<Response> {
         <p class="muted mono">${workspace.path ?? ''}</p>
         ${top(workspace.workspaceId).length === 0 ? h`<p class="muted">セッションはありません。</p>` : h`<ul class="list">${top(workspace.workspaceId).map(sessionItem)}</ul>`}</section>`)}
         ${top(null).length > 0 ? h`<section class="card"><h3>ワークスペース外</h3><ul class="list">${top(null).map(sessionItem)}</ul></section>` : ''}`
+      tools = h`${await searchSection(env, hostId, live, query)}${terminalSection(hostId, live, list)}`
     }
   }
   const body = h`${message(url)}
 <p class="crumbs"><a href="/">ホーム</a> / ホスト</p>
 <h1><span class="dot ${live.online ? 'on' : 'off'}" aria-hidden="true"></span> ${name}${live.reportedName && live.reportedName !== name ? h` <span class="muted">（ホストの申告名: ${live.reportedName}）</span>` : ''}</h1>
 <p class="muted">${live.online ? '接続中' : `オフライン（最終 ${relativeTime(live.lastSeenAt)}）`} ・ プラグイン ${live.pluginVersion ?? '—'} ・ DSH ${live.dshVersion ?? '—'} ・ 上限 ${live.ceiling ? LEVEL_LABEL[live.ceiling.level] : '未報告'}${live.killSwitch ? ' ・ 緊急停止中' : ''}</p>
-${live.attention.length > 0 ? h`<section class="card inbox-section urgent" data-testid="hub-host-attention"><h2>要対応 <span class="count">${live.attention.length}</span></h2>${inbox(live.attention, new Map([[hostId, '']]))}</section>` : ''}
+${live.attention.length + live.confirmations.length > 0 ? h`<section class="card inbox-section urgent" data-testid="hub-host-attention"><h2>要対応 <span class="count">${live.attention.length + live.confirmations.length}</span></h2>
+${confirmationList(live.confirmations.map(item => ({ item, hostId, name: '' })))}${live.attention.length > 0 ? inbox(live.attention, new Map([[hostId, '']])) : ''}</section>` : ''}
+${tools}
 ${content}
 <details class="card"><summary>使える操作（${live.operations.length}）</summary><p class="mono small">${live.operations.join(', ') || '—'}</p></details>
 <details class="card danger-zone"><summary>登録の解除</summary>
@@ -268,12 +306,52 @@ ${reauthForm(`/hosts/${hostId}/revoke`, {}, 'パスキーで確認して解除',
   return view(name, 'home', body)
 }
 
+const ROLE_LABEL: Readonly<Record<SearchHit['role'], string>> = { title: 'タイトル', user: '依頼', assistant: '返答' }
+
+/** Find words in the sessions of one host (GET ?q=). */
+async function searchSection(env: Env, hostId: string, live: HostLive, query: string): Promise<Raw> {
+  if (!live.operations.includes('sessions.search')) return raw('')
+  const form = h`<form method="get" action="/hosts/${hostId}" class="row" role="search">
+  <input name="q" value="${query}" maxlength="200" placeholder="会話を検索（空白区切りの語をすべて含むもの）" aria-label="会話を検索">
+  <button type="submit">検索</button>
+</form>`
+  if (query === '') return h`<section class="card">${form}</section>`
+  const outcome = await runOperation(env, OWNER, 'sessions.search', { hostId, query, limit: 30 })
+  if (!outcome.ok) return h`<section class="card">${form}${errorFlash(outcome.error, '検索できませんでした')}</section>`
+  const result = outcome.result as { hits: SearchHit[]; scanned: number; partial: boolean }
+  const hit = (item: SearchHit) => h`<li><a href="/hosts/${hostId}/sessions/${encodeURIComponent(item.sessionId)}"><span class="untrusted">${item.title}</span></a>
+  <span class="badge">${ROLE_LABEL[item.role]}${item.turn ? ` ・ ターン ${item.turn}` : ''}</span> <span class="muted">${relativeTime(item.at)}</span>
+  <p class="untrusted snippet muted">${item.snippet}</p></li>`
+  return h`<section class="card" data-testid="hub-search"><h2>検索結果 <span class="count">${result.hits.length}</span></h2>${form}
+${result.hits.length === 0 ? h`<p class="muted">見つかりませんでした。</p>` : h`<ul class="list hits">${result.hits.map(hit)}</ul>`}
+<p class="muted">${result.scanned} 件のセッションを新しい順に調べました。${result.partial ? '時間か件数の上限で途中までです。語を足すか、ワークスペースを絞ってください。' : ''}</p></section>`
+}
+
+/** Run one shell command in a workspace folder; the hub then asks for a passkey. */
+function terminalSection(hostId: string, live: HostLive, workspaces: WorkspaceSummary[]): Raw {
+  if (!live.operations.includes('terminal.run')) return raw('')
+  const body = live.ceiling?.level !== 'full'
+    ? h`<p class="muted">DSH の Remora タブで上限を「リモート全権」にしたときだけ使えます。</p>`
+    : workspaces.length === 0
+      ? h`<p class="muted">Remora から見えるワークスペースがありません。</p>`
+      : h`<form method="post" action="/hosts/${hostId}/terminal" class="stack">
+  <label>ワークスペース<select name="cwdWorkspaceId" required>${workspaces.map(workspace => h`<option value="${workspace.workspaceId}">${workspace.name}${workspace.untrusted ? '（未信頼）' : ''}</option>`)}</select></label>
+  <textarea name="command" rows="2" maxlength="8000" required placeholder="例: git status" class="mono"></textarea>
+  <label>タイムアウト（秒）<input name="timeoutSeconds" type="number" min="1" max="600" value="60"></label>
+  <button type="submit" class="danger">次へ（パスキーで確認）</button>
+  <p class="muted">次の画面で内容を確かめ、パスキーで確認すると、その PC のワークスペースのフォルダでコマンドを 1 回だけ実行します。DSH のサンドボックスの外で、DSH と同じユーザーとして動きます。</p>
+</form>`
+  return h`<details class="card"><summary>ターミナル</summary>${body}</details>`
+}
+
 async function sessionPage(env: Env, url: URL, hostId: string, sessionId: string): Promise<Response> {
   const host = await hubStub(env).getHost(hostId)
   if (!host || host.revokedAt) return notFound()
   const [got, live] = await Promise.all([runOperation(env, OWNER, 'session.get', { hostId, sessionId }), hostStub(env, hostId).summary()])
   const running = live.running.filter(task => task.sessionId === sessionId)
+  const base = `/hosts/${hostId}/sessions/${encodeURIComponent(sessionId)}`
   let detail: Raw
+  let jobs: Raw = raw('')
   if (!got.ok) {
     detail = errorFlash(got.error, 'セッションを読めませんでした')
   } else {
@@ -291,8 +369,8 @@ ${result.hasLiveClient ? flash('DSH Web で誰かがこのセッションを見�
 <section><h2>最近のターン</h2>
 ${result.recentTurns.length === 0 ? h`<p class="muted">まだありません。</p>` : h`<ol class="turns">${result.recentTurns.map(turn => h`<li><p class="who">依頼</p><p class="untrusted pre">${turn.request}</p><p class="who">返答</p><p class="untrusted pre">${turn.reply}</p></li>`)}</ol>`}
 <p class="muted">会話の全文や細かい操作は、その PC の DSH Web で開いてください。ここに出る文章は DSH から来たもので、そのまま表示しています。</p></section>`
+    jobs = jobsSection(base, live, result.jobs)
   }
-  const base = `/hosts/${hostId}/sessions/${encodeURIComponent(sessionId)}`
   const actions = h`<section class="card"><h2>依頼する</h2>
 <form method="post" action="${base}/prompt" class="stack">
   <input type="hidden" name="idempotencyKey" value="${randomToken(12)}">
@@ -314,9 +392,59 @@ ${running.length === 0 ? h`<p class="muted">このセッションでハブから
   <div class="row3"><input name="provider" placeholder="プロバイダー（任意）"><input name="model" placeholder="モデル名" required><input name="effort" placeholder="Effort（任意）"></div>
   <button type="submit">モデルを変更</button>
   <p class="muted">DSH はこの選択を新しいセッションの既定値にも保存します。</p>
-</form></section>`
-  const body = h`${message(url)}<p class="crumbs"><a href="/">ホーム</a> / <a href="/hosts/${hostId}">${host.name}</a> / セッション</p>${detail}${actions}`
+</form>
+${live.operations.includes('session.fork') ? h`<form method="post" action="${base}/fork" class="stack">
+  <h3>フォーク</h3>
+  <div class="row3"><input name="atTurn" type="number" min="1" placeholder="何ターン目まで（空なら最後まで）"><input name="title" maxlength="200" placeholder="新しいセッションのタイトル（任意）"></div>
+  <button type="submit">フォークする</button>
+  <p class="muted">指定したターンの終わりまでの会話を写した新しいセッションを、同じワークスペースに作ります。元のセッションは変わりません。</p>
+</form>` : ''}</section>`
+  const schedules = live.online && live.operations.includes('schedules.list') ? await schedulesSection(env, hostId, sessionId, base, live) : raw('')
+  const body = h`${message(url)}<p class="crumbs"><a href="/">ホーム</a> / <a href="/hosts/${hostId}">${host.name}</a> / セッション</p>${detail}${actions}${jobs}${schedules}`
   return view('セッション', 'home', body)
+}
+
+const JOB_STATE: Readonly<Record<string, string>> = { running: '実行中', stopping: '停止中', completed: '完了', failed: '失敗', killed: '停止済み' }
+
+/** Background jobs of the session (dev servers, watchers), each with a stop button. */
+function jobsSection(base: string, live: HostLive, jobs: SessionGetResult['jobs']): Raw {
+  if (!jobs || jobs.length === 0) return raw('')
+  const canStop = live.online && live.operations.includes('job.stop')
+  return h`<section class="card" data-testid="hub-jobs"><h2>バックグラウンドのジョブ <span class="count">${jobs.length}</span></h2>
+<ul class="list">${jobs.map(job => h`<li><span class="badge${job.status === 'running' ? ' ok' : ''}">${JOB_STATE[job.status] ?? job.status}</span> <code class="untrusted">${job.label || job.kind}</code> <span class="muted mono">${job.jobId}</span>
+  ${canStop && job.status === 'running' ? h`<form method="post" action="${base}/job-stop" class="inline"><input type="hidden" name="jobId" value="${job.jobId}"><button type="submit" class="small danger">止める</button></form>` : ''}</li>`)}</ul></section>`
+}
+
+const WEEKDAY_LABEL = ['', '月', '火', '水', '木', '金', '土', '日']
+
+/** Scheduled prompts of the session, a form to add one, and delete buttons. */
+async function schedulesSection(env: Env, hostId: string, sessionId: string, base: string, live: HostLive): Promise<Raw> {
+  const listed = await runOperation(env, OWNER, 'schedules.list', { hostId, sessionId })
+  const schedules = listed.ok ? (listed.result as { schedules: ScheduleInfo[] }).schedules : []
+  const canDelete = live.operations.includes('schedule.delete')
+  const item = (schedule: ScheduleInfo) => h`<li><span class="badge${schedule.status === 'active' ? ' ok' : ''}">${schedule.status === 'active' ? '有効' : '終了'}</span> <strong class="untrusted">${schedule.title}</strong> <span class="mono">${schedule.rule}</span>
+  <span class="muted">${schedule.nextAt ? `次回 ${dateTime(schedule.nextAt)}` : ''}${schedule.lastDeliveredAt ? ` ・ 前回 ${dateTime(schedule.lastDeliveredAt)}` : ''}</span>
+  ${schedule.prompt ? h`<p class="untrusted pre muted">${schedule.prompt}</p>` : ''}
+  ${canDelete ? h`<form method="post" action="${base}/schedule-delete" class="inline"><input type="hidden" name="scheduleId" value="${schedule.scheduleId}"><button type="submit" class="small">削除</button></form>` : ''}</li>`
+  const form = live.operations.includes('schedule.create') ? h`<form method="post" action="${base}/schedule-create" class="stack">
+  <h3>スケジュールを追加</h3>
+  <input type="hidden" name="idempotencyKey" value="${randomToken(12)}">
+  <input name="title" maxlength="120" required placeholder="名前（例: 朝の CI 確認）">
+  <textarea name="prompt" rows="3" maxlength="20000" required placeholder="時間になったらエージェントに送る依頼"></textarea>
+  <label>いつ<select name="kind">
+    <option value="daily">毎日</option><option value="weekly">毎週</option><option value="every">一定の間隔で</option>
+    <option value="after">○分後に 1 回</option><option value="at">日時を決めて 1 回</option><option value="cron">cron 式</option>
+  </select></label>
+  <div class="row3"><input name="time" placeholder="時刻 HH:mm（毎日・毎週）" pattern="[0-2][0-9]:[0-5][0-9]"><input name="minutes" type="number" min="1" placeholder="分（間隔・○分後）"><input name="timeZone" value="Asia/Tokyo" placeholder="タイムゾーン"></div>
+  <div class="weekdays">${[1, 2, 3, 4, 5, 6, 7].map(day => h`<label class="check"><input type="checkbox" name="weekday" value="${day}"> ${WEEKDAY_LABEL[day]}</label>`)}</div>
+  <div class="row3"><input name="at" type="datetime-local" aria-label="日時（1 回だけのとき）"><input name="cron" placeholder="cron 式（例: 0 9 * * 1-5）"></div>
+  <button type="submit">追加</button>
+  <p class="muted">選んだ「いつ」に関係する欄だけが使われます。時間になると DSH がこのセッションに依頼として送ります（その PC で DSH Web が動いているときだけ）。</p>
+</form>` : raw('')
+  return h`<section class="card" data-testid="hub-schedules"><h2>スケジュール <span class="count">${schedules.length}</span></h2>
+${listed.ok ? '' : errorFlash(listed.error, 'スケジュールを読めませんでした')}
+${schedules.length === 0 ? h`<p class="muted">このセッションのスケジュールはありません。</p>` : h`<ul class="list">${schedules.map(item)}</ul>`}
+${form}</section>`
 }
 
 async function sessionAction(env: Env, request: Request, hostId: string, sessionId: string, action: string): Promise<Response> {
@@ -345,6 +473,28 @@ async function sessionAction(env: Env, request: Request, hostId: string, session
       outcome = await runOperation(env, OWNER, 'model.select', params)
       break
     }
+    case 'fork': {
+      const atTurn = Number(form.get('atTurn') || '0')
+      const title = (form.get('title') ?? '').trim()
+      outcome = await runOperation(env, OWNER, 'session.fork', { hostId, sessionId, ...(atTurn > 0 ? { atTurn: Math.floor(atTurn) } : {}), ...(title ? { title } : {}) })
+      if (outcome.ok) return redirect(`/hosts/${hostId}/sessions/${encodeURIComponent((outcome.result as SessionForkResult).session.sessionId)}?msg=forked`)
+      break
+    }
+    case 'job-stop':
+      outcome = await runOperation(env, OWNER, 'job.stop', { hostId, jobId: form.get('jobId') ?? '' })
+      if (outcome.ok) return redirect(`${base}?msg=${(outcome.result as { stopped: boolean }).stopped ? 'job-stopped' : 'job-not-running'}`)
+      break
+    case 'schedule-create': {
+      const when = whenFromForm(form)
+      if (!when.ok) return view('入力を確かめてください', 'home', h`${flash(when.message, 'error')}<p><a class="button" href="${base}">戻る</a></p>`)
+      outcome = await runOperation(env, OWNER, 'schedule.create', { hostId, sessionId, title: (form.get('title') ?? '').trim(), prompt: form.get('prompt') ?? '', when: when.when, idempotencyKey: form.get('idempotencyKey') || randomToken(12) })
+      if (outcome.ok) return redirect(`${base}?msg=schedule-created`)
+      break
+    }
+    case 'schedule-delete':
+      outcome = await runOperation(env, OWNER, 'schedule.delete', { hostId, sessionId, scheduleId: form.get('scheduleId') ?? '' })
+      if (outcome.ok) return redirect(`${base}?msg=${(outcome.result as { deleted: boolean }).deleted ? 'schedule-deleted' : 'schedule-gone'}`)
+      break
     default:
       return notFound()
   }
@@ -461,8 +611,9 @@ async function attentionPage(env: Env, url: URL): Promise<Response> {
   const sections: Raw[] = []
   for (const { summary, live } of data.hosts) {
     const { items, note } = await hostAttention(env, summary, live)
-    if (items.length === 0 && note.value === '') continue
+    if (items.length === 0 && live.confirmations.length === 0 && note.value === '') continue
     sections.push(h`<section><h2>${summary.name}</h2>${note}
+${confirmationList(live.confirmations.map(item => ({ item, hostId: summary.hostId, name: '' })))}
 ${[...items].sort(byUrgency).map(item => attentionCard(item, cardHost(summary)))}</section>`)
   }
   const body = h`${message(url)}<h1>要対応</h1>
@@ -499,6 +650,100 @@ async function attentionRespond(env: Env, request: Request): Promise<Response> {
   return view('失敗しました', 'attention', h`${errorFlash(outcome.error)}<p><a class="button" href="/attention">戻る</a></p>`)
 }
 
+// --- passkey confirmations of parked requests -------------------------------------------------
+
+const CONFIRMATION_STATE: Readonly<Record<string, string>> = {
+  pending: '確認待ち', running: '実行中', done: '完了', failed: '失敗', denied: '拒否しました', expired: '期限切れ',
+}
+
+function terminalOutput(output: TerminalRunOutput): Raw {
+  const status = output.timedOut ? 'タイムアウトで止めました' : output.exitCode === null ? `シグナル ${output.signal ?? '?'} で終了` : `終了コード ${output.exitCode}`
+  return h`<dl class="facts"><dt>結果</dt><dd><span class="badge${output.exitCode === 0 ? ' ok' : ' danger'}">${status}</span> <span class="muted">${(output.durationMs / 1000).toFixed(1)} 秒</span></dd></dl>
+<p class="who">標準出力</p><div class="untrusted pre card" data-testid="hub-terminal-stdout">${output.stdout || '（なし）'}</div>
+${output.stderr ? h`<p class="who">標準エラー出力</p><div class="untrusted pre card" data-testid="hub-terminal-stderr">${output.stderr}</div>` : ''}
+${output.truncated ? h`<p class="muted">出力が長いため一部を省きました。</p>` : ''}
+<p class="muted">出力は DSH ホストでシークレットらしい文字列を伏せてから送られています。</p>`
+}
+
+/** The page a confirmUrl opens: what a client asked to run, and the passkey button. */
+async function confirmPage(env: Env, url: URL, origin: string, hostId: string, confirmationId: string): Promise<Response> {
+  const host = await hubStub(env).getHost(hostId)
+  if (!host || host.revokedAt) return notFound()
+  const [item, live] = await Promise.all([confirmations(env, hostId).view(confirmationId, origin), hostStub(env, hostId).summary()])
+  if (!item) return notFound()
+  const params = item.params
+  const crumbs = h`<p class="crumbs"><a href="/">ホーム</a> / <a href="/hosts/${hostId}">${host.name}</a> / パスキーでの確認</p>`
+  const requester = item.clientId === OWNER_CLIENT_ID ? 'ハブの画面（あなた）' : item.clientName
+  let workspace: Raw = h`<span class="mono">${String(params.cwdWorkspaceId ?? '')}</span>`
+  if (item.state === 'pending' && live.online && typeof params.cwdWorkspaceId === 'string') {
+    const listed = await runOperation(env, OWNER, 'workspaces.list', { hostId })
+    const found = listed.ok ? ((listed.result as { workspaces?: WorkspaceSummary[] }).workspaces ?? []).find(entry => entry.workspaceId === params.cwdWorkspaceId) : undefined
+    if (found) workspace = h`<span class="untrusted">${found.name}</span>${found.untrusted ? h` <span class="badge warn">未信頼</span>` : ''} <span class="muted mono">${found.path ?? ''}</span>`
+  }
+  const facts = h`<dl class="facts">
+  <dt>操作</dt><dd>${CONFIRM_LABEL[item.operation] ?? item.operation} <span class="muted mono">${item.operation}</span></dd>
+  <dt>依頼したもの</dt><dd>${requester}</dd>
+  <dt>ホスト</dt><dd>${host.name} <span class="muted mono">${hostId}</span></dd>
+  ${typeof params.command === 'string' ? h`<dt>コマンド</dt><dd><pre class="command untrusted" data-testid="hub-confirm-command">${params.command}</pre></dd>` : ''}
+  ${params.cwdWorkspaceId !== undefined ? h`<dt>場所</dt><dd>${workspace}</dd>` : ''}
+  ${typeof params.timeoutMs === 'number' ? h`<dt>タイムアウト</dt><dd>${Math.round(params.timeoutMs / 1000)} 秒</dd>` : ''}
+  <dt>状態</dt><dd><span class="state ${item.state}" data-testid="hub-confirm-state">${CONFIRMATION_STATE[item.state] ?? item.state}</span> <span class="muted">${dateTime(item.createdAt)}</span></dd>
+</dl>`
+  let outcome: Raw
+  let refreshSeconds: number | undefined
+  switch (item.state) {
+    case 'pending':
+      outcome = !live.online
+        ? h`<p class="muted">ホストがオフラインのため、今は実行できません。期限までにホストがつながれば実行できます。</p>`
+        : h`<div class="confirm-preview"><p>パスキーで署名する内容（DSH ホストが検証します）:</p>
+<pre class="codes">${JSON.stringify(finalParams(item.operation, params, hostId), null, 2)}</pre></div>
+<form data-confirm-op="${item.operation}" data-host="${hostId}" data-params="${JSON.stringify(params)}" data-pending="${item.confirmationId}" data-done="${confirmPath(hostId, item.confirmationId)}" class="actions">
+  <button class="danger" type="submit" data-testid="hub-confirm-run">パスキーで確認して実行</button>
+  <p data-status hidden></p>
+</form>`
+      outcome = h`<article class="card attention-item kind-confirmation" data-expiring>
+<div class="row"><span class="badge danger">${ATTENTION_LABEL.confirmation}</span> ${countdown(item.expiresAt)}</div>
+<p>内容を確かめてください。AI が組み立てたコマンドは、見た目と違う動きをすることがあります。分からないときは実行しないでください。</p>
+${outcome}
+<form method="post" action="${confirmPath(hostId, item.confirmationId)}/deny" class="actions"><button type="submit" data-testid="hub-confirm-deny">拒否する</button></form>
+</article>`
+      break
+    case 'running':
+      refreshSeconds = 3
+      outcome = h`<p class="flash ok" role="status">ホストで実行しています。終わるとこのページに結果が出ます（自動で更新します）。</p>`
+      break
+    case 'done':
+      outcome = item.operation === 'terminal.run' && item.result && typeof item.result === 'object'
+        ? terminalOutput(item.result as TerminalRunOutput)
+        : h`<pre class="untrusted pre card">${JSON.stringify(item.result ?? null, null, 2)}</pre>`
+      break
+    case 'failed':
+      outcome = errorFlash(item.error, '実行できませんでした')
+      break
+    case 'denied':
+      outcome = h`<p class="muted">この依頼は拒否しました。</p>`
+      break
+    default:
+      outcome = h`<p class="muted">確認されないまま期限が切れました。必要なら、もう一度依頼してください。</p>`
+  }
+  const body = h`${message(url)}${crumbs}<h1>パスキーでの確認</h1>${facts}${outcome}`
+  return html(page({ title: 'パスキーでの確認', nav: 'attention', body, scripts: ['/js/webauthn.js', '/js/live.js'], ...(refreshSeconds ? { refreshSeconds } : {}) }))
+}
+
+async function denyConfirmation(env: Env, hostId: string, confirmationId: string): Promise<Response> {
+  const denied = await confirmations(env, hostId).deny(confirmationId)
+  return redirect(`${confirmPath(hostId, confirmationId)}?msg=${denied ? 'confirmation-denied' : 'confirmation-gone'}`)
+}
+
+/** The host page's terminal form: park the command, then confirm it on its page. */
+async function terminalRequest(env: Env, request: Request, origin: string, hostId: string): Promise<Response> {
+  const form = await readForm(request)
+  const seconds = Math.min(600, Math.max(1, Math.round(Number(form.get('timeoutSeconds') || '60')) || 60))
+  const outcome = await runOperation(env, OWNER, 'terminal.run', { hostId, command: form.get('command') ?? '', cwdWorkspaceId: form.get('cwdWorkspaceId') ?? '', timeoutMs: seconds * 1000 }, { origin })
+  if (outcome.ok) return redirect(confirmPath(hostId, (outcome.result as ConfirmationInfo).confirmationId))
+  return view('失敗しました', 'home', h`${errorFlash(outcome.error)}<p><a class="button" href="/hosts/${hostId}">戻る</a></p>`)
+}
+
 /** JSON endpoint for dangerous operations carrying a passkey confirmation collected in the browser. */
 async function confirmedOperation(env: Env, request: Request): Promise<Response> {
   let body: Record<string, unknown>
@@ -517,6 +762,15 @@ async function confirmedOperation(env: Env, request: Request): Promise<Response>
   if (typeof raw.hostId === 'string' && raw.hostId !== hostId) return json({ error: { code: 'invalid_request', message: 'params.hostId does not match hostId' } }, { status: 400 })
   // Same params as /auth/confirm/options signed over, and the frame id is the requestId it returned.
   const confirmation = { issuedAt, assertion } as Confirmation
+  if (typeof body.pendingId === 'string') {
+    // A parked request: the host object sends its stored params, with the requester's current grant.
+    const host = confirmations(env, hostId)
+    const pending = await host.view(body.pendingId)
+    if (!pending || pending.operation !== operation) return json({ error: { code: 'not_found', message: 'No such request.' } }, { status: 404 })
+    const grant = pending.clientId === OWNER_CLIENT_ID ? ownerGrant() : (await hubStub(env).clientStanding(pending.clientId, hostId)).grant
+    const ran = await host.run(body.pendingId, { requestId, confirmation, grant, origin: hubOrigin(request, env) })
+    return ran.ok ? json({ ok: true, result: ran.result }) : json({ error: ran.error }, { status: 400 })
+  }
   const outcome = await runOperation(env, OWNER, operation, finalParams(operation, raw, hostId), { confirmation, requestId })
   return outcome.ok ? json({ ok: true, result: outcome.result }) : json({ error: outcome.error }, { status: 400 })
 }
@@ -734,7 +988,7 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
       const state = await hub.state()
       return state.setupComplete ? redirect('/') : setupPage(env)
     }
-    const known = path === '/' || path === '/attention' || path.startsWith('/attention/') || path === '/connections' || path === '/audit' || path === '/settings' || path.startsWith('/hosts/') || path.startsWith('/tasks/')
+    const known = path === '/' || path === '/attention' || path.startsWith('/attention/') || path === '/connections' || path === '/audit' || path === '/settings' || path.startsWith('/hosts/') || path.startsWith('/tasks/') || path.startsWith('/confirm/')
     if (!known) return null
     if (path === '/') {
       const state = await hub.state()
@@ -763,11 +1017,13 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
     if (sessionMatch) return sessionPage(env, url, sessionMatch[1] as string, decodeURIComponent(sessionMatch[2] as string))
     const taskMatch = /^\/tasks\/([a-z0-9-]{8,80})$/.exec(path)
     if (taskMatch) return taskPage(env, url, taskMatch[1] as string)
+    const confirmMatch = /^\/confirm\/([a-z0-9]{8,64})\/([a-z0-9-]{8,80})$/.exec(path)
+    if (confirmMatch) return confirmPage(env, url, origin, confirmMatch[1] as string, confirmMatch[2] as string)
     return notFound()
   }
 
   if (request.method !== 'POST') return null
-  const handled = path === '/ops/confirmed' || path.startsWith('/push/') || path.startsWith('/hosts/') || path.startsWith('/attention/') || path.startsWith('/connections/') || path.startsWith('/settings/')
+  const handled = path === '/ops/confirmed' || path.startsWith('/push/') || path.startsWith('/hosts/') || path.startsWith('/attention/') || path.startsWith('/connections/') || path.startsWith('/settings/') || path.startsWith('/confirm/')
   if (!handled) return null
   if (!sameOrigin(request, origin)) return new Response('cross-origin request refused', { status: 403 })
   const session = await getSession(request, env)
@@ -777,8 +1033,13 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
   if (path === '/push/subscribe' || path === '/push/unsubscribe') return pushEndpoint(env, request, path)
   if (path === '/attention/respond') return attentionRespond(env, request)
 
-  const sessionAct = /^\/hosts\/([a-z0-9]{8,64})\/sessions\/([^/]+)\/(prompt|steer|cancel|compact|model)$/.exec(path)
+  const sessionAct = /^\/hosts\/([a-z0-9]{8,64})\/sessions\/([^/]+)\/(prompt|steer|cancel|compact|model|fork|job-stop|schedule-create|schedule-delete)$/.exec(path)
   if (sessionAct) return sessionAction(env, request, sessionAct[1] as string, decodeURIComponent(sessionAct[2] as string), sessionAct[3] as string)
+
+  const deny = /^\/confirm\/([a-z0-9]{8,64})\/([a-z0-9-]{8,80})\/deny$/.exec(path)
+  if (deny) return denyConfirmation(env, deny[1] as string, deny[2] as string)
+  const terminal = /^\/hosts\/([a-z0-9]{8,64})\/terminal$/.exec(path)
+  if (terminal) return terminalRequest(env, request, origin, terminal[1] as string)
 
   const revokeHost = /^\/hosts\/([a-z0-9]{8,64})\/revoke$/.exec(path)
   if (revokeHost) {

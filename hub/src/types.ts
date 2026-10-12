@@ -119,7 +119,7 @@ export const PUSH_TYPES: readonly PushType[] = ['attention', 'tasks', 'hosts']
 /** One thing worth a notification. No conversation content: kind, host name, a short redacted title, a hub path. */
 export interface PushEvent {
   type: PushType | 'test'
-  kind: 'question' | 'plan-review' | 'approval' | 'task-completed' | 'task-failed' | 'host-offline' | 'host-online' | 'test'
+  kind: 'question' | 'plan-review' | 'approval' | 'confirmation' | 'task-completed' | 'task-failed' | 'host-offline' | 'host-online' | 'test'
   hostId: string | null
   /** The host's approved display name. */
   host: string

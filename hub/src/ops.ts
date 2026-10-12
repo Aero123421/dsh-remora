@@ -5,13 +5,13 @@
  */
 import { stampAnswerUrls } from './attention.ts'
 import { FREE_TIER, RATE_LIMITS } from './config.ts'
-import type { ExecuteResult, HostLive } from './host-do.ts'
+import type { ConfirmationView, ExecuteResult, HostLive } from './host-do.ts'
 import { denied } from './host-do.ts'
 import { hostStub, hubStub } from './meter.ts'
 import type { CallContext } from './types.ts'
 import { hostIdOfTask } from './util.ts'
 import {
-  HUB_OPERATIONS, INPUT_SCHEMAS, TASK_LEDGER_OPERATIONS, decide, findOperation, validateParams,
+  CONFIRMATION_LEDGER_OPERATIONS, HUB_OPERATIONS, INPUT_SCHEMAS, TASK_LEDGER_OPERATIONS, decide, findOperation, validateParams,
   type Confirmation, type Grant, type HostSummary, type OperationId, type RemoraError, type StatusResult,
 } from './vendor/protocol/index.ts'
 
@@ -98,6 +98,9 @@ async function runOperationInner(env: Env, caller: Caller, op: string, rawParams
   if (TASK_LEDGER_OPERATIONS.has(op)) {
     hostId = typeof params.taskId === 'string' ? hostIdOfTask(params.taskId) : null
     if (!hostId || !context.hosts.some(host => host.hostId === hostId)) return err('not_found', 'No task with this id is known to the hub.')
+  } else if (CONFIRMATION_LEDGER_OPERATIONS.has(op)) {
+    hostId = typeof params.confirmationId === 'string' ? hostIdOfTask(params.confirmationId) : null
+    if (!hostId || !context.hosts.some(host => host.hostId === hostId)) return err('not_found', 'No confirmation with this id is known to the hub.')
   } else {
     const resolved = resolveHost(context, params)
     if (!resolved.ok) return resolved.result
@@ -177,6 +180,22 @@ async function hubOperation(env: Env, context: CallContext, op: string, clientId
     freeTier: await freeTierUsage(env),
   }
   return result
+}
+
+/**
+ * Passkey confirmations parked on one host. Workers RPC stubs drop fields
+ * typed `unknown` (a result, the stored params) from their return types, so
+ * these calls restate what HostDO actually returns.
+ */
+export function confirmations(env: Env, hostId: string) {
+  const host = hostStub(env, hostId)
+  return {
+    view: (id: string, origin?: string) => host.confirmationView(id, origin) as unknown as Promise<ConfirmationView | null>,
+    pending: (origin?: string) => host.pendingConfirmations(origin) as unknown as Promise<ConfirmationView[]>,
+    run: (id: string, input: { requestId: string; confirmation: Confirmation; grant: Grant | null; origin?: string }) =>
+      host.confirmRun(id, input) as unknown as Promise<ExecuteResult>,
+    deny: (id: string) => host.denyConfirmation(id) as Promise<boolean>,
+  }
 }
 
 /** Unpair a host: mark it revoked on the hub, then close its socket and fail its open tasks. */
