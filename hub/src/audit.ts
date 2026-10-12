@@ -4,6 +4,7 @@
  * (no prompts, replies, file names or parameters).
  */
 import { canonicalJson, type DenialLayer } from './vendor/protocol/index.ts'
+import { AUDIT_MAX_ROWS } from './config.ts'
 import { sha256Hex } from './util.ts'
 
 export type AuditOutcome = 'ok' | 'denied' | 'error'
@@ -70,7 +71,7 @@ function fromRow(row: Row): AuditRow {
 }
 
 /** Append one entry. Call inside the Durable Object so appends are serialized. */
-export async function appendAudit(sql: SqlStorage, entry: AuditEntry): Promise<AuditRow> {
+export async function appendAudit(sql: SqlStorage, entry: AuditEntry, maxRows = AUDIT_MAX_ROWS): Promise<AuditRow> {
   const last = sql.exec<{ seq: number; hash: string }>('SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1').toArray()[0]
   const seq = (last?.seq ?? 0) + 1
   const prevHash = last?.hash ?? GENESIS_HASH
@@ -79,6 +80,8 @@ export async function appendAudit(sql: SqlStorage, entry: AuditEntry): Promise<A
     'INSERT INTO audit (seq, at, actor, actor_name, operation, host_id, outcome, layer, reason, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     seq, entry.at, entry.actor, entry.actorName, entry.operation, entry.hostId, entry.outcome, entry.layer, entry.reason, prevHash, hash,
   )
+  // Keep the newest rows only. The chain stays verifiable from the first kept row's prev_hash.
+  if (seq > maxRows && seq % 50 === 0) sql.exec('DELETE FROM audit WHERE seq <= ?', seq - maxRows)
   return { ...entry, seq, prevHash, hash }
 }
 

@@ -11,6 +11,7 @@ import { html } from './http.ts'
 import { handleMcp } from './mcp.ts'
 import { countWorkerRequest, hostStub, maybeFlush } from './meter.ts'
 import { handleOAuth, oauthFor, registerProtectedHandlers } from './oauth.ts'
+import { isPairedHost } from './ops.ts'
 import { hostUnpair, pairApprovePage, pairApprovePost, pairPoll, pairStart } from './pair.ts'
 import { route } from './router.ts'
 import { h, page } from './ui/layout.ts'
@@ -33,6 +34,7 @@ async function dispatch(request: Request, env: Env, ctx: ExecutionContext): Prom
       return Response.json({ ok: true, version: HUB_VERSION })
     case 'host-socket': {
       if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return new Response('expected a WebSocket upgrade', { status: 426 })
+      if (!(await isPairedHost(env, target.hostId))) return new Response('unknown host', { status: 404 })
       const forwarded = new Request(request)
       forwarded.headers.set('x-remora-origin', hubOrigin(request, env))
       return hostStub(env, target.hostId).fetch(forwarded)
