@@ -13,9 +13,11 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test --test-reporter=spec --disable-warning=ExperimentalWarning \"test/*.test.ts\""
+    "test": "node --test --test-reporter=spec --disable-warning=ExperimentalWarning \"test/*.test.ts\"",
+    "build:binary": "node scripts/build-binaries.mjs"
   },
   "devDependencies": {
-    "@dsh-remora/protocol": "workspace:*"
+    "@dsh-remora/protocol": "workspace:*",
+    "postject": "1.0.0-alpha.6"
   }
 }

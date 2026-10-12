@@ -1,74 +1,100 @@
 /**
- * remora — the Remora CLI.
- *
- * P0 scaffold: argument handling, `--version`, `help` and `doctor`. The other
- * commands are listed with the phase they arrive in, so the surface is
- * visible from day one.
+ * remora — the Remora CLI. Drives DSH Web sessions through a self-hosted
+ * Remora hub: OAuth login, the HTTP API (`POST /api/v1/ops/<operationId>`),
+ * and a stdio MCP bridge.
  */
 import { PROTOCOL_VERSION } from '@dsh-remora/protocol'
-import { configDir } from './config.ts'
+import { bool, parseArgs } from './args.ts'
+import { makeCmd, printJson, type CommandDef } from './command.ts'
+import type { Ctx } from './ctx.ts'
+import { CliError, EXIT } from './errors.ts'
+import { login, logout } from './commands/auth.ts'
+import { attention, hosts, sessions, workspaces } from './commands/read.ts'
+import { answer, patch, run, tasks } from './commands/tasks.ts'
+import { doctor, mcp, NOT_YET, selfUpdateCommand } from './commands/misc.ts'
+import { cleanupOldBinary } from './selfupdate.ts'
+import { CLI_VERSION } from './version.ts'
 
-declare const __REMORA_VERSION__: string | undefined
-export const CLI_VERSION: string = typeof __REMORA_VERSION__ === 'string' ? __REMORA_VERSION__ : '0.0.0-dev'
+export { CLI_VERSION } from './version.ts'
+export type { Ctx } from './ctx.ts'
+/** @deprecated use Ctx */
+export type Io = Ctx
 
-export interface Io {
-  out(line: string): void
-  err(line: string): void
-  env: NodeJS.ProcessEnv
-  platform: NodeJS.Platform
-  nodeVersion: string
+export const COMMANDS: readonly CommandDef[] = [
+  login, logout, hosts, sessions, tasks, run, attention, answer, patch, workspaces, doctor, mcp, selfUpdateCommand, ...NOT_YET,
+]
+
+const EXIT_CODE_HELP = [
+  '終了コード:',
+  '  0 成功 / 1 失敗（タスクの失敗・取り消しを含む） / 2 未対応の機能 / 3 人の判断待ちで停止',
+  '  4 未ログイン・ログイン切れ / 5 権限で拒否 / 6 見つからない / 7 ハブやホストに届かない',
+  '  8 待機の打ち切り / 64 使い方の誤り / 130 待機中の Ctrl-C（タスクは続行）',
+]
+
+function help(ctx: Ctx): void {
+  ctx.out(`remora ${CLI_VERSION} — DSH を外から操作する Remora の CLI（非公式）`)
+  ctx.out('')
+  ctx.out('使い方: remora <コマンド> [オプション]')
+  ctx.out('')
+  for (const c of COMMANDS) ctx.out(`  ${c.name.padEnd(12)} ${c.summary}`)
+  ctx.out(`  ${'help'.padEnd(12)} この説明（remora help <コマンド> で詳しく）`)
+  ctx.out(`  ${'--version'.padEnd(12)} 版を表示する`)
+  ctx.out('')
+  ctx.out('共通オプション: --json（機械向けの JSON を出す）、--hub <URL>（保存したハブの代わりに使う）、--help')
+  ctx.out('環境変数: REMORA_HUB_URL、REMORA_TOKEN（個人トークン）、REMORA_CONFIG_DIR、REMORA_TOKEN_STORE=file')
+  ctx.out('')
+  for (const line of EXIT_CODE_HELP) ctx.out(line)
 }
 
-const PLANNED: Readonly<Record<string, { phase: 'P0' | 'P1' | 'P2'; summary: string }>> = {
-  login: { phase: 'P0', summary: 'ハブにログインする（--device で SSH 先からも）' },
-  hosts: { phase: 'P0', summary: 'つながっている DSH ホストを表示する' },
-  sessions: { phase: 'P0', summary: 'セッションを一覧・表示する（ls / show / read）' },
-  tasks: { phase: 'P0', summary: 'タスクを投入・確認・待機する（start / status / wait / watch）' },
-  run: { phase: 'P0', summary: 'タスクを投入して完了まで待つ（--wait）' },
-  attention: { phase: 'P0', summary: '人の判断待ちを表示する' },
-  mcp: { phase: 'P0', summary: 'ローカルの MCP クライアント向け stdio ブリッジ' },
-  answer: { phase: 'P1', summary: 'AI からの質問に答える' },
-  patch: { phase: 'P1', summary: '変更差分を取り出してローカルに適用する' },
-  open: { phase: 'P1', summary: 'セッションを DSH Web で開く' },
-  workspaces: { phase: 'P1', summary: 'ワークスペースを作る' },
-  'self-update': { phase: 'P1', summary: 'GitHub Releases から自己更新する' },
+function commandHelp(ctx: Ctx, c: CommandDef): void {
+  ctx.out(`remora ${c.name} — ${c.summary}`)
+  ctx.out('')
+  for (const line of c.usage) ctx.out(line)
+  ctx.out('')
+  ctx.out('共通オプション: --json、--hub <URL>')
 }
 
-function help(io: Io): void {
-  io.out(`remora ${CLI_VERSION} — DSH を外から操作する Remora の CLI（非公式）`)
-  io.out('')
-  io.out('使い方: remora <コマンド> [オプション]')
-  io.out('')
-  io.out('  help             この説明を表示する')
-  io.out('  doctor           環境と設定を確認する')
-  io.out('  --version        版を表示する')
-  for (const [name, { phase, summary }] of Object.entries(PLANNED)) io.out(`  ${name.padEnd(16)} ${summary}（${phase} で追加予定）`)
-  io.out('')
-  io.out('すべてのコマンドに --json を付けられます（追加予定）。')
-}
-
-function doctor(io: Io): number {
-  const [major = 0, minor = 0] = io.nodeVersion.replace(/^v/, '').split('.').map(Number)
-  const nodeOk = major > 22 || (major === 22 && minor >= 19)
-  io.out(`remora      ${CLI_VERSION} (protocol ${PROTOCOL_VERSION})`)
-  io.out(`node        ${io.nodeVersion} ${nodeOk ? 'ok' : '— 22.19 以上が必要です'}`)
-  io.out(`platform    ${io.platform}`)
-  io.out(`config      ${configDir(io.env, io.platform)}`)
-  io.out('hub         未設定（remora login で設定します。P0 で追加予定）')
-  return nodeOk ? 0 : 1
-}
-
-export async function main(argv: readonly string[], io: Io): Promise<number> {
-  const [command] = argv
-  if (command === undefined || command === 'help' || command === '--help' || command === '-h') { help(io); return 0 }
-  if (command === '--version' || command === '-v') { io.out(CLI_VERSION); return 0 }
-  if (command === 'doctor') return doctor(io)
-  const planned = PLANNED[command]
-  if (planned) {
-    io.err(`remora ${command}: まだ実装されていません（${planned.phase} で追加予定）。`)
-    return 2
+function report(ctx: Ctx, json: boolean, error: CliError): void {
+  if (json) {
+    printJson(ctx, { error: { code: error.detail.code ?? 'error', message: error.message, ...(error.detail.fix ? { fix: error.detail.fix } : {}), ...(error.detail.hint ? { hint: error.detail.hint } : {}), ...(error.detail.denial ? { denial: error.detail.denial } : {}), exitCode: error.exitCode } })
+    return
   }
-  io.err(`remora: 不明なコマンドです: ${command}`)
-  io.err('remora help で使えるコマンドを確認できます。')
-  return 64
+  ctx.err(`remora: ${error.message}`)
+  if (error.detail.hint) ctx.err(error.detail.hint)
+  if (error.detail.fix) ctx.err(`直す場所: ${error.detail.fix}`)
+}
+
+export async function main(argv: readonly string[], ctx: Ctx): Promise<number> {
+  const [name, ...rest] = argv
+  if (ctx.isSea && ctx.platform === 'win32') await cleanupOldBinary(ctx.execPath)
+  if (name === undefined || name === 'help' || name === '--help' || name === '-h') {
+    const topic = name === 'help' ? COMMANDS.find(c => c.name === rest[0]) : undefined
+    if (topic) commandHelp(ctx, topic)
+    else help(ctx)
+    return EXIT.ok
+  }
+  if (name === '--version' || name === '-v' || name === 'version') {
+    if (rest.includes('--json')) printJson(ctx, { version: CLI_VERSION, protocol: PROTOCOL_VERSION, platform: ctx.platform, arch: ctx.arch })
+    else ctx.out(CLI_VERSION)
+    return EXIT.ok
+  }
+  const command = COMMANDS.find(c => c.name === name)
+  const json = rest.includes('--json')
+  if (!command) {
+    report(ctx, json, new CliError(`不明なコマンドです: ${name}`, EXIT.usage, { code: 'usage', hint: 'remora help で使えるコマンドを確認できます。' }))
+    return EXIT.usage
+  }
+  try {
+    const args = parseArgs(rest, command.flags)
+    if (bool(args, 'help')) { commandHelp(ctx, command); return EXIT.ok }
+    return await command.run(makeCmd(ctx, args))
+  } catch (error) {
+    if (error instanceof CliError) {
+      report(ctx, json, error)
+      if (error.exitCode === EXIT.usage && !json && error.detail.code === 'usage') ctx.err(`remora help ${command.name} で使い方を確認できます。`)
+      return error.exitCode
+    }
+    report(ctx, json, new CliError(`予期しないエラー: ${(error as Error)?.stack ?? String(error)}`, EXIT.failure, { code: 'internal' }))
+    return EXIT.failure
+  }
 }

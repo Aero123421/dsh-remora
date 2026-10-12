@@ -1,10 +1,8 @@
+import { defaultCtx } from './ctx.ts'
 import { main } from './main.ts'
 
-const code = await main(process.argv.slice(2), {
-  out: line => process.stdout.write(`${line}\n`),
-  err: line => process.stderr.write(`${line}\n`),
-  env: process.env,
-  platform: process.platform,
-  nodeVersion: process.version,
-})
-process.exitCode = code
+// No top-level await: the standalone binary runs this bundle as CommonJS.
+main(process.argv.slice(2), defaultCtx()).then(
+  code => { process.exitCode = code },
+  error => { process.stderr.write(`remora: ${String(error)}\n`); process.exitCode = 1 },
+)
