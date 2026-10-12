@@ -9,7 +9,6 @@ import { isAbsolute, join, parse, relative, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { FORBIDDEN_COMMANDS, type PlacementInfo } from '@dsh-remora/protocol'
 import type { ScopePolicy, SessionScopeInput } from '../ops/types.ts'
-import { fullAccessActive } from './permissions.ts'
 import type { Placement, RemoraSettings } from './settings.ts'
 
 /** Whether `child` is `parent` or inside it (both absolute, already normalized). */
@@ -80,7 +79,6 @@ export class SettingsScopePolicy implements ScopePolicy {
   }
 
   private get settings(): RemoraSettings { return this.deps.settings() }
-  private get full(): boolean { return fullAccessActive(this.settings.ceiling, (this.deps.now ?? Date.now)()) }
 
   /** Re-check placements against the filesystem (symlinks may have moved). */
   async revalidatePlacements(roots?: ForbiddenRoots): Promise<void> {
@@ -120,19 +118,24 @@ export class SettingsScopePolicy implements ScopePolicy {
       .map(({ placementId, path }) => ({ placementId, path }))
   }
 
+  // Skills, agent presets and slash commands always need an explicit allow on
+  // the DSH tab. Full remote access never widens these lists: it is a
+  // host-wide ceiling, not the caller's grant, and a blanket "everything" would
+  // let any client run commands such as `/permission` (see FORBIDDEN_COMMANDS).
+
   isAllowedSkill(name: string, workspaceId: string | null): boolean {
     if (workspaceId !== null && this.isUntrustedWorkspace(workspaceId)) return false
-    return this.full || this.settings.scope.skills.includes(name)
+    return this.settings.scope.skills.includes(name)
   }
 
   isAllowedAgentPreset(name: string): boolean {
-    return this.full || this.settings.scope.agentPresets.includes(name)
+    return this.settings.scope.agentPresets.includes(name)
   }
 
   isAllowedCommand(name: string): boolean {
-    const command = name.startsWith('/') ? name : `/${name}`
+    const command = (name.startsWith('/') ? name : `/${name}`).toLowerCase()
     if (FORBIDDEN_COMMANDS.has(command)) return false
-    return this.full || this.settings.scope.commands.includes(command)
+    return this.settings.scope.commands.includes(command)
   }
 
   aliases(): Readonly<Record<string, string>> {

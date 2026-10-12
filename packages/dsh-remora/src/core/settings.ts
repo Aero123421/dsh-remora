@@ -3,7 +3,7 @@
  * state, the task ledger and used confirmation ids. Each has a schema version
  * and a `parse` that rejects malformed content loudly.
  */
-import { OPERATIONS, type Grant, type OperationId, type OwnerCredential, type PermissionLevel, type RemoraError, type TaskState } from '@dsh-remora/protocol'
+import { FORBIDDEN_COMMANDS, OPERATIONS, type Grant, type OperationId, type OwnerCredential, type PermissionLevel, type RemoraError, type TaskState } from '@dsh-remora/protocol'
 import type { TaskRecord } from '../ops/types.ts'
 import { asObject, optionalNumber, optionalString, stringArray, type DocumentSpec } from './storage.ts'
 
@@ -31,7 +31,7 @@ export interface ScopeSettings {
   placements: Placement[]
   /** alias -> sessionId */
   aliases: Record<string, string>
-  /** Allowed while the ceiling is below full access. Full access allows every one (except forbidden commands). */
+  /** Explicit allow-lists. Full remote access does not widen them; forbidden commands are dropped on parse. */
   skills: string[]
   agentPresets: string[]
   /** Slash commands with the leading slash, e.g. `/compact`. */
@@ -125,7 +125,7 @@ function parseScope(value: unknown): ScopeSettings {
     aliases,
     skills: stringArray(raw.skills, 'scope.skills'),
     agentPresets: stringArray(raw.agentPresets, 'scope.agentPresets'),
-    commands: stringArray(raw.commands, 'scope.commands'),
+    commands: stringArray(raw.commands, 'scope.commands').map(c => c.toLowerCase()).filter(c => !FORBIDDEN_COMMANDS.has(c.startsWith('/') ? c : `/${c}`)),
     gitHosts: stringArray(raw.gitHosts, 'scope.gitHosts').map(host => host.toLowerCase()),
     untrustedWorkspaces: stringArray(raw.untrustedWorkspaces, 'scope.untrustedWorkspaces'),
   }

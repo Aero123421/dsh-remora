@@ -35,7 +35,7 @@ export interface ScopePolicy {
   placements(): PlacementInfo[]
   isAllowedSkill(name: string, workspaceId: string | null): boolean
   isAllowedAgentPreset(name: string): boolean
-  /** Already excludes FORBIDDEN_COMMANDS. */
+  /** Explicit allow-list only (full access does not widen it); always false for FORBIDDEN_COMMANDS. */
   isAllowedCommand(name: string): boolean
   /** alias -> sessionId, configured on the settings tab. */
   aliases(): Readonly<Record<string, string>>
@@ -75,6 +75,13 @@ export interface OperationContext {
   idempotencyKey?: string
   /** OAuth scopes of the caller; e.g. include `detail`/transcript text only with dsh.content. */
   scopes: readonly string[]
+  /**
+   * Whether THIS caller has unexpired full remote access: the DSH ceiling AND
+   * the caller's hub grant are both `full` and neither has expired. Never
+   * derive this from the ceiling alone. Full access does not widen the skill,
+   * agent-preset or command allow-lists.
+   */
+  fullAccess: boolean
   signal: AbortSignal
 }
 

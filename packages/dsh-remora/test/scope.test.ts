@@ -59,10 +59,14 @@ test('scope: workspaces, placements, outside sessions, exceptions and allow-list
     assert.equal(scope.isAllowedSkill('other', null), false)
     assert.equal(scope.isAllowedCommand('compact'), true)
     assert.equal(scope.isAllowedCommand('/export'), false)
-    settings = { ...settings, ceiling: { level: 'full', fullAccessExpiresAt: 10 }, scope: { ...settings.scope, commands: ['/export'] } }
-    assert.equal(scope.isAllowedCommand('/anything'), true)
-    assert.equal(scope.isAllowedCommand('/export'), false, 'forbidden commands stay forbidden')
-    assert.equal(scope.isAllowedAgentPreset('ptc'), true)
+    // Full remote access never widens the allow-lists (the /permission attack).
+    settings = { ...settings, ceiling: { level: 'full', fullAccessExpiresAt: 10 }, scope: { ...settings.scope, commands: ['/export', '/permission'] } }
+    assert.equal(scope.isAllowedCommand('/anything'), false)
+    assert.equal(scope.isAllowedCommand('/permission'), false, 'raising the permission preset is never allowed')
+    assert.equal(scope.isAllowedCommand('/PERMISSION'), false)
+    assert.equal(scope.isAllowedCommand('/export'), false, 'forbidden commands stay forbidden even when listed')
+    assert.equal(scope.isAllowedAgentPreset('ptc'), false)
+    assert.equal(scope.isAllowedSkill('deploy', 'w1'), false)
     await scope.markUntrustedWorkspace('w3')
     assert.deepEqual(marked, ['w3'])
     settings = { ...settings, scope: { ...settings.scope, outsideWorkspace: true } }
