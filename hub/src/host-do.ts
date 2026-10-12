@@ -108,6 +108,13 @@ export interface ConfirmationView extends ConfirmationInfo {
   params: Record<string, unknown>
 }
 
+/**
+ * A settled confirmation keeps its params (the command) and result (the
+ * output) this long, for the client to collect them and the owner to read
+ * them; then both are dropped and only the outcome stays.
+ */
+const CONFIRMATION_CONTENT_MS = 60 * 60_000
+
 /** Time a confirmed command has beyond its own timeout before the hub gives up on the host's answer. */
 const CONFIRMED_RUN_SLACK_MS = 30_000
 
@@ -740,8 +747,9 @@ export class HostDO extends DurableObject<Env> {
       id, call.actor.clientId, String(call.actor.clientName).slice(0, 200), call.op, JSON.stringify(call.params), JSON.stringify(call.scopes), now, now + CONFIRMATION_REQUEST_TTL_MS, now,
     )
     await this.scheduleAlarm()
-    const what = typeof call.params.command === 'string' ? call.params.command : call.op
     if (call.actor.clientId !== OWNER_CLIENT_ID) {
+      // Like every notification, no content: who asks for what kind of operation, not the command.
+      const what = call.op === 'terminal.run' ? 'コマンドの実行' : call.op
       this.push([{ type: 'attention', kind: 'confirmation', hostId: this.hostId, host: this.displayName(), title: pushText(`${call.actor.clientName}: ${what}`), url: `/confirm/${this.hostId ?? ''}/${id}`, expiresAt: now + CONFIRMATION_REQUEST_TTL_MS }])
     }
     return { ok: true, result: this.confirmationInfo(this.confirmationRow(id) as ConfirmationRow, call.origin) }
@@ -859,6 +867,7 @@ export class HostDO extends DurableObject<Env> {
       this.sql.exec("UPDATE confirmations SET state = 'failed', error = ?, updated_at = ? WHERE id = ?", JSON.stringify(frame.error ?? err('internal', 'The host returned an error without details.')), now, row.id)
     }
     this.notify(`c:${row.id}`)
+    void this.scheduleAlarm()
   }
 
   // --- task ledger ------------------------------------------------------------------------------
@@ -972,9 +981,11 @@ export class HostDO extends DurableObject<Env> {
   private async scheduleAlarm(retryInMs?: number): Promise<void> {
     const next = this.sql.exec<{ at: number | null }>("SELECT MIN(expires_at) AS at FROM tasks WHERE state = 'parked' AND expires_at IS NOT NULL").one().at
     const confirmationDue = this.sql.exec<{ at: number | null }>("SELECT MIN(CASE WHEN state = 'pending' THEN expires_at ELSE deadline_at END) AS at FROM confirmations WHERE state IN ('pending', 'running')").one().at
+    const settledContent = this.sql.exec<{ at: number | null }>("SELECT MIN(updated_at) AS at FROM confirmations WHERE state NOT IN ('pending', 'running') AND (params != '{}' OR result IS NOT NULL)").one().at
+    const contentDue = settledContent === null ? null : settledContent + CONFIRMATION_CONTENT_MS
     const offlineSince = Number(this.info('offline_since') ?? '0') || null
     const offlineCheck = offlineSince === null ? null : offlineSince + OFFLINE_NOTIFY_AFTER_MS
-    const candidates = [next, confirmationDue, offlineCheck, retryInMs !== undefined ? Date.now() + retryInMs : null, Date.now() + 24 * 60 * 60_000].filter((value): value is number => value !== null)
+    const candidates = [next, confirmationDue, contentDue, offlineCheck, retryInMs !== undefined ? Date.now() + retryInMs : null, Date.now() + 24 * 60 * 60_000].filter((value): value is number => value !== null)
     const at = Math.min(...candidates)
     const current = await this.ctx.storage.getAlarm()
     if (current === null || current > at) await this.ctx.storage.setAlarm(at)
@@ -1006,6 +1017,7 @@ export class HostDO extends DurableObject<Env> {
     this.sql.exec('DELETE FROM tasks WHERE updated_at < ? AND state IN (\'completed\', \'failed\', \'cancelled\')', now - RETENTION_MS)
     this.sql.exec('DELETE FROM attention WHERE updated_at < ?', now - RETENTION_MS)
     this.settleOverdue(now)
+    this.sql.exec("UPDATE confirmations SET params = '{}', result = NULL WHERE state NOT IN ('pending', 'running') AND updated_at <= ? AND (params != '{}' OR result IS NOT NULL)", now - CONFIRMATION_CONTENT_MS)
     this.sql.exec("DELETE FROM confirmations WHERE updated_at < ? AND state NOT IN ('pending', 'running')", now - RETENTION_MS)
     const pendingDelivery = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE state = 'parked' AND delivered = 0").one().n
     await this.scheduleAlarm(pendingDelivery > 0 && ws ? 60_000 : undefined)

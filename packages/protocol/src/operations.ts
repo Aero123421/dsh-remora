@@ -106,7 +106,7 @@ export const OPERATIONS = [
   { id: 'terminal.run', tool: 'dsh_terminal_run', level: 'full', scope: 'dsh.admin', phase: 'P2', readOnly: false, destructive: true,
     description: 'Run a shell command in a workspace folder on the DSH host. Needs full remote access, and the owner confirms every command on the Remora hub with a passkey: the result is a pending confirmation whose confirmUrl you give the user; then call dsh_confirmation_get with its confirmationId for the output.' },
   { id: 'confirmation.get', tool: 'dsh_confirmation_get', level: 'view', scope: 'dsh.read', phase: 'P2', readOnly: true, destructive: false,
-    description: 'Get the state of an operation waiting for the owner\'s passkey confirmation (such as dsh_terminal_run), waiting up to 25 seconds for it to finish, and its result once confirmed.' },
+    description: 'Get the state of an operation waiting for the owner\'s passkey confirmation (such as dsh_terminal_run), waiting up to 25 seconds for it to finish, and its result once confirmed. The hub keeps the result for one hour.' },
 ] as const satisfies readonly OperationSpec[]
 
 export type OperationId = (typeof OPERATIONS)[number]['id']

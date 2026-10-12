@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { route } from '../../src/router.ts'
-import { escapeHtml, h, page, raw } from '../../src/ui/layout.ts'
+import { escapeHtml, h, page, raw, visibleText } from '../../src/ui/layout.ts'
 
 test('routes', () => {
   assert.deepEqual(route('GET', '/'), { kind: 'ui' })
@@ -34,4 +34,10 @@ test('pages escape outside values', () => {
   assert.ok(!html.includes('<script>alert'))
   assert.ok(!/<script>[^<]/.test(html), 'no inline script')
   assert.ok(html.includes('非公式'))
+})
+
+test('visibleText shows controls, bidi overrides and zero-width marks; keeps tabs and newlines', () => {
+  assert.deepEqual(visibleText('ls -la\n\tgit status'), { text: 'ls -la\n\tgit status', hidden: false })
+  assert.deepEqual(visibleText('a\u202eb\u200bc\u0007d\r'), { text: 'a⟦U+202E⟧b⟦U+200B⟧c⟦U+0007⟧d⟦U+000D⟧', hidden: true })
+  assert.equal(visibleText('\u2066x\u2069\ufeff').text, '⟦U+2066⟧x⟦U+2069⟧⟦U+FEFF⟧')
 })

@@ -441,7 +441,7 @@ export interface ConfirmationInfo {
   confirmUrl?: string
   createdAt: number
   expiresAt: number
-  /** The host's result once `done` (e.g. TerminalRunOutput). */
+  /** The host's result once `done` (e.g. TerminalRunOutput). The hub drops it one hour after the request settled. */
   result?: unknown
   /** Why it `failed`. */
   error?: RemoraError

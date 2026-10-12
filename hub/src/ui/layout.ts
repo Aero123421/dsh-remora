@@ -143,6 +143,23 @@ export const ATTENTION_LABEL: Readonly<Record<string, string>> = {
   confirmation: 'パスキーでの確認待ち',
 }
 
+/** Characters that change how text looks without showing up: controls, bidi overrides, zero-width marks. */
+const INVISIBLE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u200B-\u200F\u2028-\u202E\u2060-\u2069\uFEFF]/g
+
+/**
+ * Text the owner must judge before confirming it (a command): every
+ * invisible character becomes a visible ⟦U+XXXX⟧, so the page shows what
+ * will run. Tabs and newlines stay.
+ */
+export function visibleText(text: string): { text: string; hidden: boolean } {
+  let hidden = false
+  const shown = text.replace(INVISIBLE, char => {
+    hidden = true
+    return `⟦U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}⟧`
+  })
+  return { text: shown, hidden }
+}
+
 export function flash(message: string | null | undefined, kind: 'ok' | 'error' = 'ok'): Raw {
   return message ? h`<p class="flash ${kind}" role="status">${message}</p>` : raw('')
 }

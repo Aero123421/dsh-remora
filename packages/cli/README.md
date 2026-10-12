@@ -27,16 +27,20 @@ irm https://raw.githubusercontent.com/Aero123421/dsh-remora/main/scripts/install
 
 | コマンド | 内容 |
 | --- | --- |
-| `login <ハブ URL> [--device] [--content] [--scope …]` | OAuth 2.1 ＋ PKCE（S256）、ループバック `http://127.0.0.1:<任意のポート>/callback`。`--device` は RFC 8628 |
+| `login <ハブ URL> [--device] [--content] [--admin] [--scope …]` | OAuth 2.1 ＋ PKCE（S256）、ループバック `http://127.0.0.1:<任意のポート>/callback`。`--device` は RFC 8628。`--content` は `dsh.content`、`--admin` は `dsh.admin`（`terminal` に必要）も求める |
 | `logout` | トークンをハブで取り消し（RFC 7009、メタデータに `revocation_endpoint` がある場合）、保存分を削除 |
 | `hosts` | ホスト一覧 |
-| `sessions ls｜show｜read` | `read --depth summary｜turns｜page`、`--cursor`、`--all` |
+| `sessions ls｜show｜read｜fork` | `read --depth summary｜turns｜page`、`--cursor`、`--all`。`fork <ID> [--turn N] [--title]` は N ターン目の終わりまでを写した新しいセッションを作る |
+| `search <語>…` | 会話（タイトル・依頼・返答）をすべての語で探す。`--workspace`、`--session`、`--limit`。`dsh.content` が必要 |
 | `tasks start｜status｜wait｜watch｜steer｜cancel` | `start` の宛先は `--session｜--latest｜--title｜--alias｜--new <ワークスペース>`、`--skill` は繰り返し可、プロンプトは引数か標準入力、冪等キーは自動 |
 | `run --wait` | 投入して 25 秒刻みで待ち、最後の返答を標準出力へ |
 | `attention`、`answer <ID>` | 要対応の一覧（回答方法、期限までの残り時間、パスキーが要る承認はハブの URL）と、質問・プラン確認への回答 |
 | `approve <ID>`、`reject <ID>` | DSH の承認待ちを 1 回だけ許可・拒否（`approval.respond`）。確認してから送る（`--yes` で省略）。DSH の設定タブで「MCP と CLI からの承認を許可」がオフ（既定）なら、ハブでパスキーを使う URL を表示して終了コード 5 |
 | `patch [--apply]` | 差分を表示。`--apply` は `git apply --check` の後、確認して `git apply` |
 | `workspaces ls｜create` | `create <名前> [--placement] [--git <https URL>]` |
+| `jobs ls <セッション>｜output <ジョブ>｜stop <ジョブ>` | エージェントがバックグラウンドで動かしているコマンド（開発サーバーなど）の一覧・出力・停止 |
+| `schedules ls｜add｜rm` | 決まった時間にセッションへ依頼を送る（DSH の自動タスク）。`add <セッション> --title <名前>` に `--after 15m`、`--at <日時>`、`--every 2h`、`--daily 09:00`、`--weekly mon,fri@18:30`、`--cron "<式>"` のどれか 1 つ。時刻は `--tz`（既定はこの PC のタイムゾーン） |
+| `terminal run --workspace <ID> -- <コマンド>`、`terminal status <確認 ID>` | ワークスペースのフォルダでコマンドを 1 回実行する。ハブが出す URL でオーナーがパスキーで確認するまで動かず、確認後に出力を表示する（確認の期限 10 分、`--timeout` はコマンドの制限時間で既定 60 秒・最長 10 分、`--no-wait` で URL だけ表示）。リモート全権と `dsh.admin` が必要。コマンドが 0 以外で終われば終了コード 1、拒否は 5、期限切れは 8 |
 | `doctor` | ハブ・メタデータ・トークン・ホストの診断 |
 | `mcp`、`mcp probe` | stdio MCP ブリッジと疎通確認 |
 | `self-update [--check] [--version]` | GitHub Releases から更新 |

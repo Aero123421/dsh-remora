@@ -50,6 +50,9 @@ export const remora = {
   hubConnected: [css('[data-testid="remora-hub-status"][data-state="connected"]'), text('Connected')],
   // Permissions tab: the DSH-side ceiling ("Can request" is what task.start needs).
   ceilingRequest: [testid('remora-ceiling-request'), css('button[role="radio"][data-level="request"]')],
+  /** "Full remote access" and the dialog that turns it on. */
+  ceilingFull: [testid('remora-ceiling-full'), css('button[role="radio"][data-level="full"]')],
+  fullConfirm: [role('button', { name: 'Turn on', exact: true }), role('button', { name: '有効にする', exact: true })],
   // Scope tab: the workspace allow list (Switch per workspace).
   scopeSwitches: [css('[role="switch"]')],
   // Permissions tab, "Answers from outside".
@@ -87,6 +90,15 @@ export const hub = {
   questionAnswer: [testid('hub-question-answer')],
   approvalAllow: [testid('hub-approval-allow')],
   approvalReject: [testid('hub-approval-reject')],
+  /** Host page: the terminal form (inside a <details>) and session search. */
+  terminalOpen: scope => scope.locator('details.card').filter({ hasText: 'ターミナル' }).locator('summary'),
+  terminalForm: [css('form[action$="/terminal"]')],
+  /** /confirm/<hostId>/<id>: a parked command and its outcome. */
+  confirmCommand: [testid('hub-confirm-command')],
+  confirmRun: [testid('hub-confirm-run')],
+  confirmDeny: [testid('hub-confirm-deny')],
+  confirmState: [testid('hub-confirm-state')],
+  terminalStdout: [testid('hub-terminal-stdout')],
   /** OAuth consent at /oauth/authorize. */
   consentApprove: [testid('hub-consent-approve'), role('button', { name: /^(allow|approve|authorize)|許可|承認/i })],
 }

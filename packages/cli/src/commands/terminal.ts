@@ -63,14 +63,16 @@ function finish(cmd: Cmd, info: ConfirmationInfo, timedOut: boolean): number {
     if (output.truncated) cmd.ctx.err('（出力が長いため一部を省きました）')
     const status = output.timedOut ? 'タイムアウトで止めました' : output.exitCode === null ? `シグナル ${output.signal ?? '?'} で終了` : `終了コード ${output.exitCode}`
     cmd.ctx.err(`${status}（${fmtElapsed(output.durationMs)}）`)
+  } else if (info.state === 'done') {
+    cmd.ctx.err('完了しましたが、出力はもうありません（ハブは 1 時間で消します）。')
   } else if (info.state === 'failed') {
     cmd.ctx.err(`実行できませんでした: ${clean(info.error?.message ?? '理由は不明です')}`)
-  } else if (info.state !== 'done') {
+  } else {
     cmd.ctx.err(`${STATE_LABEL[info.state] ?? info.state}。`)
   }
   if (timedOut) return EXIT.timeout
   switch (info.state) {
-    case 'done': return output && output.exitCode === 0 && !output.timedOut ? EXIT.ok : EXIT.failure
+    case 'done': return !output ? EXIT.notFound : output.exitCode === 0 && !output.timedOut ? EXIT.ok : EXIT.failure
     case 'denied': return EXIT.denied
     case 'expired': return EXIT.timeout
     case 'failed': return info.error ? exitCodeForError(info.error.code) : EXIT.failure

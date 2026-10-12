@@ -78,6 +78,8 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 | `remora-e2e:approve` を含む（`write` が使えるとき） | `write`（`remora-e2e-<nonce>.txt`）を `sandbox_permissions: danger-full-access` 付きで呼ぶ。DSH はこれを承認としてユーザーに尋ねる |
 | 回答（legacy のツール結果、または timed の `answer_to_pending_question`）の直後 | `REMORA-MOCK-ANSWERED <nonce> <回答>` |
 | `write` の結果の直後 | `REMORA-MOCK-WRITE <nonce> done`（書けた）／`refused`（拒否・エラー） |
+| `remora-e2e:job` を含む（`bash` が使えるとき） | `bash` を `run_in_background: true` で呼ぶ（`echo REMORA-JOB-<nonce>; sleep 600`） |
+| `bash` の結果の直後 | `REMORA-MOCK-JOB <nonce> started`（ジョブ ID が返った）／`failed` |
 
 `node e2e/lib/mock-llm.mjs --port 4200` で単体でも起動できます。DSH の pi-ai 経由で試す場合は、プロファイルの `cordis.patch.yml` に `llm-pi-ai` のカスタムプロバイダー（`api: openai-completions`、`baseURL: http://127.0.0.1:4200/v1`）を足します。
 
@@ -122,6 +124,11 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 | `answer.no-web` | DSH Web のページを離れて（イベントの流れが切れる）同じ質問を出す。締め切り（約 10 分後）付きで受け付けられ、項目の `answerUrl`（ハブの回答ページ）で Teal を選んで答えると `completed`。最後に DSH Web へ戻る |
 | `approval.passkey` | モックが `write` に権限の拡大を求め、DSH が承認を尋ねる。既定では `answerVia: hub-passkey`、HTTP API の `approval.respond` は 403（`confirmation-failed`）でハブの回答ページへのリンクを返す。そのページで「パスキーで確認して今回だけ許可」を押すと、DSH 側が署名を確かめて許可し、`REMORA-MOCK-WRITE <nonce> done` で `completed`（ファイルが既定のワークスペースにできる） |
 | `approval.remote` | Remora タブで「Allow approvals from MCP and CLI」をオンにすると、項目が `answerVia: remote` になり、`approval.respond`（拒否）がパスキーなしで通って `REMORA-MOCK-WRITE <nonce> refused` で `completed`、ファイルはできない。最後にスイッチを戻す |
+| `sessions.search` | `sessions.search` で `task.complete` の nonce を探すと、そのセッションの依頼（`user`）と返答（`assistant`）の両方が見つかり、ありえない語を足すと 0 件 |
+| `session.fork` | `task.complete` のターンまでを `session.fork` で写すと、同じワークスペースに指定したタイトルで新しいセッションができ、`session.read` でそのターンで終わっている |
+| `job.stop` | モックが `bash` を `run_in_background: true` で呼び、`sleep` するジョブを残す。そのタスクは終わらずに動き続け、`session.get` の `jobs` に実行中で出て、`job.output` に目印が出る。`job.stop` で止まり（2 回目は `stopped: false`）、タスクは `completed` になる（DSH がジョブの終了を伝えて続きのターンが入ることがある） |
+| `schedule.create` | 毎日のスケジュールを作る（同じ冪等キーでは同じものが返る）と `schedules.list` に依頼文つきで出て、`schedule.delete` で消える。2 秒後の 1 回きりのスケジュールは、DSH が依頼として届けてモックの返答のターンができる |
+| `terminal.run` | 「依頼できる」のトークンからの `terminal.run` は 403 で断られる。Remora タブで上限を「リモート全権」にする（確認ダイアログ）と、ハブのホスト画面にターミナルが出る。コマンドを送ると `/confirm/<ホスト>/<ID>` に移り、コマンドが表示され、パスキーで確認すると、出力（目印とワークスペースのフォルダ）がその画面に出る。2 つ目は「拒否する」で拒否済みになる。最後に上限を「依頼できる」に戻す |
 | `kill-switch.enforced` | DSH 側で緊急停止を入れると `task.start` が 403（`denied`、層は dsh）で拒否され、切ると再接続してタスクがまた完了する |
 
 ハブは `http://localhost:8788` として使います。WebAuthn は IP アドレスを RP ID にできないためです。ハブの状態は一時ディレクトリに置くので、毎回オーナー未登録の状態から始まります。`wrangler dev` には `WRANGLER_SEND_METRICS=false` と `CLOUDFLARE_CF_FETCH_ENABLED=false`（`Request.cf` を取りに行かない）を渡します。
@@ -137,6 +144,8 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 | ハブ: ログイン後のナビ | `hub-signed-in` |
 | ハブ: 個人トークン（`/settings#tokens`） | `hub-token-name`、`hub-token-create`、一度だけ表示する値は `hub-secret` |
 | ハブ: 接続（`/connections`） | `hub-grant-level`（クライアントごと・ホストごとの付与範囲） |
+| ハブ: パスキー確認（`/confirm/<ホスト>/<ID>`） | `hub-confirm-command`、`hub-confirm-run`、`hub-confirm-deny`、`hub-confirm-state`、`hub-terminal-stdout`、`hub-terminal-stderr`。要対応の一覧の行は `hub-confirmation-item` |
+| ハブ: セッション・ホスト | `hub-jobs`、`hub-schedules`、`hub-search` |
 | ハブ: ペアリング（`/pair?code=`） | まだ無し（`strong.code` と `button[name=decision][value=approve]` で探す） |
 | ハブ: 要対応の回答ページ（`/attention/<hostId>/<attentionId>`） | `hub-attention-item`、`hub-question-answer`、`hub-plan-approve`／`hub-plan-reject`、`hub-approval-allow`／`hub-approval-reject` |
 

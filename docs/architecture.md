@@ -49,6 +49,21 @@ DSH のサンドボックスが制限するのはファイルの書き込みだ�
 
 操作の一覧、必要な権限、MCP のツール名と説明文は `packages/protocol/src/operations.ts` にある。中核ツールの名前と説明文は固定し、版ごとに変えない。
 
+- 会話の検索（`sessions.search`、`dsh.content`）: DSH Web は全文検索の索引をオフで出荷している（`session-query-sqlite` が `openAt: never`）ため、プラグインが範囲内のセッションのログを `inspect`（セッションを起こさない読み取り）で新しい順に読む。1 回 300 セッション・8 秒・1 セッション 5 件まで。途中で止めたら `partial`。
+- フォーク（`session.fork`）: 指定ターンの `turn/end` までを `sessionController.fork` で写す。移行はしない（`allowMigration: false`）。
+- ジョブ（`session.get` の `jobs`、`job.output`、`job.stop`）: `ctx.jobs` の、範囲内のセッションが持つジョブだけ。止めるときは理由に「Remora 経由」とクライアント名を残す。
+- スケジュール（`schedules.list`／`schedule.create`／`schedule.delete`）: DSH の自動タスク（`ctx.schedule`）。時間になると依頼としてターンを始めるので、作るときはタスク投入と同じ条件（範囲内・通常のセッション・アーカイブでない・信頼済みで準備済みのワークスペース）。冪等キーは 24 時間覚える。
+- ターミナル（`terminal.run`、リモート全権・`dsh.admin`）: `ctx.subprocess` で、ワークスペースのフォルダ（realpath）でシェルを 1 回起動する（macOS・Linux は既定のシェルで `-c`、Windows は `cmd.exe /d /s /c`）。子プロセスは DSH が資格情報らしい環境変数を除いた環境で動く。既定 60 秒・最長 10 分で止め、出力は各 64 KB まで、伏せ字を通して返す。
+
+### パスキーで毎回確認する操作
+
+`REQUIRES_CONFIRMATION`（リモート全権の操作。今は `terminal.run` だけ）は、クライアントから届いてもすぐにはホストへ送らない。
+
+1. ホストの Durable Object が権限を判定したうえで依頼を保留し（10 分）、オーナーに通知して、`ConfirmationInfo`（`confirmationId`、`confirmUrl` = `/confirm/<ホスト>/<ID>`）を返す。
+2. オーナーはその画面で内容（コマンド、場所、タイムアウト、依頼したクライアント）を見て、パスキーで確認する。チャレンジは保存してある params（`hostId` 込み）で作るので、ブラウザ側が中身を変えることはできない。拒否もできる。
+3. ハブは依頼したクライアントの今の付与で権限を判定し直し、`confirmation` 付きでホストへ送る。DSH 側のプラグインが署名を検証してから実行する（ハブが乗っ取られても偽造できない）。
+4. クライアントは `confirmation.get`（最長 25 秒ずつ待てる）で `pending`→`running`→`done`／`failed`／`denied`／`expired` を見て、`done` なら `result` に出力が入る。自分の依頼しか見えない。期限切れや拒否の行は params を消す。
+
 ## 要対応と完了判定
 
 - 承認待ち: ログの `approval/asked` に `approval/decided` がまだ無い。
@@ -68,9 +83,8 @@ DSH のサンドボックスが制限するのはファイルの書き込みだ�
 
 ## 未検証
 
-実機での結合テストはまだしていません。主なもの:
+npm 版の DSH と手元のハブでの通しテスト（[e2e.md](e2e.md)）は通っています。まだ確かめていない主なもの:
 
-- 自前ビルドのブラウザ側コードが DSH Web で読み込まれ、設定タブが出るか（同じ方式は dsh-pi-login で動いている）
 - Node 標準の WebSocket はプロキシ環境では `NODE_USE_ENV_PROXY=1` で起動したときだけプロキシを通る（ローカルの CONNECT プロキシで確認済み。実ネットワークは未確認）
 - `workers-oauth-provider` の CIMD が Claude・ChatGPT の実際のメタデータで通るか
 - ハブの同期ワークフロー（`hub/.github/workflows/sync-upstream.yml`）が複製先で動くか

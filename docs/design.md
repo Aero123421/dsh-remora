@@ -19,7 +19,7 @@ Remora は、すでに動いている DSH Web のセッションを、ChatGPT・
 | 言語 | TypeScript。CLI は Windows / macOS / Linux |
 | 名前とアイコン | Remora。上向きのコバンザメと青緑の泡。公式 DSH ロゴは使わない |
 
-この設計は、DSH の公式ソース（commit `d743267`、0.2.1-alpha.2）と、観点の違う 3 本のレビュー（利用者体験、DSH 統合と配布、セキュリティと運用）を反映しています。実装はまだ一切始まっていません。
+この設計は、DSH の公式ソース（commit `d743267`、0.2.1-alpha.2）と、観点の違う 3 本のレビュー（利用者体験、DSH 統合と配布、セキュリティと運用）を反映しています。P0〜P2 の範囲は実装済みで、何をどこまで確かめたかは [development.md](development.md) の「確認済みのこと」にまとめています。
 
 ## 全体構成
 
@@ -128,7 +128,9 @@ MCP、CLI、HTTP API は同じ操作カタログを別の形で見せるだけ�
 | セッション | 新規作成（エージェントプリセットを選ぶ）、名前変更、ゴールの設定・一時停止・解除、スラッシュコマンド実行（`/compact` など） | `session.create`、`commands.execute`、goal 系 |
 | モデルとモード | モデル・プロバイダー・Effort の切り替え、プランモード | `modelCatalog`／`selectModel`、`ctx.planMode.set`（または `/plan`） |
 | ワークスペース | 置き場所の下に新規作成、Git から作成、既存フォルダの登録（リモート全権のみ）、名前変更、一覧から外す（フォルダとログは残る） | `workspaceRegistry`、フォルダ作成はプラグイン自身が行う |
-| 危険系（既定オフ） | ターミナル、ジョブ停止、スケジュール作成・削除 | P2 で個別に設計 |
+| 検索・フォーク | 会話の検索（範囲内のセッションのログを新しい順に読む。1 回 300 セッション・8 秒まで）、指定ターンまでのフォーク | `inspect`（全文検索の索引は DSH Web では既定オフ）、`sessionController.fork` |
+| ジョブ・スケジュール | バックグラウンドジョブの一覧・出力・停止、決まった時間に依頼を送るスケジュールの一覧・追加・削除（追加はタスク投入と同じ条件） | `ctx.jobs`（`list`／`readAt`／`kill`）、`ctx.schedule`（`create`／`catalog`／`delete`） |
+| 危険系（リモート全権のみ） | ターミナル（ワークスペースのフォルダでコマンドを 1 回）。毎回ハブでオーナーがパスキーで確認し、DSH 側が署名を検証してから動く | `ctx.subprocess`（`spawn`、`terminalEnvironment`） |
 
 **モードについて**: 通常と PTC はエージェントプリセット（standard／ptc／cordis など）の違いです。最初のターンの後はロックされるので、モードの選択は「新しいセッションを作るときに選ぶ」形になります。既存セッションのモードは表示だけです。
 
@@ -156,6 +158,12 @@ MCP、CLI、HTTP API は同じ操作カタログを別の形で見せるだけ�
 | `dsh_workspace_create` | 置き場所の下に作成、Git クローンも可 | 依頼できる＋置き場所 | P1 |
 | `dsh_model_select` | モデル、プロバイダー、Effort | 依頼できる | P1 |
 | `dsh_command_run` | スラッシュコマンド実行。コマンドごとに許可 | 操作ごと | P1 |
+| `dsh_sessions_search` | 会話（タイトル・依頼・返答）をすべての語で探す。`dsh.content` が必要 | 見るだけ | P2 |
+| `dsh_session_fork` | 指定ターンの終わりまでを写した新しいセッション | 依頼できる | P2 |
+| `dsh_job_stop` | バックグラウンドジョブを止める | 依頼できる | P2 |
+| `dsh_schedules_list`／`dsh_schedule_create`／`dsh_schedule_delete` | スケジュールの一覧・追加（`afterSeconds`／`at`／`everySeconds`／`daily`／`weekly`／`cron` のどれか、`idempotencyKey` 必須）・削除 | 見るだけ／依頼できる | P2 |
+| `dsh_terminal_run` | ワークスペースのフォルダでコマンドを 1 回。すぐには動かず、オーナーが確認する `confirmUrl` を返す | リモート全権＋`dsh.admin` | P2 |
+| `dsh_confirmation_get` | パスキー確認待ちの依頼の状態と結果（最長 25 秒待てる）。自分の依頼だけ | 見るだけ | P2 |
 
 ### CLI
 
@@ -164,11 +172,13 @@ MCP、CLI、HTTP API は同じ操作カタログを別の形で見せるだけ�
 | サブコマンド | 用途 |
 | --- | --- |
 | `login [--device]`、`hosts`、`doctor` | ログイン、ホスト一覧、接続診断 |
-| `sessions ls｜show｜read`、`open` | セッションの閲覧と DSH Web で開く |
+| `sessions ls｜show｜read｜fork`、`search`、`open` | セッションの閲覧・フォーク・会話の検索と、ハブのセッション画面を開く |
 | `tasks start｜status｜wait｜watch｜steer｜cancel`、`run --wait` | タスク操作。`run --wait` は投入から完了待ちまでを 1 回で行う |
 | `attention`、`answer` | 要対応の一覧と回答、承認待ちの許可・拒否（approve／reject） |
 | `patch` | 変更差分を取り出してローカルに適用する |
 | `workspaces create` | ワークスペース作成 |
+| `jobs ls｜output｜stop`、`schedules ls｜add｜rm` | バックグラウンドジョブとスケジュール |
+| `terminal run｜status` | ターミナル（ハブの URL でオーナーがパスキーで確認するまで待ち、出力を表示する。`login --admin` が必要） |
 | `mcp`、`mcp probe` | ローカルの MCP クライアント向け stdio ブリッジと疎通確認 |
 | `rotate-key`、`audit verify`、`hub export` | 鍵の更新、監査ログの改ざん検査、ハブ設定の書き出し |
 | `self-update` | GitHub Releases から自己更新 |
@@ -435,7 +445,7 @@ P0 は「外から見て、頼んで、終わったか分かる」ところま�
 | --- | --- | --- |
 | P0 | ハブ: パスキー（`SETUP_TOKEN`、リカバリーコード）、ホストのペアリング、OAuth（CIMD、既知クライアント）、MCP、監査ログ、無料枠メーター。プラグイン: 設定タブ（接続・権限・範囲・緊急停止）、一覧と読み取り、タスク投入・確認・待機、スキル指定、要対応の一覧。CLI: `login`、`hosts`、`sessions`、`tasks`、`run --wait`、`attention`、`doctor`、`mcp`。配布: Releases の tarball と Deploy ボタン | Claude と ChatGPT の両方から、2 台の DSH のセッションが見え、スキル付きでタスクを投げ、完了と要対応を正しく受け取れる。1 週間使って無料枠に収まる |
 | P1 | 追加指示・取り消し・中断・再投入。要対応への回答（質問、プラン確認、承認）。新規セッション（モード選択）、ワークスペース作成と Git クローン。モデル・プロバイダー・Effort、プランモード、コンテキストの内訳と `/compact`、スラッシュコマンド。ゴール、ジョブの出力、変更要約と差分、成果物。個人トークンと HTTP API、Web Push 通知、QR ペアリング、互換性 CI、設定タブからの更新、CLI の `patch`／`answer`／`open`／`self-update` | スマホだけで、ワークスペース作成から依頼、質問への回答、差分の確認までを一通りできる |
-| P2 | リモート全権での危険系（ターミナル、ジョブ停止、スケジュール）、フォーク、検索。複数ユーザーはセルフホスト前提なので優先度低 | ハブを乗っ取った想定のテストで、危険操作が一つも通らない |
+| P2 | リモート全権での危険系（ターミナル）、ジョブ停止、スケジュール、フォーク、検索（いずれも実装済み）。複数ユーザーはセルフホスト前提なので優先度低（未着手） | ハブを乗っ取った想定のテストで、危険操作が一つも通らない（プラグインの単体テストで、パスキーの署名が無い・使い回したターミナルの依頼を DSH 側が断ることを確認） |
 
 ## 未検証事項と検証計画
 

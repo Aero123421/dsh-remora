@@ -1,5 +1,5 @@
 import { env } from 'cloudflare:workers'
-import { runInDurableObject } from 'cloudflare:test'
+import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
 import type { HostDO } from '../../src/host-do.ts'
 import { confirmationChallenge, fromBase64Url, type ConfirmationInfo, type HubFrame } from '../../src/vendor/protocol/index.ts'
@@ -102,6 +102,33 @@ describe('terminal commands wait for the owner\'s passkey on the hub', () => {
     const again = await confirmInBrowser(owner, host.hostId, pending.confirmationId)
     expect(again.status).toBe(409)
     expect(requests.filter(item => item.op === 'terminal.run')).toHaveLength(1)
+
+    // An hour after it settled, the hub drops the command and the output; the outcome stays.
+    const stub = env.HOST.get(env.HOST.idFromName(host.hostId))
+    await runInDurableObject(stub, (_instance: HostDO, state) => {
+      state.storage.sql.exec('UPDATE confirmations SET updated_at = updated_at - ? WHERE id = ?', 2 * 3600_000, pending.confirmationId)
+    })
+    expect(await runDurableObjectAlarm(stub)).toBe(true)
+    const kept = await runInDurableObject(stub, (_instance: HostDO, state) => state.storage.sql.exec<{ params: string; result: string | null; state: string }>('SELECT params, result, state FROM confirmations WHERE id = ?', pending.confirmationId).one())
+    expect(kept).toEqual({ params: '{}', result: null, state: 'done' })
+    const later = (await mcpTool(token, 'dsh_confirmation_get', { confirmationId: pending.confirmationId })).structuredContent as unknown as ConfirmationInfo
+    expect(later.state).toBe('done')
+    expect(later.result).toBeUndefined()
+    expect(await (await owner.browser.fetch(`/confirm/${host.hostId}/${pending.confirmationId}`)).text()).toContain('出力は 1 時間を過ぎたので消しました')
+  })
+
+  it('shows invisible characters in a command as visible marks, never raw', async () => {
+    const owner = await setupOwner()
+    const { host } = await fullHost(owner)
+    const token = await cliToken(owner, MCP, ['dsh.read', 'dsh.tasks', 'dsh.admin'])
+    await env.HUB.get(env.HUB.idFromName('hub')).setGrant('remora-cli', host.hostId, 'full', 'full')
+    const parked = (await mcpTool(token, 'dsh_terminal_run', { hostId: host.hostId, command: 'echo safe \u202e; rm -rf ~ #\u200b', cwdWorkspaceId: 'ws-1' })).structuredContent as unknown as ConfirmationInfo
+    const page = await (await owner.browser.fetch(`/confirm/${host.hostId}/${parked.confirmationId}`)).text()
+    expect(page).toContain('echo safe ⟦U+202E⟧; rm -rf ~ #⟦U+200B⟧')
+    expect(page).not.toContain('\u202e')
+    expect(page).toContain('data-testid="hub-confirm-hidden"')
+    const home = await (await owner.browser.fetch('/')).text()
+    expect(home).toContain('⟦U+202E⟧')
   })
 
   it('lets the owner refuse, hides other clients\' requests, and expires what nobody confirmed', async () => {

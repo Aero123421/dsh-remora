@@ -34,7 +34,10 @@ export const ASK_MARKER = 'remora-e2e:ask'
 export const ASK_BLOCKING_MARKER = 'remora-e2e:ask-blocking'
 export const APPROVE_MARKER = 'remora-e2e:approve'
 export const WRITE_PREFIX = 'REMORA-MOCK-WRITE'
+export const JOB_MARKER = 'remora-e2e:job'
+export const JOB_PREFIX = 'REMORA-MOCK-JOB'
 export const ASK_TOOL = 'ask_user_question'
+export const BASH_TOOL = 'bash'
 export const WRITE_TOOL = 'write'
 export const MOCK_MODEL = 'remora-mock'
 
@@ -72,6 +75,11 @@ function answeredTool(messages, protocol) {
   return undefined
 }
 
+/** The long-running command the job test starts in the background (prints a marker, then waits). */
+export function jobCommand(nonce) {
+  return `echo REMORA-JOB-${nonce}; sleep 600 # remora-e2e-job-${nonce}`
+}
+
 /** File the approval test writes, inside the session's working directory. */
 export function approvalFile(nonce) {
   return `remora-e2e-${nonce}.txt`
@@ -90,6 +98,10 @@ export function decide({ messages, toolNames, protocol }) {
     : (Array.isArray(last?.content) ? last.content.find(block => block?.type === 'tool_result') : undefined)
   if (answer !== undefined) {
     const text = typeof answer === 'string' ? answer : textOf(answer.content)
+    if (answeredTool(messages, protocol) === BASH_TOOL) {
+      // A background bash call answers with the job id at once.
+      return { kind: 'text', text: `${JOB_PREFIX} ${nonce} ${/job|bash-/i.test(text) ? 'started' : 'failed'}` }
+    }
     if (answeredTool(messages, protocol) === WRITE_TOOL) {
       // DSH's write tool answers "Created file" / "Updated file"; anything else is a refusal or an error.
       const done = /\b(Created|Updated) file\b/.test(text)
@@ -116,6 +128,14 @@ export function decide({ messages, toolNames, protocol }) {
         sandbox_permissions: 'danger-full-access',
         justification: `Remora E2E approval test (${nonce})`,
       },
+    }
+  }
+  if (lastText.includes(JOB_MARKER) && toolNames.includes(BASH_TOOL)) {
+    return {
+      kind: 'tool',
+      id: `toolu_remora_${nonce}_${Date.now().toString(36)}`,
+      name: BASH_TOOL,
+      input: { command: jobCommand(nonce), description: `Remora E2E background job (${nonce})`, run_in_background: true },
     }
   }
   if (lastText.includes(ASK_MARKER) && toolNames.includes(ASK_TOOL)) {

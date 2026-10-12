@@ -13,15 +13,23 @@
 //   approval.passkey a write asking for a sandbox escalation: approval.respond without the
 //                    passkey is refused with the hub link; the owner allows it there with the passkey
 //   approval.remote  "Allow approvals from MCP and CLI" on (this PC): approval.respond rejects it
+//   sessions.search  sessions.search finds the first task's nonce in its prompt and reply
+//   session.fork     session.fork copies up to the first task's turn into a new session
+//   job.stop         the model starts a background bash job, which keeps the task running →
+//                    session.get lists it, job.output reads it, job.stop stops it → task completes
+//   schedule.create  a daily prompt is listed and deleted; a one-shot prompt arrives as a new turn
+//   terminal.run     the "request" token is refused; with "Full remote access" on in DSH the
+//                    owner runs a command from the host page, confirms it with the passkey on
+//                    /confirm/… and reads its output there; a second one is denied
 //   kill-switch      kill switch on in DSH → task.start is refused → off again → tasks run
 //
 // Each step detects features that are not there yet (501 from the hub, a
 // missing control in the UI) and skips with the reason, so this scenario
 // grows into the full E2E as the hub and plugin streams land.
 import { randomBytes, randomUUID } from 'node:crypto'
-import { readdirSync } from 'node:fs'
+import { readdirSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
-import { ANSWERED_PREFIX, APPROVE_MARKER, ASK_BLOCKING_MARKER, ASK_MARKER, REPLY_PREFIX, WRITE_PREFIX, approvalFile } from './lib/mock-llm.mjs'
+import { ANSWERED_PREFIX, APPROVE_MARKER, ASK_BLOCKING_MARKER, ASK_MARKER, JOB_MARKER, JOB_PREFIX, REPLY_PREFIX, WRITE_PREFIX, approvalFile } from './lib/mock-llm.mjs'
 import { addVirtualAuthenticator, firstPresent, instrument, mustBePresent, requirePresent, shot } from './lib/browser.mjs'
 import { HUB_PATHS, dsh as DSH_SELECTORS, hub as HUB, remora as REMORA } from './lib/selectors.mjs'
 import { hubApi, startHub } from './lib/hub.mjs'
@@ -234,6 +242,7 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
     if (!mock.requests.some(request => request.lastUserText.includes(`nonce=${nonce}`))) throw new Error('the mock LLM never saw the prompt')
     state.host = host
     state.target = target
+    state.firstNonce = nonce
     await shot(dshSession.page, artifacts, 'flow-dsh-after-task')
     return `task ${started.taskId} on session "${session.title}" completed; reply "${task.result.reply}"; idempotent re-start returned the same task`
   })
@@ -354,6 +363,163 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
       return `switch on (${shotPath}); approval.respond rejected it without a passkey; reply "${done.result.reply}"; no file written`
     } finally {
       await toggle(false)
+    }
+  })
+
+  await r.step('sessions.search', 'sessions.search finds the first task\'s nonce in its prompt and in the reply', { needs: ['task.complete'], timeoutMs: 60_000 }, async () => {
+    const { body } = await state.api('sessions.search', { hostId: state.host.hostId, query: state.firstNonce })
+    const mine = (body.hits ?? []).filter(hit => hit.sessionId === state.target.sessionId)
+    const roles = [...new Set(mine.map(hit => hit.role))].sort()
+    if (!roles.includes('user') || !roles.includes('assistant')) throw new Error(`expected user and assistant hits in ${state.target.sessionId}: ${JSON.stringify(body)}`)
+    if (!mine.every(hit => hit.snippet.includes(state.firstNonce))) throw new Error(`a snippet lacks the nonce: ${JSON.stringify(mine)}`)
+    const { body: none } = await state.api('sessions.search', { hostId: state.host.hostId, query: `${state.firstNonce} zz-not-there-${randomBytes(3).toString('hex')}` })
+    if (none.hits.length !== 0) throw new Error(`an impossible query matched: ${JSON.stringify(none)}`)
+    return `${mine.length} hit(s) (${roles.join(', ')}) for "${state.firstNonce}" after scanning ${body.scanned} session(s); an impossible query found nothing`
+  })
+
+  await r.step('session.fork', 'session.fork copies the session up to the first task\'s turn into a new session in the same workspace', { needs: ['task.complete'], timeoutMs: 60_000 }, async () => {
+    const title = `Remora E2E fork ${randomBytes(2).toString('hex')}`
+    // The turn of task.complete (DSH Web's own smoke turn may come first).
+    const { body: history } = await state.api('session.read', { hostId: state.host.hostId, sessionId: state.target.sessionId, depth: 'turns', limit: 50 })
+    const atTurn = (history.turns ?? []).find(turn => turn.request.includes(`nonce=${state.firstNonce}`))?.index
+    if (!atTurn) throw new Error(`no turn with nonce=${state.firstNonce}: ${JSON.stringify(history.turns)}`)
+    const { body } = await state.api('session.fork', { hostId: state.host.hostId, sessionId: state.target.sessionId, atTurn, title })
+    if (body.forkedFrom !== state.target.sessionId || !body.session?.sessionId || body.session.sessionId === state.target.sessionId) throw new Error(`unexpected fork result: ${JSON.stringify(body)}`)
+    const { body: listed } = await state.api('sessions.list', { hostId: state.host.hostId, limit: 50 })
+    const original = listed.sessions.find(item => item.sessionId === state.target.sessionId)
+    const fork = listed.sessions.find(item => item.sessionId === body.session.sessionId)
+    if (!fork || fork.workspaceId !== original?.workspaceId || fork.title !== title) throw new Error(`the fork is not listed in the workspace with its title: ${JSON.stringify(fork)}`)
+    const { body: read } = await state.api('session.read', { hostId: state.host.hostId, sessionId: fork.sessionId, depth: 'turns' })
+    const turns = read.turns ?? []
+    if (turns.length !== atTurn || !turns.at(-1).request.includes(`nonce=${state.firstNonce}`)) throw new Error(`the fork does not end at turn ${atTurn}: ${JSON.stringify(turns)}`)
+    return `fork ${fork.sessionId} "${fork.title}" holds turns 1–${atTurn}, ending with "${turns.at(-1).reply.slice(0, 60)}"`
+  })
+
+  await r.step('job.stop', 'A background bash job started by the model keeps its task running: session.get lists it, job.output reads it, job.stop stops it and the task completes', { needs: ['task.complete'], timeoutMs: 180_000, onFailure: failShot('job', 'dsh') }, async () => {
+    const nonce = `j${randomBytes(4).toString('hex')}`
+    const { body: started } = await state.api('task.start', { hostId: state.host.hostId, target: state.target, prompt: `Remora E2E background job ${JOB_MARKER} nonce=${nonce}`, idempotencyKey: randomUUID() })
+    const findJob = async () => {
+      const { body } = await state.api('session.get', { hostId: state.host.hostId, sessionId: state.target.sessionId })
+      return (body.jobs ?? []).find(job => job.label.includes(`remora-e2e-job-${nonce}`))
+    }
+    let job
+    for (const deadline = Date.now() + 60_000; !job; ) {
+      job = await findJob()
+      if (job) break
+      if (Date.now() > deadline) throw new Error('session.get never listed the background job')
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
+    if (job.status !== 'running') throw new Error(`the job is not running: ${JSON.stringify(job)}`)
+    const { body: during } = await state.api('task.wait', { taskId: started.taskId, timeoutMs: 3000 })
+    if (TERMINAL.has(during.state)) throw new Error(`the task ended (${during.state}) while its job still runs`)
+    let output = ''
+    for (const deadline = Date.now() + 15_000; !output.includes(`REMORA-JOB-${nonce}`) && Date.now() < deadline;) {
+      ;({ body: { output } } = await state.api('job.output', { hostId: state.host.hostId, jobId: job.jobId }))
+      if (!output.includes(`REMORA-JOB-${nonce}`)) await new Promise(resolve => setTimeout(resolve, 500))
+    }
+    if (!output.includes(`REMORA-JOB-${nonce}`)) throw new Error(`job.output never showed the marker: ${JSON.stringify(output)}`)
+    const { body: stopped } = await state.api('job.stop', { hostId: state.host.hostId, jobId: job.jobId })
+    if (stopped.stopped !== true) throw new Error(`job.stop: ${JSON.stringify(stopped)}`)
+    let after = job
+    for (const deadline = Date.now() + 15_000; after?.status === 'running' && Date.now() < deadline;) {
+      await new Promise(resolve => setTimeout(resolve, 500))
+      after = await findJob()
+    }
+    if (after?.status === 'running') throw new Error(`the job is still running after job.stop: ${JSON.stringify(after)}`)
+    const { body: again } = await state.api('job.stop', { hostId: state.host.hostId, jobId: job.jobId })
+    if (again.stopped !== false) throw new Error(`a second job.stop claimed to stop it: ${JSON.stringify(again)}`)
+    const task = await waitTask(state.api, started.taskId, value => TERMINAL.has(value) || value === 'needs_attention', 60_000)
+    // DSH tells the agent that the job ended, which may add a follow-up turn to the task: its reply carries the nonce too.
+    if (task.state !== 'completed' || !task.result?.reply?.includes(nonce)) throw new Error(`after the stop the task ended ${task.state}: ${JSON.stringify(task)}`)
+    return `job ${job.jobId} ("${job.label}") listed running while its task ran; output had the marker; job.stop → ${stopped.status}, now ${after?.status ?? 'gone'}; a second stop is a no-op; the task then completed ("${task.result.reply}")`
+  })
+
+  await r.step('schedule.create', 'A daily prompt is listed and deleted; a one-shot prompt arrives as a new turn', { needs: ['task.complete'], timeoutMs: 180_000, onFailure: failShot('schedule', 'dsh') }, async () => {
+    const hostId = state.host.hostId
+    const sessionId = state.target.sessionId
+    const dailyParams = { hostId, sessionId, title: 'Remora E2E daily', prompt: 'Remora E2E daily check', when: { daily: { time: '09:00', timeZone: 'Asia/Tokyo' } }, idempotencyKey: randomUUID() }
+    const { body: daily } = await state.api('schedule.create', dailyParams)
+    const { body: same } = await state.api('schedule.create', dailyParams)
+    if (same.schedule.scheduleId !== daily.schedule.scheduleId) throw new Error(`the same idempotencyKey created a second schedule: ${JSON.stringify(same)}`)
+    if (daily.schedule.rule !== 'daily 09:00 Asia/Tokyo' || !(daily.schedule.nextAt > Date.now())) throw new Error(`unexpected daily schedule: ${JSON.stringify(daily)}`)
+    const nonce = `s${randomBytes(4).toString('hex')}`
+    const { body: once } = await state.api('schedule.create', { hostId, sessionId, title: 'Remora E2E once', prompt: `Remora E2E scheduled prompt nonce=${nonce}`, when: { afterSeconds: 2 }, idempotencyKey: randomUUID() })
+    const { body: listed } = await state.api('schedules.list', { hostId, sessionId })
+    if (!listed.schedules.some(item => item.scheduleId === daily.schedule.scheduleId && item.status === 'active' && item.prompt === 'Remora E2E daily check')) throw new Error(`schedules.list lacks the daily one: ${JSON.stringify(listed)}`)
+    for (const deadline = Date.now() + 90_000; ;) {
+      const { body } = await state.api('session.read', { hostId, sessionId, depth: 'turns', limit: 5 })
+      // DSH frames a scheduled prompt as a reminder (source "schedule"); the mock answers with its nonce.
+      if ((body.turns ?? []).some(item => item.reply?.includes(`${REPLY_PREFIX} ${nonce}`))) break
+      if (Date.now() > deadline) throw new Error(`the one-shot prompt never ran: ${JSON.stringify(body.turns?.slice(-2))}`)
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+    const { body: removed } = await state.api('schedule.delete', { hostId, sessionId, scheduleId: daily.schedule.scheduleId })
+    if (removed.deleted !== true) throw new Error(`schedule.delete: ${JSON.stringify(removed)}`)
+    const { body: left } = await state.api('schedules.list', { hostId, sessionId })
+    if (left.schedules.some(item => item.scheduleId === daily.schedule.scheduleId)) throw new Error('the deleted schedule is still listed')
+    const onceNow = left.schedules.find(item => item.scheduleId === once.schedule.scheduleId)
+    return `daily listed with its prompt, then deleted; one-shot ${once.schedule.scheduleId} ran as a turn (now ${onceNow ? onceNow.status : 'gone from the list'})`
+  })
+
+  await r.step('terminal.run', 'Terminal: a "request" token is refused; with full access the owner runs a command and confirms it with the passkey on the hub', { needs: ['task.complete', 'hub.owner'], timeoutMs: 180_000, onFailure: failShot('terminal') }, async () => {
+    const hostId = state.host.hostId
+    // The personal token ("request", no dsh.admin) is refused before anything is parked.
+    const refused = await state.api('terminal.run', { hostId, command: 'echo nope', cwdWorkspaceId: 'x' }, { allow: [403] })
+    if (refused.status !== 403 || refused.body?.error?.code !== 'denied') throw new Error(`terminal.run from a "request" token: ${refused.status} ${JSON.stringify(refused.body)}`)
+    const page = dshSession.page
+    const setCeiling = async level => {
+      const { section } = await ensureRemoraTab(page)
+      await openRemoraSubTab(section, REMORA.tabs.permissions)
+      const control = await mustBePresent(section, level === 'full' ? REMORA.ceilingFull : REMORA.ceilingRequest, `the "${level}" level`)
+      if (await control.getAttribute('aria-checked') === 'true') return
+      const reply = page.waitForResponse(response => /\/api\/remora\/permission$/.test(response.url()), { timeout: 15_000 })
+      await control.click()
+      if (level === 'full') await (await mustBePresent(page, REMORA.fullConfirm, 'the "Turn on" button of the full-access dialog')).click()
+      const body = await rpcBody(await reply)
+      if (!body?.result?.ok) throw new Error(`permission RPC failed: ${JSON.stringify(body)}`)
+    }
+    await setCeiling('full')
+    const dshShot = await shot(page, artifacts, 'flow-dsh-full-access')
+    try {
+      const hubPage = state.hubPage
+      // The hub offers the form once the host reported the raised ceiling.
+      let form
+      for (const deadline = Date.now() + 30_000; ;) {
+        await hubPage.goto(`${state.hub.origin}/hosts/${hostId}`)
+        const open = HUB.terminalOpen(hubPage)
+        if (await open.count() > 0) {
+          await open.first().click()
+          form = await firstPresent(hubPage, HUB.terminalForm, 1000)
+          if (form) break
+        }
+        if (Date.now() > deadline) throw new Error('the host page never offered the terminal form')
+        await hubPage.waitForTimeout(1000)
+      }
+      const nonce = `c${randomBytes(4).toString('hex')}`
+      await form.locator('textarea[name="command"]').fill(`echo REMORA-TERMINAL-${nonce}; pwd`)
+      await Promise.all([hubPage.waitForURL(/\/confirm\/[^/]+\/[^/?]+$/, { timeout: 20_000 }), form.locator('button[type="submit"]').click()])
+      const confirmPath = new URL(hubPage.url()).pathname
+      const command = await mustBePresent(hubPage, HUB.confirmCommand, 'the command on the confirm page')
+      if (!(await command.innerText()).includes(`REMORA-TERMINAL-${nonce}`)) throw new Error(`the confirm page shows "${await command.innerText()}"`)
+      await shot(hubPage, artifacts, 'flow-hub-terminal-confirm')
+      await (await mustBePresent(hubPage, HUB.confirmRun, 'the "confirm with passkey and run" button')).click()
+      const stdout = await mustBePresent(hubPage, HUB.terminalStdout, 'the command output on the confirm page', 60_000)
+      const text = await stdout.innerText()
+      if (!text.includes(`REMORA-TERMINAL-${nonce}`) || !text.includes(realpathSync(world.root))) throw new Error(`unexpected output (expected a folder under ${world.root}): ${JSON.stringify(text)}`)
+      const outputShot = await shot(hubPage, artifacts, 'flow-hub-terminal-output')
+      // A second command, refused by the owner, never runs.
+      const denied = await state.hubPage.goto(`${state.hub.origin}/hosts/${hostId}`)
+      if (!denied?.ok()) throw new Error('the host page did not load again')
+      await HUB.terminalOpen(hubPage).first().click()
+      const again = await mustBePresent(hubPage, HUB.terminalForm, 'the terminal form again')
+      await again.locator('textarea[name="command"]').fill(`echo REMORA-NEVER-${nonce}`)
+      await Promise.all([hubPage.waitForURL(/\/confirm\//, { timeout: 20_000 }), again.locator('button[type="submit"]').click()])
+      await Promise.all([hubPage.waitForURL(/msg=confirmation-denied/, { timeout: 20_000 }), (await mustBePresent(hubPage, HUB.confirmDeny, 'the deny button')).click()])
+      const deniedState = await (await mustBePresent(hubPage, HUB.confirmState, 'the state on the confirm page')).innerText()
+      if (!deniedState.includes('拒否')) throw new Error(`after denying, the page says "${deniedState}"`)
+      return `token refused (${refused.body.error.denial?.layer}: ${refused.body.error.denial?.reason}); full access on (${dshShot}); ran on ${confirmPath} with the passkey → "${text.trim().split('\n').join(' | ')}" (${outputShot}); a second command denied`
+    } finally {
+      await setCeiling('request')
     }
   })
 

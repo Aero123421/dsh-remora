@@ -24,7 +24,7 @@ import {
   type SessionGetResult, type SessionSummary, type TaskInfo, type TerminalRunOutput, type WorkspaceSummary,
 } from '../vendor/protocol/index.ts'
 import { whenFromForm } from './schedule-form.ts'
-import { ATTENTION_LABEL, LEVEL_LABEL, STATE_LABEL, dateTime, flash, h, page, raw, reauthForm, relativeTime, type NavKey, type Raw } from './layout.ts'
+import { ATTENTION_LABEL, LEVEL_LABEL, STATE_LABEL, dateTime, flash, h, page, raw, reauthForm, relativeTime, visibleText, type NavKey, type Raw } from './layout.ts'
 
 const OWNER: Caller = { clientId: OWNER_CLIENT_ID, clientName: 'ハブの画面', scopes: [...SCOPES], kind: 'owner' }
 
@@ -201,7 +201,7 @@ const confirmPath = (hostId: string, confirmationId: string) => `/confirm/${host
 function confirmationRow(item: PendingConfirmation, hostId: string, hostName: string): Raw {
   return h`<li class="inbox-item kind-confirmation" data-expiring data-testid="hub-confirmation-item">
   <div class="row"><span class="badge danger">${ATTENTION_LABEL.confirmation}</span> <a href="${confirmPath(hostId, item.confirmationId)}">${CONFIRM_LABEL[item.operation] ?? item.operation}</a> <span class="muted">${item.clientName} から</span></div>
-  <div class="row"><code class="untrusted">${item.what}</code></div>
+  <div class="row"><code class="untrusted">${visibleText(item.what).text}</code></div>
   <div class="row muted">${hostName ? h`<span>${hostName}</span>` : ''} ${countdown(item.expiresAt)} <span>${relativeTime(item.createdAt)}</span>
   <a class="button small primary" href="${confirmPath(hostId, item.confirmationId)}">確認する</a></div>
 </li>`
@@ -665,6 +665,11 @@ ${output.truncated ? h`<p class="muted">出力が長いため一部を省きま�
 <p class="muted">出力は DSH ホストでシークレットらしい文字列を伏せてから送られています。</p>`
 }
 
+/** JSON with every non-ASCII character escaped (`\u202e`), so no invisible character reaches the page. */
+function asciiJson(value: unknown, space?: number): string {
+  return JSON.stringify(value, null, space).replace(/[\u007f-\uffff]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`)
+}
+
 /** The page a confirmUrl opens: what a client asked to run, and the passkey button. */
 async function confirmPage(env: Env, url: URL, origin: string, hostId: string, confirmationId: string): Promise<Response> {
   const host = await hubStub(env).getHost(hostId)
@@ -674,6 +679,7 @@ async function confirmPage(env: Env, url: URL, origin: string, hostId: string, c
   const params = item.params
   const crumbs = h`<p class="crumbs"><a href="/">ホーム</a> / <a href="/hosts/${hostId}">${host.name}</a> / パスキーでの確認</p>`
   const requester = item.clientId === OWNER_CLIENT_ID ? 'ハブの画面（あなた）' : item.clientName
+  const command = typeof params.command === 'string' ? visibleText(params.command) : null
   let workspace: Raw = h`<span class="mono">${String(params.cwdWorkspaceId ?? '')}</span>`
   if (item.state === 'pending' && live.online && typeof params.cwdWorkspaceId === 'string') {
     const listed = await runOperation(env, OWNER, 'workspaces.list', { hostId })
@@ -684,7 +690,7 @@ async function confirmPage(env: Env, url: URL, origin: string, hostId: string, c
   <dt>操作</dt><dd>${CONFIRM_LABEL[item.operation] ?? item.operation} <span class="muted mono">${item.operation}</span></dd>
   <dt>依頼したもの</dt><dd>${requester}</dd>
   <dt>ホスト</dt><dd>${host.name} <span class="muted mono">${hostId}</span></dd>
-  ${typeof params.command === 'string' ? h`<dt>コマンド</dt><dd><pre class="command untrusted" data-testid="hub-confirm-command">${params.command}</pre></dd>` : ''}
+  ${command ? h`<dt>コマンド</dt><dd><pre class="command untrusted" data-testid="hub-confirm-command">${command.text}</pre>${command.hidden ? h`<p class="flash error" data-testid="hub-confirm-hidden">見えない文字（制御文字・文字の向きを変える文字・幅のない文字）が含まれています。⟦U+…⟧ の位置にあります。意図したものでなければ実行しないでください。</p>` : ''}</dd>` : ''}
   ${params.cwdWorkspaceId !== undefined ? h`<dt>場所</dt><dd>${workspace}</dd>` : ''}
   ${typeof params.timeoutMs === 'number' ? h`<dt>タイムアウト</dt><dd>${Math.round(params.timeoutMs / 1000)} 秒</dd>` : ''}
   <dt>状態</dt><dd><span class="state ${item.state}" data-testid="hub-confirm-state">${CONFIRMATION_STATE[item.state] ?? item.state}</span> <span class="muted">${dateTime(item.createdAt)}</span></dd>
@@ -696,8 +702,8 @@ async function confirmPage(env: Env, url: URL, origin: string, hostId: string, c
       outcome = !live.online
         ? h`<p class="muted">ホストがオフラインのため、今は実行できません。期限までにホストがつながれば実行できます。</p>`
         : h`<div class="confirm-preview"><p>パスキーで署名する内容（DSH ホストが検証します）:</p>
-<pre class="codes">${JSON.stringify(finalParams(item.operation, params, hostId), null, 2)}</pre></div>
-<form data-confirm-op="${item.operation}" data-host="${hostId}" data-params="${JSON.stringify(params)}" data-pending="${item.confirmationId}" data-done="${confirmPath(hostId, item.confirmationId)}" class="actions">
+<pre class="codes">${asciiJson(finalParams(item.operation, params, hostId), 2)}</pre></div>
+<form data-confirm-op="${item.operation}" data-host="${hostId}" data-params="${asciiJson(params)}" data-pending="${item.confirmationId}" data-done="${confirmPath(hostId, item.confirmationId)}" class="actions">
   <button class="danger" type="submit" data-testid="hub-confirm-run">パスキーで確認して実行</button>
   <p data-status hidden></p>
 </form>`
@@ -713,9 +719,11 @@ ${outcome}
       outcome = h`<p class="flash ok" role="status">ホストで実行しています。終わるとこのページに結果が出ます（自動で更新します）。</p>`
       break
     case 'done':
-      outcome = item.operation === 'terminal.run' && item.result && typeof item.result === 'object'
-        ? terminalOutput(item.result as TerminalRunOutput)
-        : h`<pre class="untrusted pre card">${JSON.stringify(item.result ?? null, null, 2)}</pre>`
+      outcome = item.result === undefined
+        ? h`<p class="muted">完了しました。出力は 1 時間を過ぎたので消しました（ハブには残しません）。</p>`
+        : item.operation === 'terminal.run' && item.result && typeof item.result === 'object'
+          ? terminalOutput(item.result as TerminalRunOutput)
+          : h`<pre class="untrusted pre card">${JSON.stringify(item.result, null, 2)}</pre>`
       break
     case 'failed':
       outcome = errorFlash(item.error, '実行できませんでした')
