@@ -39,34 +39,60 @@ export interface TaskTurn {
   text: string
   /** Turn the message entered, or null if it was appended outside a turn. */
   turn: number | null
-  /** Set once the turn closed. */
+  /**
+   * The task's span: its own turn plus the follow-up turns DSH started without a
+   * new human prompt (an answer to a continued question, a goal round). The span
+   * ends where a turn starts with another human prompt.
+   */
+  turns: number[]
+  /** Set once the last turn of the span closed. */
   end: { seq: number; reason: { kind: string; error?: { message?: string; code?: string; status?: number } } } | null
 }
 
-/** Locate the turn a request id entered (`source.rpcId` on the durable user message). */
+/** Locate the turn a request id entered (`source.rpcId` on the durable user message), and its follow-up span. */
 export function findTaskTurn(events: readonly DshSessionEvent[], requestId: string): TaskTurn | null {
   let openTurn: number | null = null
   let found: TaskTurn | null = null
+  /** Turn opened after the span's last turn ended, waiting for its first user message to decide. */
+  let candidate: number | null = null
   for (const event of events) {
-    if (event.type === 'turn/start') openTurn = numberOr(event.data?.turn, openTurn)
+    if (event.type === 'turn/start') {
+      openTurn = numberOr(event.data?.turn, openTurn)
+      if (found?.end) candidate = openTurn
+      continue
+    }
     if (found === null) {
       if (event.type === 'user/message' && rpcIdOf(event.data) === requestId) {
-        found = { messageSeq: event.seq, text: contentText(event.data?.content), turn: openTurn, end: null }
+        found = { messageSeq: event.seq, text: contentText(event.data?.content), turn: openTurn, turns: openTurn === null ? [] : [openTurn], end: null }
       }
-    } else if (event.type === 'turn/end' && found.turn !== null && event.data?.turn === found.turn) {
-      found.end = { seq: event.seq, reason: event.data?.reason ?? { kind: 'completed' } }
-      return found
+      if (event.type === 'turn/end') openTurn = null
+      continue
     }
-    if (event.type === 'turn/end') openTurn = null
+    if (candidate !== null && event.type === 'user/message') {
+      // A human prompt (any source.kind 'user') starts someone else's work: the span is over.
+      if (event.data?.source?.kind === 'user') return found
+      found.turns.push(candidate)
+      found.end = null
+      candidate = null
+      continue
+    }
+    if (event.type === 'turn/end') {
+      const last = found.turns.at(-1)
+      if (last !== undefined && event.data?.turn === last && found.end === null) {
+        found.end = { seq: event.seq, reason: event.data?.reason ?? { kind: 'completed' } }
+      }
+      if (candidate !== null && event.data?.turn === candidate) candidate = null
+      openTurn = null
+    }
   }
   return found
 }
 
-/** Final assistant reply of one turn (text blocks of the last non-empty assistant message). */
-export function turnReply(events: readonly DshSessionEvent[], turn: number): string | null {
+/** Final assistant reply over a set of turns (text of the last non-empty assistant message). */
+export function spanReply(events: readonly DshSessionEvent[], turns: readonly number[]): string | null {
   let reply: string | null = null
   for (const event of events) {
-    if (event.type !== 'assistant/message' || event.data?.turn !== turn) continue
+    if (event.type !== 'assistant/message' || !turns.includes(event.data?.turn)) continue
     const text = contentText(event.data?.message?.content)
     if (text.trim() !== '') reply = text
   }
@@ -390,13 +416,16 @@ function questionItem(sessionId: string, callId: string, questions: DshQuestionI
 
 export interface ChangesEvent { seq: number; turn: number }
 
-/** `workspace/changes` events (latest per turn wins), optionally for one turn. */
-export function changesEvents(events: readonly DshSessionEvent[], turn?: number): ChangesEvent[] {
+const inTurns = (turns: number | readonly number[] | undefined, turn: unknown): boolean =>
+  turns === undefined || (typeof turns === 'number' ? turn === turns : turns.includes(turn as number))
+
+/** `workspace/changes` events (latest per turn wins), optionally for some turns. */
+export function changesEvents(events: readonly DshSessionEvent[], turns?: number | readonly number[]): ChangesEvent[] {
   const byTurn = new Map<number, number>()
   for (const event of events) {
     if (event.type !== 'workspace/changes') continue
     const t = event.data?.turn
-    if (typeof t !== 'number' || (turn !== undefined && t !== turn)) continue
+    if (typeof t !== 'number' || !inTurns(turns, t)) continue
     byTurn.set(t, event.seq)
   }
   return [...byTurn].map(([t, seq]) => ({ seq, turn: t }))
@@ -404,12 +433,12 @@ export function changesEvents(events: readonly DshSessionEvent[], turn?: number)
 
 export interface PresentedFile { deliverableId: string; path: string; description?: string; turn: number }
 
-/** Files the `present` tool delivered (`deliverables/presented`), optionally for one turn. */
-export function presentedFiles(events: readonly DshSessionEvent[], turn?: number): PresentedFile[] {
+/** Files the `present` tool delivered (`deliverables/presented`), optionally for some turns. */
+export function presentedFiles(events: readonly DshSessionEvent[], turns?: number | readonly number[]): PresentedFile[] {
   const files: PresentedFile[] = []
   for (const event of events) {
     if (event.type !== 'deliverables/presented') continue
-    if (turn !== undefined && event.data?.turn !== turn) continue
+    if (!inTurns(turns, event.data?.turn)) continue
     const list = Array.isArray(event.data?.files) ? event.data.files : []
     list.forEach((file: { path?: unknown; description?: unknown }, index: number) => {
       if (typeof file?.path !== 'string') return

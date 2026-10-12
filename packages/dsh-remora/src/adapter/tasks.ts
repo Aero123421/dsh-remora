@@ -25,7 +25,7 @@ import type {
 import { SERVICES } from './dsh-types.ts'
 import { denied, fromDsh, invalid, notFound } from './errors.ts'
 import {
-  changesEvents, computeAttention, contentText, findTaskTurn, presentedFiles, rpcIdOf, skillGestures, turnReply,
+  changesEvents, computeAttention, contentText, findTaskTurn, presentedFiles, rpcIdOf, skillGestures, spanReply,
 } from './events.ts'
 import { forCaller } from './reads.ts'
 import { hasContent, type Runtime, type SessionRow } from './runtime.ts'
@@ -42,7 +42,8 @@ interface Evaluation {
   error?: RemoraError
   attention: AttentionItem[]
   events: readonly DshSessionEvent[]
-  turn: number | null
+  /** The task's turns (its own and DSH-started follow-ups), empty until it entered one. */
+  turns: number[]
 }
 
 /** Deterministic DSH session id for a `new` target, so a retried task.start adopts instead of creating twice. */
@@ -109,19 +110,27 @@ export class Tasks {
   }
 
   async evaluate(record: TaskRecord, signal: AbortSignal, preloaded?: { events: readonly DshSessionEvent[]; values: DshProjectionValues | null }): Promise<Evaluation> {
-    const unchanged = (): Evaluation => ({ state: record.state, attention: [], events: [], turn: null, ...(record.error ? { error: record.error } : {}) })
+    const unchanged = (): Evaluation => ({ state: record.state, attention: [], events: [], turns: [], ...(record.error ? { error: record.error } : {}) })
     if (record.sessionId === null || TERMINAL_TASK_STATES.has(record.state) || this.inflight.has(record.taskId)) return unchanged()
     const sessionId = record.sessionId
     const events = preloaded?.events ?? await this.rt.events(sessionId, signal)
     const values = preloaded ? preloaded.values : await this.rt.projections(sessionId, signal)
     const attention = computeAttention(sessionId, { events, values, loginError: this.rt.loginErrors.get(sessionId) ?? null })
     const turn = findTaskTurn(events, record.requestId)
-    const base = { attention, events, turn: turn?.turn ?? null }
+    const base = { attention, events, turns: turn?.turns ?? [] }
     if (!turn) {
       const queued = [...values?.inbox?.['next-turn'] ?? [], ...values?.inbox?.['next-step'] ?? []].some(item => rpcIdOf(item) === record.requestId)
       if (queued) return { ...base, state: 'accepted' }
-      // Neither logged nor queued after DSH accepted it: someone removed it from the queue.
-      if (record.state === 'accepted' && !this.rt.isRunning(sessionId)) return { ...base, state: 'cancelled' }
+      if (record.state === 'accepted' && !this.rt.isRunning(sessionId)) {
+        // Neither logged nor queued after DSH accepted it. Either a turn claimed it and
+        // failed before logging the message, or someone removed it from the queue.
+        const failedTurn = events.findLast(event => event.type === 'turn/end' && event.time >= record.createdAt - 1000)
+        const reason = failedTurn?.data?.reason
+        if (reason?.kind === 'error') {
+          return { ...base, state: 'failed', error: { code: 'internal', message: redactLine(`the turn failed: ${String(reason.error?.message ?? 'error')}`, 500) } }
+        }
+        return { ...base, state: 'cancelled' }
+      }
       return { ...base, state: record.state }
     }
     if (!turn.end) return { ...base, state: attention.length > 0 ? 'needs_attention' : 'running' }
@@ -152,7 +161,7 @@ export class Tasks {
     } catch (error) {
       if (error instanceof OperationError && error.code === 'gone' && !TERMINAL_TASK_STATES.has(record.state)) {
         const next = await this.save(record, 'failed', { code: 'gone', message: error.message })
-        return { record: next, evaluation: { state: 'failed', attention: [], events: [], turn: null } }
+        return { record: next, evaluation: { state: 'failed', attention: [], events: [], turns: [] } }
       }
       throw error
     }
@@ -181,13 +190,13 @@ export class Tasks {
     }
     if (TERMINAL_TASK_STATES.has(record.state)) {
       const events = evaluation?.events.length ? evaluation.events : await this.rt.events(record.sessionId, context.signal).catch(() => [] as const)
-      const turn = evaluation?.turn ?? findTaskTurn(events, record.requestId)?.turn ?? null
-      if (turn !== null) {
-        const reply = turnReply(events, turn)
+      const turns = evaluation?.turns.length ? evaluation.turns : findTaskTurn(events, record.requestId)?.turns ?? []
+      if (turns.length > 0) {
+        const reply = spanReply(events, turns)
         info.result = {
           reply: hasContent(context) && reply !== null ? redactTruncate(reply, 20_000).text : null,
-          changes: this.turnChanges(record.sessionId, events, turn),
-          deliverables: presentedFiles(events, turn).map((file): DeliverableRef => ({
+          changes: this.turnChanges(record.sessionId, events, turns),
+          deliverables: presentedFiles(events, turns).map((file): DeliverableRef => ({
             deliverableId: file.deliverableId,
             title: redactLine(file.description ?? file.path.split(/[\\/]/).pop() ?? file.path, 200),
             mimeType: null,
@@ -200,11 +209,11 @@ export class Tasks {
     return info
   }
 
-  private turnChanges(sessionId: string, events: readonly DshSessionEvent[], turn: number): NonNullable<NonNullable<TaskInfo['result']>['changes']> {
+  private turnChanges(sessionId: string, events: readonly DshSessionEvent[], turns: readonly number[]): NonNullable<NonNullable<TaskInfo['result']>['changes']> {
     const service = this.rt.get<DshWorkspaceChanges>(SERVICES.workspaceChanges)
     if (!service) return []
     const files = new Map<string, { path: string; status: 'modified'; additions: number; deletions: number }>()
-    for (const { seq } of changesEvents(events, turn)) {
+    for (const { seq } of changesEvents(events, turns)) {
       for (const file of service.summary(sessionId, seq)?.files ?? []) {
         files.set(file.path, { path: redactLine(file.display || file.path, 1000), status: 'modified', additions: file.added, deletions: file.deleted })
       }

@@ -121,31 +121,30 @@ export function createReads(rt: Runtime) {
   }
 
   /** Session and turn targeted by changes/patch: a task's turn or the whole session. */
-  async function changeTarget(params: { sessionId?: string; taskId?: string }, signal: AbortSignal): Promise<{ sessionId: string; events: readonly DshSessionEvent[]; turn?: number }> {
+  async function changeTarget(params: { sessionId?: string; taskId?: string }, signal: AbortSignal): Promise<{ sessionId: string; events: readonly DshSessionEvent[]; turns?: number[] }> {
     if (params.taskId !== undefined) {
       const record = rt.deps.tasks.get(params.taskId)
       if (!record || !record.sessionId) throw notFound(`task ${params.taskId} not found on this host`)
       if (params.sessionId !== undefined && params.sessionId !== record.sessionId) throw invalid('taskId and sessionId do not match')
       const { events } = await sessionRowAndEvents(record.sessionId, signal)
-      const turn = findTaskTurn(events, record.requestId)?.turn
-      if (turn === undefined || turn === null) return { sessionId: record.sessionId, events: [], turn: -1 }
-      return { sessionId: record.sessionId, events, turn }
+      const turns = findTaskTurn(events, record.requestId)?.turns ?? []
+      return { sessionId: record.sessionId, events: turns.length > 0 ? events : [], turns }
     }
     if (params.sessionId === undefined) throw invalid('give sessionId or taskId')
     const { events } = await sessionRowAndEvents(params.sessionId, signal)
     return { sessionId: params.sessionId, events }
   }
 
-  async function changedFiles(sessionId: string, events: readonly DshSessionEvent[], turn: number | undefined, signal: AbortSignal): Promise<{ file: ChangedFile; seq: number; index: number }[]> {
+  async function changedFiles(sessionId: string, events: readonly DshSessionEvent[], turns: readonly number[] | undefined, signal: AbortSignal): Promise<{ file: ChangedFile; seq: number; index: number }[]> {
     const service = rt.get<DshWorkspaceChanges>(SERVICES.workspaceChanges)
     if (!service) throw unavailable('DSH workspace changes are not available')
     const byPath = new Map<string, { file: ChangedFile; seq: number; index: number }>()
-    for (const { seq } of changesEvents(events, turn)) {
+    for (const { seq } of changesEvents(events, turns)) {
       const summary = service.summary(sessionId, seq)
       if (!summary) continue
       for (const [index, file] of summary.files.entries()) {
         let status: ChangedFile['status'] = 'modified'
-        if (turn !== undefined && summary.files.length <= 50) {
+        if (turns !== undefined && summary.files.length <= 50) {
           const diff = await service.diff(sessionId, seq, index, signal).catch(() => undefined)
           if (diff?.kind === 'text') status = diff.before && !diff.after ? 'deleted' : !diff.before && diff.after ? 'added' : 'modified'
         }
@@ -338,7 +337,7 @@ export function createReads(rt: Runtime) {
 
     async 'changes.get'(params: Params<'changes.get'>, context: OperationContext): Promise<Result<'changes.get'>> {
       const target = await changeTarget(params, context.signal)
-      const files = await changedFiles(target.sessionId, target.events, target.turn, context.signal)
+      const files = await changedFiles(target.sessionId, target.events, target.turns, context.signal)
       return { files: files.map(entry => entry.file) }
     },
 
@@ -346,7 +345,7 @@ export function createReads(rt: Runtime) {
       if (!hasContent(context)) throw new OperationError('denied', 'reading a patch needs the dsh.content scope', { denial: { layer: 'token', reason: 'missing-scope' } })
       const target = await changeTarget(params, context.signal)
       const service = rt.get<DshWorkspaceChanges>(SERVICES.workspaceChanges)!
-      const files = await changedFiles(target.sessionId, target.events, target.turn, context.signal)
+      const files = await changedFiles(target.sessionId, target.events, target.turns, context.signal)
       const maxBytes = params.maxBytes ?? 200_000
       let patch = ''
       let truncated = false

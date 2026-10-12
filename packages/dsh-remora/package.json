@@ -60,10 +60,13 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node --test --test-reporter=spec --disable-warning=ExperimentalWarning \"test/*.test.ts\"",
-    "pack:plugin": "node scripts/build.mjs && node scripts/pack.mjs"
+    "pack:plugin": "node scripts/build.mjs && node scripts/pack.mjs",
+    "test:compat": "node --disable-warning=ExperimentalWarning scripts/compat/run.mjs"
   },
   "devDependencies": {
     "@dsh-remora/protocol": "workspace:*",
-    "@types/react": "18.3.31"
+    "@types/react": "18.3.31",
+    "mime-types": "3.0.2",
+    "zod": "4.4.3"
   }
 }
