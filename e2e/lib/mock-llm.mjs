@@ -13,6 +13,8 @@
 //   default                      -> "REMORA-MOCK-REPLY <nonce>"   (nonce from `nonce=<id>`, else "none")
 //   contains "remora-e2e:ask"    -> an `ask_user_question` tool call (only when the request offers that tool)
 //   newest message is the answer -> "REMORA-MOCK-ANSWERED <nonce> <answer json>"
+//   timed question still pending -> "REMORA-MOCK-WAITING <nonce>", then the
+//   answer_to_pending_question user message -> "REMORA-MOCK-ANSWERED <nonce> <label>"
 //
 // Run standalone: node e2e/lib/mock-llm.mjs --port 4200
 import { createServer } from 'node:http'
@@ -20,6 +22,7 @@ import { pathToFileURL } from 'node:url'
 
 export const REPLY_PREFIX = 'REMORA-MOCK-REPLY'
 export const ANSWERED_PREFIX = 'REMORA-MOCK-ANSWERED'
+export const WAITING_PREFIX = 'REMORA-MOCK-WAITING'
 export const ASK_MARKER = 'remora-e2e:ask'
 export const ASK_TOOL = 'ask_user_question'
 export const MOCK_MODEL = 'remora-mock'
@@ -54,9 +57,16 @@ export function decide({ messages, toolNames, protocol }) {
     : (Array.isArray(last?.content) ? last.content.find(block => block?.type === 'tool_result') : undefined)
   if (answer !== undefined) {
     const text = typeof answer === 'string' ? answer : textOf(answer.content)
+    // Legacy mode returns the answers; timed mode returns a "pending" notice
+    // and the answer arrives later as a user message (answer_to_pending_question).
+    if (!/"answers"/.test(text)) return { kind: 'text', text: `${WAITING_PREFIX} ${nonce}` }
     return { kind: 'text', text: `${ANSWERED_PREFIX} ${nonce} ${text.replace(/\s+/g, ' ').slice(0, 200)}` }
   }
   const lastText = textOf(last?.content)
+  if (/answer_to_pending_question/.test(lastText)) {
+    const picked = /Teal|Navy/.exec(lastText)?.[0] ?? 'other'
+    return { kind: 'text', text: `${ANSWERED_PREFIX} ${nonce} ${picked}` }
+  }
   if (lastText.includes(ASK_MARKER) && toolNames.includes(ASK_TOOL)) {
     return {
       kind: 'tool',

@@ -60,7 +60,10 @@ DSH に渡す環境変数:
 | `DSH_TELEMETRY_MODE` | `DISABLED` | OTel の送信を止める |
 | `HOME`／`DSH_HOME`／`DSH_AGENTS_HOME`／`XDG_*` | 一時ディレクトリ | 隔離 |
 
-`e2e.patch.yml` は `workspace-controller` の `documentsDirectory` を一時ディレクトリの `Documents` に固定するだけのオーバーレイです。Linux では「書類」フォルダを `xdg-user-dir` で調べるため、これが無いコンテナでは既定のワークスペースが作られず（`spawn xdg-user-dir ENOENT`）、チャット欄が出ません。
+`e2e.patch.yml` は次の 2 つを入れるオーバーレイです（プロファイルには書き込みません）。
+
+- `workspace-controller` の `documentsDirectory` を一時ディレクトリの `Documents` に固定する。Linux では「書類」フォルダを `xdg-user-dir` で調べるため、これが無いコンテナでは既定のワークスペースが作られず（`spawn xdg-user-dir ENOENT`）、チャット欄が出ません。
+- 各エージェントプリセット（`preset-standard`・`preset-ptc`・`preset-cordis`）の `tool-ask-user` を `mode: timed`（1 秒）にする。既定の `legacy` モードの質問は DSH Web が抱えたままで、Remora からは答えられません。timed モードでは 1 秒後に質問が「続き」扱いになり、`attention.respond` が `userQuestions.answer` で答えられます。ツールの行はプリセットの `config.plugins` の中にあり、パッチで id 指定できないため、`dsh --dump-config` からプリセットの行を写して `config` を足したものを追記します（`enableTimedQuestions`）。
 
 ### モックのモデル（`e2e/lib/mock-llm.mjs`）
 
@@ -70,7 +73,8 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 | --- | --- |
 | 通常 | `REMORA-MOCK-REPLY <nonce>`（発話中の `nonce=<id>`、無ければ `none`） |
 | `remora-e2e:ask` を含む（`ask_user_question` が使えるとき） | `ask_user_question` のツール呼び出し（Teal／Navy の 2 択） |
-| 質問への回答の直後 | `REMORA-MOCK-ANSWERED <nonce> <回答>` |
+| timed モードで回答待ちのツール結果の直後 | `REMORA-MOCK-WAITING <nonce>` |
+| 回答（legacy のツール結果、または timed の `answer_to_pending_question`）の直後 | `REMORA-MOCK-ANSWERED <nonce> <回答>` |
 
 `node e2e/lib/mock-llm.mjs --port 4200` で単体でも起動できます。DSH の pi-ai 経由で試す場合は、プロファイルの `cordis.patch.yml` に `llm-pi-ai` のカスタムプロバイダー（`api: openai-completions`、`baseURL: http://127.0.0.1:4200/v1`）を足します。
 
@@ -85,46 +89,48 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 | `setup.plugin-install` | `dsh plugin add` で入り、プロファイルの bundles と合成後の設定に `dsh-remora` の行がある（peer の範囲外なら DSH がここで拒否する） |
 | `setup.dsh-web` | プラグイン入りの DSH Web が起動する |
 
-### ブラウザ確認（browser.*、2026-10-12 にこの環境で全て pass）
+### ブラウザ確認（browser.*）
 
 | ステップ | 示すこと |
 | --- | --- |
 | `browser.open` | 認証付き URL で DSH Web が開き、`window.__ModuleLoader__` がある |
 | `browser.settings-nav` | 設定画面の左ナビに「Remora」が出る。**自前ビルドのブラウザ側コードが `__ModuleLoader__` 経由で読み込まれ、`settings.section` スロットに登録された**ことの確認 |
-| `browser.remora-tab` | タブが `/api/remora/state`（`ctx.connection.fetch.register` の認証付きルート）から状態を取って描画する |
+| `browser.remora-tab` | Remora ページが `/api/remora/state`（`ctx.connection.fetch.register` の認証付きルート）から状態を取って描画し、プラグインの版が一致する |
 | `browser.kill-switch` | 緊急停止を入れると `/api/remora/kill-switch` が新しい状態を返し、再読み込み後も保たれ、切れる |
 | `browser.plugins-page` | Plugins 画面に dsh-remora が出る（参考情報。無くても失敗にしない） |
 | `browser.no-plugin-errors` | プラグイン由来のページエラー・コンソールエラーが無い |
-| `browser.mock-model` | DSH Web でのチャットにモックが答え、`ask_user_question` の質問カードが出る（フローの前提になるモデル経路の確認） |
-| `remote.*` | DSH を非ループバックのアドレス（例 `192.0.2.2`）で起動し直し、同じ確認をする。ブラウザからは別端末と同じに見えるので、**別端末から認証付きルートで保存できるか**の確認になる。該当するインターフェースが無ければ skip |
+| `browser.mock-model` | DSH Web でのチャットにモックが答え、`ask_user_question` の質問カードが出て、画面から答えると続きのターンが返る |
+| `remote.*` | DSH を非ループバックのアドレス（例 `192.0.2.2`）で起動し直し、同じ確認をする。ブラウザからは別端末と同じに見えるので、**別端末から認証付きルートが使えるか**の確認になる。緊急停止は別端末から入れられるが、再開はできない（ボタンが無効）ことも確かめる。該当するインターフェースが無ければ skip |
 
 ### フロー（hub.*、host.*、token.*、task.*、kill-switch.*）
 
-ハブとプラグインの機能がそろうにつれて、skip が pass に変わります。足りない機能は 501 応答や UI の欠如で検出し、理由付きで skip します。
+足りない機能は 501 応答や UI の欠如で検出し、理由付きで skip します（`--strict` では失敗）。2026-10-12 の統合版（`integrate`）では、`--strict` で全ステップが pass します。
 
-| ステップ | 示すこと | 現状（2026-10-12） |
-| --- | --- | --- |
-| `hub.start` | `wrangler dev` で空の状態のハブが 8788 番で起動し、`/healthz` が答える | pass（`/api/v1` は 501） |
-| `hub.owner` | `SETUP_TOKEN` を入れ、仮想認証器（CDP の `WebAuthn.addVirtualAuthenticator`）でオーナーのパスキーを登録できる | skip（登録画面が未実装） |
-| `host.pair` | Remora タブにハブの URL を入れて確認コードを出し、ハブの `/pair?code=…` で承認すると、タブが「Connected」になる | skip |
-| `token.mint` | ハブの画面で個人トークンを発行する。無ければ CLI と同じ OAuth 2.1＋PKCE（`remora-cli`、ループバックのリダイレクトを Playwright が受ける） | skip |
-| `task.complete` | `hosts.list` → `sessions.list` → `task.start`（同じ `idempotencyKey` で 2 回送って同じタスクになること）→ `task.wait` で `completed`、返答がモックの `REMORA-MOCK-REPLY <nonce>` で、モックがそのプロンプトを受け取っている | skip |
-| `task.attention` | `ask_user_question` で `needs_attention`、`attention.respond` で答えて `completed` | skip |
-| `kill-switch.enforced` | DSH 側で緊急停止を入れると `task.start` が拒否される | skip |
+| ステップ | 示すこと |
+| --- | --- |
+| `hub.start` | `wrangler dev` で空の状態のハブが 8788 番で起動し、`/healthz` が答え、認証なしの `/api/v1` は 401 |
+| `hub.owner` | `/` の初期設定で `SETUP_TOKEN` を入れ、仮想認証器（CDP の `WebAuthn.addVirtualAuthenticator`）でオーナーのパスキーを登録し、リカバリーコードが 1 回だけ出て、ログイン状態になる |
+| `host.pair` | Remora タブの「接続」でハブの URL を入れて確認コードを出し、ハブの `/pair?code=…` でパスキーの再確認つきで承認すると、タブが「Connected」になる |
+| `host.permit` | Remora タブで上限を「依頼できる」にし、「範囲」で既定のワークスペースを許可する |
+| `token.mint` | ハブの設定画面で個人トークン（`dsh.read`・`dsh.content`・`dsh.tasks`）をパスキーの再確認つきで発行し、「接続」画面でそのホストに「依頼できる」を付与する（ハブが DSH の上限を知るまで待つ） |
+| `task.complete` | `hosts.list` → `sessions.list` → `task.start`（同じ `idempotencyKey` で 2 回送って同じタスクになること）→ `task.wait` で `completed`、返答がモックの `REMORA-MOCK-REPLY <nonce>` で、モックがそのプロンプトを受け取っている |
+| `task.attention` | `ask_user_question`（timed モード）で `needs_attention`、`attention.list` に出て、`attention.respond` で答えると続きのターンが `REMORA-MOCK-ANSWERED <nonce> Teal` を返して `completed` |
+| `kill-switch.enforced` | DSH 側で緊急停止を入れると `task.start` が 403（`denied`、層は dsh）で拒否され、切ると再接続してタスクがまた完了する |
 
 ハブは `http://localhost:8788` として使います。WebAuthn は IP アドレスを RP ID にできないためです。ハブの状態は一時ディレクトリに置くので、毎回オーナー未登録の状態から始まります。`wrangler dev` には `WRANGLER_SEND_METRICS=false` と `CLOUDFLARE_CF_FETCH_ENABLED=false`（`Request.cf` を取りに行かない）を渡します。
 
 ## テスト用フック
 
-セレクターは `e2e/lib/selectors.mjs` にまとめてあります。プラグインとハブには次の `data-testid` を付けてもらう前提で、付くまではアクセシブルな名前（英語・日本語）で探します。
+セレクターは `e2e/lib/selectors.mjs` にまとめてあります。次の `data-testid` を優先し、無いときは既存のクラス・属性（`#kill-switch`、`form[data-setup]` など）で探します。
 
 | 場所 | `data-testid` |
 | --- | --- |
-| Remora タブ | `remora-section`、`remora-kill-switch`（`aria-pressed` で状態）、`remora-version`、`remora-hub-status`（`data-state="connected"` など）、`remora-hub-url`、`remora-pair-start`、`remora-pair-code`、`remora-ceiling-request` |
-| ハブ: 初回登録 | `hub-setup-token`、`hub-register-passkey`、`hub-recovery-codes`、`hub-recovery-ack`、`hub-signed-in`、`hub-sign-in` |
-| ハブ: ペアリング（`/pair?code=`） | `hub-pair-code`、`hub-pair-approve`、`hub-pair-approved` |
-| ハブ: 個人トークン（`/tokens`） | `hub-token-name`、`hub-token-scope-tasks`、`hub-token-create`、`hub-token-value` |
-| ハブ: OAuth の同意画面 | `hub-consent-approve` |
+| Remora ページ（`packages/dsh-remora/src/ui/`） | `remora-page`、`remora-kill-switch`（`data-on` で状態）、`remora-hub-status`（`data-state` に接続状態）、`remora-hub-url`、`remora-pair-start`、`remora-pair-code`、`remora-ceiling-<view\|request\|full\|custom>` |
+| ハブ: 初回登録（`/`） | `hub-setup-token`、`hub-setup-label`、`hub-register-passkey`、`hub-recovery-codes`、`hub-recovery-ack` |
+| ハブ: ログイン後のナビ | `hub-signed-in` |
+| ハブ: 個人トークン（`/settings#tokens`） | `hub-token-name`、`hub-token-create`、一度だけ表示する値は `hub-secret` |
+| ハブ: 接続（`/connections`） | `hub-grant-level`（クライアントごと・ホストごとの付与範囲） |
+| ハブ: ペアリング（`/pair?code=`） | まだ無し（`strong.code` と `button[name=decision][value=approve]` で探す） |
 
 ## 後片付け
 
@@ -132,8 +138,8 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 
 ## CI
 
-- `.github/workflows/e2e.yml`: プラグイン・protocol・ハブ・ハーネスに触れる PR、毎晩（固定の版と `newest`。`newest` の失敗はジョブを落とさない）、手動実行、リリースからの呼び出し。`artifacts/e2e/` をアップロードし、`summary.md` をジョブの概要に出します。
-- `.github/workflows/release.yml`: `v*` タグで、版の一致（`scripts/check-version.mjs`）、型検査・テスト・ハブのバンドル、E2E（ブラウザ確認）、プラグインの tarball、5 プラットフォームの CLI（`packages/cli/scripts/build-binaries.mjs` をネイティブのランナーで実行）、インストールスクリプト、全アセットの `SHA256SUMS`、`actions/attest-build-provenance` による来歴の証明、GitHub Release の作成。
+- `.github/workflows/e2e.yml`: プラグイン・protocol・ハブ・ハーネスに触れる PR と毎晩の実行は `--strict`（毎晩は固定の版と `newest`。`newest` の失敗はジョブを落とさない）。ほかに手動実行、リリースからの呼び出し。`artifacts/e2e/` をアップロードし、`summary.md` をジョブの概要に出します。
+- `.github/workflows/release.yml`: `v*` タグで、版の一致（`scripts/check-version.mjs`）、型検査・テスト・ハブのバンドル、E2E（全ステップ、`--strict`）、プラグインの tarball、5 プラットフォームの CLI（`packages/cli/scripts/build-binaries.mjs` をネイティブのランナーで実行）、インストールスクリプト、全アセットの `SHA256SUMS`、`actions/attest-build-provenance` による来歴の証明、GitHub Release の作成。
 
 ## 既知の制約
 
@@ -143,4 +149,5 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 - `dsh plugin add` は pnpm のメタデータを取りに npm レジストリへアクセスします。オフラインでは動きません。
 - サンドボックスなど `HTTPS_PROXY` がある環境では、Chromium を `--no-proxy-server` で起動します。プロキシ経由になると、非ループバックのアドレスへの WebSocket（`/api/remote.mux`）がプロキシに 403 で拒否され、DSH の不具合のように見えるためです。
 - `remote.*` は同じマシンの別アドレスから開くだけで、本当の別端末ではありません。DSH から見るとループバック以外の接続になる、という点だけを確かめます。
-- フローの `task.*` は、オーナーのパスキー登録・ペアリング・トークン発行・HTTP API がそろうまで skip になります。
+- 質問への遠隔回答は timed モードが前提です。プラン確認（`exit_plan_mode`）と承認は遠隔では答えられないため、フローでは扱いません。
+- トークンは個人トークンで作ります。OAuth＋PKCE の経路（`remora-cli`）はハブの単体テストと CLI 側の範囲で、このフローでは通しません。

@@ -12,7 +12,7 @@ const TABS: Tab[] = ['connection', 'permissions', 'scope', 'activity', 'compat']
 
 function KillSwitch({ snapshot, t, run, busy }: { snapshot: RemoraSnapshot; t: Translate; run: (method: string, payload?: unknown) => Promise<boolean>; busy: boolean }) {
   const on = snapshot.settings.killSwitch
-  return <div className="rmr-kill" data-on={on} id="kill-switch">
+  return <div className="rmr-kill" data-on={on} id="kill-switch" data-testid="remora-kill-switch">
     <div className="rmr-row-text">
       <span>{t('kill.title')}</span>
       <span className="rmr-muted">{on ? t('kill.active') : t('kill.hint')}</span>
@@ -37,7 +37,7 @@ export function RemoraPage({ ctx }: { ctx: ClientContext }) {
   const top = useRef<HTMLDivElement>(null)
   useEffect(() => { try { sessionStorage.setItem('dsh-remora:tab', tab) } catch { /* storage may be unavailable */ } }, [tab])
 
-  return <div className="rmr" ref={top}>
+  return <div className="rmr" ref={top} data-testid="remora-page">
     <div className="rmr-header">
       <div className="rmr-title-row">
         <h2 className="rmr-title">{t('title')}</h2>

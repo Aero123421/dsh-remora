@@ -12,7 +12,7 @@
 // DEEPSEEK_BASE_URL=<mock> sends every model call (and the session-log
 // contribution that rides on them) to e2e/lib/mock-llm.mjs. No settings,
 // catalog or Models-page edits are needed.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -109,4 +109,46 @@ export async function startWeb({ dsh, world, host = '127.0.0.1', port, mockUrl, 
   const match = await proc.waitFor(/dsh web: (https?:\/\/\S+)/, timeoutMs, 'the "dsh web: <url>" startup line')
   const url = new URL(match[1])
   return { proc, url: url.href, origin: url.origin, token: url.searchParams.get('token') }
+}
+
+/**
+ * Switch `ask_user_question` to DSH's `timed` mode in every agent preset.
+ *
+ * Remora can answer questions only in timed mode (a "continued" question is
+ * answered through `userQuestions.answer`); the default `legacy` mode holds
+ * the question inside DSH Web. The tool rows sit inside each preset's
+ * `config.plugins` list, which a loader patch cannot target by id, so the
+ * preset rows are copied from `dsh --dump-config` with a `config` added to
+ * their `tool-ask-user` row and appended to the world's overlay. A patch
+ * replaces a row's whole config, which is why the full preset is restated.
+ * @returns the ids of the patched presets
+ */
+export function enableTimedQuestions(world, dump, timeoutSeconds = 1) {
+  const blocks = []
+  let current
+  for (const line of dump.split('\n')) {
+    if (/^- id: /.test(line)) { current = [line]; blocks.push(current) }
+    else if (/^\S/.test(line)) current = undefined
+    else if (current) current.push(line)
+  }
+  const patched = []
+  const out = []
+  for (const block of blocks) {
+    const index = block.findIndex(line => /^\s*- id: tool-ask-user\s*$/.test(line))
+    if (index < 0) continue
+    const indent = /^(\s*)-/.exec(block[index])[1]
+    const lines = [...block]
+    for (let at = lines.length - 1; at >= 0; at--) {
+      if (!/^\s*- id: tool-ask-user\s*$/.test(lines[at])) continue
+      let end = at + 1
+      while (end < lines.length && lines[end].startsWith(`${indent}  `) && !lines[end].startsWith(`${indent}  config:`)) end++
+      if (lines[end]?.startsWith(`${indent}  config:`)) throw new Error('tool-ask-user already has a config; update enableTimedQuestions')
+      lines.splice(end, 0, `${indent}  config:`, `${indent}    mode: timed`, `${indent}    timeout: ${timeoutSeconds}`)
+    }
+    patched.push(/^- id: (\S+)/.exec(lines[0])[1])
+    out.push(...lines)
+  }
+  if (patched.length === 0) throw new Error('no agent preset with a tool-ask-user row in the composed Web profile')
+  appendFileSync(world.patch, [`# ask_user_question in timed mode (${timeoutSeconds} s) so Remora can answer questions.`, ...out, ''].join('\n'))
+  return patched
 }

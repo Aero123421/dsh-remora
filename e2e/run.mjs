@@ -16,7 +16,7 @@ import { Runner } from './lib/steps.mjs'
 import { childEnv, run, stopAll } from './lib/procs.mjs'
 import { PORTS, freePort, isFree } from './lib/ports.mjs'
 import { startMockLlm } from './lib/mock-llm.mjs'
-import { createWorld, dumpConfig, installDsh, installPlugin, removeWorld, startWeb } from './lib/dsh.mjs'
+import { createWorld, dumpConfig, enableTimedQuestions, installDsh, installPlugin, removeWorld, startWeb } from './lib/dsh.mjs'
 import { launchChromium } from './lib/browser.mjs'
 import { browserSteps } from './browser-check.mjs'
 import { flowSteps, stopFlow } from './flow.mjs'
@@ -143,7 +143,11 @@ await r.step('setup.plugin-install', 'dsh plugin --profile web add <tarball> (DS
   if (!profile.dsh?.profile?.bundles?.includes(pluginManifest.name)) throw new Error(`profile bundles do not include ${pluginManifest.name}: ${JSON.stringify(profile.dsh)}`)
   const dump = await dumpConfig({ dsh: ctx.dsh, world: ctx.world, logFile: join(artifacts, 'dsh-dump-config.log') })
   if (!new RegExp(`- id: ${pluginManifest.name}\\b`).test(dump)) throw new Error(`--dump-config has no ${pluginManifest.name} row`)
-  return `profile bundles: ${profile.dsh.profile.bundles.join(', ')}; composed tree has the ${pluginManifest.name} row`
+  const presets = enableTimedQuestions(ctx.world, dump)
+  const again = await dumpConfig({ dsh: ctx.dsh, world: ctx.world, logFile: join(artifacts, 'dsh-dump-config-timed.log') })
+  const timed = (again.match(/mode: timed/g) ?? []).length
+  if (timed < presets.length) throw new Error(`timed questions: patched ${presets.join(', ')} but the composed tree shows ${timed} timed row(s)`)
+  return `profile bundles: ${profile.dsh.profile.bundles.join(', ')}; composed tree has the ${pluginManifest.name} row; ask_user_question timed in ${presets.join(', ')}`
 })
 
 await r.step('setup.dsh-web', `dsh web on 127.0.0.1:${PORTS.dsh.join('–')} with the model pointed at the mock`, { needs: ['setup.plugin-install', 'setup.mock-llm'], timeoutMs: 150_000 }, async () => {
@@ -182,7 +186,12 @@ if (ctx.browser) {
       await input.press('Enter')
       await page.getByText('Which color should the E2E pick? (smoke2)', { exact: true }).filter({ visible: true }).first().waitFor({ timeout: 60_000 })
       const question = await shot(page, artifacts, 'browser-08-question-card')
-      return `${ctx.mock.requests.length} model request(s) served; ${reply}, ${question}`
+      // Answer it in DSH Web (timed mode: the answer arrives as a follow-up turn).
+      await page.getByText('Teal', { exact: true }).filter({ visible: true }).first().click()
+      await page.getByRole('button', { name: 'Submit', exact: true }).click()
+      await page.getByText(/REMORA-MOCK-ANSWERED smoke2/).filter({ visible: true }).first().waitFor({ timeout: 60_000 })
+      const answered = await shot(page, artifacts, 'browser-09-question-answered')
+      return `${ctx.mock.requests.length} model request(s) served; ${reply}, ${question}, ${answered}`
     })
   }
 
@@ -218,7 +227,7 @@ if (ctx.browser) {
       return `${ctx.web.origin}: the browser connects from ${address}, which DSH treats as a non-loopback client`
     })
     if (r.status('remote.dsh-web') === 'pass') {
-      const remoteOut = await browserSteps(r, { browser: ctx.browser, web: ctx.web, artifacts, plugin: pluginManifest, prefix: 'remote', label: 'remote' })
+      const remoteOut = await browserSteps(r, { browser: ctx.browser, web: ctx.web, artifacts, plugin: pluginManifest, prefix: 'remote', label: 'remote', local: false })
       if (remoteOut.session) ctx.sessions.push({ ...remoteOut.session, label: 'remote' })
     }
   }

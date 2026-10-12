@@ -34,7 +34,7 @@ on:
   workflow_call:
     inputs:
       only:
-        default: browser
+        default: all
         type: string
       dsh-version:
         default: ''
@@ -75,7 +75,7 @@ jobs:
         env:
           ONLY: ${{ inputs.only || 'all' }}
           DSH_VERSION: ${{ matrix.dsh || inputs.dsh-version || '' }}
-          STRICT: ${{ inputs.strict && '--strict' || '' }}
+          STRICT: ${{ (github.event_name == 'pull_request' || github.event_name == 'schedule' || inputs.strict) && '--strict' || '' }}
         run: |
           args="--only=${ONLY}"
           [ "$ONLY" = "all" ] && args=""

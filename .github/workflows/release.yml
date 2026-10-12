@@ -62,8 +62,8 @@ jobs:
       contents: read
     uses: ./.github/workflows/e2e.yml
     with:
-      only: browser
-      strict: false
+      only: all
+      strict: true
 
   plugin:
     name: Plugin tarball
