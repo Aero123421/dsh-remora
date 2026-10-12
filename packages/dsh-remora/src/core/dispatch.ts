@@ -55,7 +55,7 @@ export function denialError(layer: DenialLayer, reason: DenialReason, message = 
 }
 
 export function killSwitchError(): RemoraError {
-  return { code: 'denied', message: 'Remote access is stopped on this DSH host (kill switch).', denial: { layer: 'dsh', reason: 'switched-off' }, fix: 'dsh:settings/remora#kill-switch' }
+  return { code: 'denied', message: 'Remote access is stopped on this DSH host (kill switch).', denial: { layer: 'dsh', reason: 'kill-switch' }, fix: 'dsh:settings/remora#kill-switch' }
 }
 
 function sanitize(error: OperationError): RemoraError {
@@ -164,7 +164,7 @@ export class Dispatcher {
   private toError(error: unknown, frame: RequestFrame): RemoraError {
     if (error instanceof Refusal) return error.error
     if (error instanceof ConfirmationDenied) {
-      return { code: 'denied', message: `The passkey confirmation could not be verified on the DSH host (${error.failure}). Confirm again on the hub.`, fix: 'hub:/' }
+      return { code: 'denied', message: `The passkey confirmation could not be verified on the DSH host (${error.failure}). Confirm again on the hub.`, denial: { layer: 'dsh', reason: 'confirmation-failed' }, fix: 'hub:/' }
     }
     if (error instanceof DeadlineError) return { code: 'unavailable', message: 'The operation did not finish before the deadline.' }
     if (error instanceof OperationError) return sanitize(error)

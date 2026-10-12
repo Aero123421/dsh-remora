@@ -12,6 +12,16 @@
  * - Text that comes from a DSH session (titles, prompts, replies, questions)
  *   is untrusted data. Results that carry transcript text set `untrusted: true`.
  * - Times are epoch milliseconds. Cursors are opaque strings.
+ * - `hostId` fields in anything a host sends are overwritten by the hub with
+ *   the id of the host connection it arrived on; hosts may send `''`.
+ * - Task ids are minted by the hub as `<hostId>-<random>`; the hub routes
+ *   ledger operations (task.get / task.wait / task.resubmit) by that prefix.
+ * - `task.start` is accepted while the host is offline: the hub parks it
+ *   (state `parked`) and delivers it when the host reconnects, or fails it
+ *   after an hour. `task.steer`, `task.resubmit` and every other operation
+ *   fail fast with `host_offline`.
+ * - A task's own final reply (`TaskInfo.result.reply`) is returned to callers
+ *   with `dsh.tasks` or `dsh.content`; other transcript text needs `dsh.content`.
  */
 import type { RemoraError } from './errors.ts'
 import type { AttentionKind, TaskState } from './operations.ts'

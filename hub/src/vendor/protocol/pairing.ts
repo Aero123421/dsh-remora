@@ -69,3 +69,15 @@ export function formatUserCode(code: string): string {
 export function normalizeUserCode(input: string): string {
   return input.toUpperCase().replace(/[^A-Z0-9]/g, '')
 }
+
+export interface UnpairRequest {
+  hostId: string
+  issuedAt: number
+  /** Ed25519 signature over `unpairMessage(hubOrigin, hostId, issuedAt)`, base64url. */
+  signature: string
+}
+
+/** Signed by the host to remove itself from the hub (accepted within 5 minutes of `issuedAt`). */
+export function unpairMessage(hubOrigin: string, hostId: string, issuedAt: number): string {
+  return ['remora-unpair/v1', hubOrigin, hostId, String(issuedAt)].join('\n')
+}

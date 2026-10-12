@@ -329,12 +329,12 @@ export function harness(fakeDsh: FakeDsh, scope: ScopeOptions = {}) {
 }
 
 let requestCounter = 0
-export function context(options: { taskId?: string; content?: boolean; clientId?: string } = {}): OperationContext {
+export function context(options: { taskId?: string; content?: boolean; clientId?: string; scopes?: string[] } = {}): OperationContext {
   return {
     actor: { clientId: options.clientId ?? 'client-1', clientName: 'Test' },
     requestId: `req-${++requestCounter}`,
     ...(options.taskId ? { taskId: options.taskId } : {}),
-    scopes: options.content === false ? ['dsh.read', 'dsh.tasks'] : ['dsh.read', 'dsh.content', 'dsh.tasks'],
+    scopes: options.scopes ?? (options.content === false ? ['dsh.read', 'dsh.tasks'] : ['dsh.read', 'dsh.content', 'dsh.tasks']),
     signal: new AbortController().signal,
   }
 }

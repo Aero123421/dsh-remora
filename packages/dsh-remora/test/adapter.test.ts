@@ -179,7 +179,10 @@ test('a task completes when its turn ended, the session is idle, the queue is em
   const info = await handlers['task.get']({ taskId: 't1' }, context())
   assert.equal(info.state, 'completed')
   assert.equal(info.result?.reply, 'all done')
-  const hidden = await handlers['task.get']({ taskId: 't1' }, context({ content: false }))
+  // The task's own reply is visible with dsh.tasks; read-only clients do not get it.
+  const own = await handlers['task.get']({ taskId: 't1' }, context({ content: false }))
+  assert.equal(own.result?.reply, 'all done')
+  const hidden = await handlers['task.get']({ taskId: 't1' }, context({ scopes: ['dsh.read'] }))
   assert.equal(hidden.result?.reply, null)
   await rejects(handlers['task.get']({ taskId: 't1' }, context({ clientId: 'someone-else' })), 'not_found')
   adapter.dispose()

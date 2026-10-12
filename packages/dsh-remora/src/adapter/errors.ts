@@ -11,7 +11,7 @@ export function isRemoteError(error: unknown): error is DshRemoteErrorLike {
 
 /** Scope refusal on the DSH side (workspace/session not reachable from outside). */
 export function denied(message: string): OperationError {
-  return new OperationError('denied', message, { denial: { layer: 'dsh', reason: 'switched-off' }, fix: fixFor('dsh') })
+  return new OperationError('denied', message, { denial: { layer: 'dsh', reason: 'out-of-scope' }, fix: fixFor('dsh') })
 }
 
 export function invalid(message: string): OperationError {

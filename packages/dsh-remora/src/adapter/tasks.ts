@@ -194,7 +194,7 @@ export class Tasks {
       if (turns.length > 0) {
         const reply = spanReply(events, turns)
         info.result = {
-          reply: hasContent(context) && reply !== null ? redactTruncate(reply, 20_000).text : null,
+          reply: (hasContent(context) || context.scopes.includes('dsh.tasks')) && reply !== null ? redactTruncate(reply, 20_000).text : null,
           changes: this.turnChanges(record.sessionId, events, turns),
           deliverables: presentedFiles(events, turns).map((file): DeliverableRef => ({
             deliverableId: file.deliverableId,

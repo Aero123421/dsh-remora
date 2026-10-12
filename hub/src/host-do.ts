@@ -8,6 +8,7 @@
  * The plugin is the final authority on permissions; `decide()` runs here
  * only to fail early and to explain denials.
  */
+import { stampHostId } from './stamp.ts'
 import { DurableObject } from 'cloudflare:workers'
 import { AUDIT_SCHEMA, appendAudit, listAudit, type AuditRow } from './audit.ts'
 import { PARKED_TASK_TTL_MS, RELAY_TIMEOUT_MS } from './config.ts'
@@ -333,7 +334,7 @@ export class HostDO extends DurableObject<Env> {
         return
       }
       case 'attention': {
-        const items = Array.isArray(event.items) ? event.items : []
+        const items = stampHostId(Array.isArray(event.items) ? event.items : [], this.hostId ?? '')
         if (items.length === 0) this.sql.exec('DELETE FROM attention WHERE session_id = ?', event.sessionId)
         else this.sql.exec('INSERT INTO attention (session_id, items, updated_at) VALUES (?, ?, ?) ON CONFLICT (session_id) DO UPDATE SET items = excluded.items, updated_at = excluded.updated_at', event.sessionId, JSON.stringify(items), Date.now())
         return
@@ -458,7 +459,7 @@ export class HostDO extends DurableObject<Env> {
     const decision = decide({ operation: call.op, ceiling, hubGrant: call.grant, tokenScopes: call.scopes, now: Date.now() })
     if (!decision.allowed) return { ok: false, error: denied(decision.layer, decision.reason, call.op) }
     if (this.info('kill_switch') === '1') {
-      return { ok: false, error: err('denied', 'Remote access is stopped with the emergency switch on the DSH host.', { denial: { layer: 'dsh', reason: 'switched-off' }, fix: 'dsh:settings/remora#kill-switch' }) }
+      return { ok: false, error: err('denied', 'Remote access is stopped with the emergency switch on the DSH host.', { denial: { layer: 'dsh', reason: 'kill-switch' }, fix: 'dsh:settings/remora#kill-switch' }) }
     }
     if (call.op === 'task.get' || call.op === 'task.wait') return this.taskQuery(call)
     const operations = this.operations()
@@ -470,7 +471,7 @@ export class HostDO extends DurableObject<Env> {
     if (!ws) return { ok: false, error: err('host_offline', 'The DSH host is offline. Start DSH Web on that machine and try again.') }
     const frame = await this.relay(ws, call.requestId ?? `r_${randomToken(12)}`, call, RELAY_TIMEOUT_MS)
     if (!frame) return { ok: false, error: err('unavailable', 'The DSH host did not answer in time.') }
-    return frame.ok ? { ok: true, result: frame.result ?? null } : { ok: false, error: frame.error ?? err('internal', 'The host returned an error without details.') }
+    return frame.ok ? { ok: true, result: stampHostId(frame.result ?? null, this.hostId ?? "") } : { ok: false, error: frame.error ?? err('internal', 'The host returned an error without details.') }
   }
 
   // --- task ledger ------------------------------------------------------------------------------
@@ -571,7 +572,7 @@ export class HostDO extends DurableObject<Env> {
       if (frame?.ok && frame.result && typeof frame.result === 'object') {
         const fromHost = frame.result as Partial<TaskInfo>
         if (fromHost.result) info.result = fromHost.result
-        if (fromHost.attention) info.attention = fromHost.attention
+        if (fromHost.attention) info.attention = stampHostId(fromHost.attention, this.hostId ?? '')
         if (fromHost.hasLiveClient !== undefined) info.hasLiveClient = fromHost.hasLiveClient
         if (fromHost.error && !info.error) info.error = fromHost.error
       }
@@ -656,6 +657,9 @@ const DENIAL_TEXT: Record<string, string> = {
   'forbidden-remotely': 'is never allowed remotely',
   'level-too-low': 'needs a higher permission level',
   'switched-off': 'is switched off',
+  'kill-switch': 'is stopped by the kill switch on the DSH host',
+  'confirmation-failed': 'needs a valid passkey confirmation',
+  'out-of-scope': 'is outside the workspaces allowed on the DSH host',
   'full-access-expired': 'needs remote full access, which has expired',
   'missing-scope': 'is outside the scopes granted to this token',
   'unknown-operation': 'is not a known operation',

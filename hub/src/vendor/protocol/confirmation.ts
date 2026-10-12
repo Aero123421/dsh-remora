@@ -18,6 +18,11 @@
  *      verifies with the pinned COSE key.
  *   5. `issuedAt` is within CONFIRMATION_TTL_MS of now, and the requestId has
  *      not been confirmed before.
+ *
+ * `params` in the subject is exactly the `params` object of the request frame
+ * (after the hub filled in `hostId`), or `{}` when the frame has none. The hub
+ * UI must therefore send the final params, hostId included, when it asks for
+ * the challenge, and the request frame id must equal `requestId`.
  */
 import { canonicalJson, sha256, toBase64Url } from './encoding.ts'
 import { OPERATIONS } from './operations.ts'

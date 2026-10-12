@@ -40,6 +40,12 @@ export type DenialReason =
   | 'full-access-expired'
   | 'missing-scope'
   | 'unknown-operation'
+  /** The kill switch on the DSH host is on. */
+  | 'kill-switch'
+  /** A dangerous operation lacked a valid passkey confirmation. */
+  | 'confirmation-failed'
+  /** The session or workspace is outside what the DSH settings tab allows. */
+  | 'out-of-scope'
 
 export interface DecideInput {
   operation: OperationId | string

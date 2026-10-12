@@ -12,12 +12,33 @@ export const ENDPOINTS = {
   pairApprove: '/pair',
   authorize: '/oauth/authorize',
   token: '/oauth/token',
+  /** RFC 7009 token revocation (also advertised as `revocation_endpoint`). */
+  revocation: '/oauth/revoke',
+  /** A paired host removes itself (signed with its host key; see pairing.ts `unpairMessage`). */
+  hostUnpair: '/pair/unpair',
   /** RFC 8628 device authorization (CLI over SSH). */
   deviceAuthorization: '/oauth/device_authorization',
   /** Owner-facing page where a device code is entered. */
   deviceVerify: '/device',
   authorizationServerMetadata: '/.well-known/oauth-authorization-server',
   protectedResourceMetadata: '/.well-known/oauth-protected-resource',
+} as const
+
+/**
+ * OAuth resource indicators (RFC 8707). Tokens are bound to one audience:
+ * MCP tokens do not work on the HTTP API and the other way round.
+ */
+export function resourceIndicators(hubOrigin: string): { mcp: string; api: string } {
+  return { mcp: `${hubOrigin}/mcp`, api: `${hubOrigin}/api/v1/ops` }
+}
+
+/** Names of release assets on GitHub Releases. */
+export const RELEASE_ASSETS = {
+  plugin: (version: string) => `dsh-remora-${version}.tgz`,
+  cli: (platform: string, arch: string) => `remora-${platform}-${arch}${platform === 'win32' ? '.exe' : ''}`,
+  checksums: 'SHA256SUMS',
+  installSh: 'install.sh',
+  installPs1: 'install.ps1',
 } as const
 
 export function hostSocketPath(hostId: string): string {
