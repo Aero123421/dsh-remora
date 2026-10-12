@@ -5,7 +5,7 @@
  */
 import { exports } from 'cloudflare:workers'
 import { expect } from 'vitest'
-import { fromBase64Url, hostAuthMessage, pairPollMessage, toBase64Url, type HubFrame } from '../../src/vendor/protocol/index.ts'
+import { fromBase64Url, hostAuthMessage, pairPollMessage, rotateKeyMessage, toBase64Url, type HubFrame } from '../../src/vendor/protocol/index.ts'
 
 export const ORIGIN = 'https://hub.example.com'
 export const SETUP_TOKEN = 'test-setup-token-0123456789'
@@ -217,6 +217,10 @@ export class FakeHost {
   private waiting: ((frame: HubFrame) => void)[] = []
   /** Answers request frames; return undefined to stay silent. */
   respond: (frame: Extract<HubFrame, { t: 'request' }>) => unknown = () => ({ ok: true, result: {} })
+  /** Key rotation like the plugin: prove a new key, switch to it on commit and reconnect. `bad-proof` signs wrongly. */
+  rotation: 'follow' | 'bad-proof' | 'ignore' = 'follow'
+  private lastHello: Parameters<FakeHost['connect']>[0] = {}
+  private nextKeys: CryptoKeyPair | null = null
 
   static async create(): Promise<FakeHost> {
     const host = new FakeHost()
@@ -250,6 +254,7 @@ export class FakeHost {
   }
 
   async connect(hello: Partial<{ operations: string[]; ceiling: unknown; killSwitch: boolean; protocol: number }> = {}, options: { badSignature?: boolean } = {}): Promise<void> {
+    this.lastHello = hello
     const response = await hubFetch(`/ws/host/${this.hostId}`, { headers: { upgrade: 'websocket' } })
     expect(response.status).toBe(101)
     const socket = response.webSocket as WebSocket
@@ -267,6 +272,8 @@ export class FakeHost {
         const answer = this.respond(frame) as { ok: boolean; result?: unknown; error?: unknown } | undefined
         if (answer) socket.send(JSON.stringify({ t: 'response', id: frame.id, ...answer }))
       }
+      if (frame.t === 'rotate-key' && this.rotation !== 'ignore') void this.proveNewKey(socket, frame.nonce, frame.issuedAt)
+      if (frame.t === 'rotate-key-commit' && this.nextKeys) void this.switchKeys()
     })
     const challenge = await this.next('challenge')
     if (challenge.t !== 'challenge') throw new Error('expected a challenge')
@@ -277,6 +284,25 @@ export class FakeHost {
     }))
     const message = hostAuthMessage(challenge.origin, this.hostId, challenge.nonce, challenge.issuedAt)
     socket.send(JSON.stringify({ t: 'auth', nonce: challenge.nonce, signature: options.badSignature ? await this.sign('wrong') : await this.sign(message) }))
+  }
+
+  private async proveNewKey(socket: WebSocket, nonce: string, issuedAt: number): Promise<void> {
+    const next = (await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify'])) as CryptoKeyPair
+    const publicKey = toBase64Url(new Uint8Array((await crypto.subtle.exportKey('raw', next.publicKey)) as ArrayBuffer))
+    const message = new TextEncoder().encode(rotateKeyMessage(ORIGIN, this.hostId, nonce, issuedAt, publicKey))
+    const signature = toBase64Url(new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, this.keys.privateKey, message)))
+    const newSignature = toBase64Url(new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, (this.rotation === 'bad-proof' ? this.keys : next).privateKey, message)))
+    this.nextKeys = next
+    socket.send(JSON.stringify({ t: 'rotate-key-proof', nonce, publicKey, signature, newSignature }))
+  }
+
+  private async switchKeys(): Promise<void> {
+    const next = this.nextKeys as CryptoKeyPair
+    this.nextKeys = null
+    this.keys = next
+    this.publicKey = toBase64Url(new Uint8Array((await crypto.subtle.exportKey('raw', next.publicKey)) as ArrayBuffer))
+    this.socket?.close(1000, 'reconnecting with the new key')
+    await this.connect(this.lastHello)
   }
 
   /** Resolve with the next frame of the given type (already received or future). */

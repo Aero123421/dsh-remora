@@ -13,7 +13,10 @@ import { CHALLENGE_TTL_MS, DEVICE_CODE_TTL_MS, DEVICE_POLL_INTERVAL_S, FULL_ACCE
 import { PUSH_TYPES, type CallContext, type ClientKind, type ClientRecord, type ClientWithGrants, type DeviceInfo, type DevicePoll, type GrantLevel, type GrantSetting, type HostRecord, type HubState, type MeterTotals, type OwnerCredential, type PairingInfo, type PasskeyRecord, type PersonalTokenRecord, type PushDevice, type PushEvent, type PushOutcome, type PushType } from './types.ts'
 import { buildPushRequest, generateVapidKeys, type VapidKeys } from './webpush.ts'
 import { base32, parseJson, randomBytes, randomCode, randomToken, sha256Hex, utcDay, verifyEd25519 } from './util.ts'
-import { PAIRING_POLL_INTERVAL_MS, PAIRING_TTL_MS, USER_CODE_ALPHABET, pairPollMessage, type Grant, type PairPollResponse, type PairStartRequest } from './vendor/protocol/index.ts'
+import {
+  CONFIRMATION_REQUEST_TTL_MS, HUB_CONFIRMATION_PREFIX, PAIRING_POLL_INTERVAL_MS, PAIRING_TTL_MS, TASK_WAIT_MAX_MS, USER_CODE_ALPHABET, pairPollMessage,
+  type ConfirmationState, type Grant, type PairPollResponse, type PairStartRequest,
+} from './vendor/protocol/index.ts'
 
 export const HUB_OBJECT_NAME = 'hub'
 
@@ -21,6 +24,23 @@ export const HUB_OBJECT_NAME = 'hub'
 export const PUSH_MAX_DEVICES = 20
 /** Per device: at most this many pushes per window (seconds); more are dropped. */
 export const PUSH_RATE: readonly [number, number] = [30, 600]
+
+/** Hub maintenance requests one client may have waiting for the owner at once. */
+export const APPROVALS_PENDING_PER_CLIENT = 5
+/** An approved export can be fetched for this long; then only the outcome remains. */
+export const APPROVAL_RESULT_MS = 60 * 60_000
+
+/** A hub maintenance request (audit.export, hub.export) parked for the owner. */
+export interface ApprovalRecord {
+  id: string
+  clientId: string
+  clientName: string
+  operation: string
+  state: ConfirmationState
+  createdAt: number
+  expiresAt: number
+  decidedAt: number | null
+}
 
 export const PAIRING_MAX_PER_SOURCE = 3
 export const PAIRING_SOFT_CAP = 20
@@ -127,6 +147,17 @@ const SCHEMA = `
     created_at INTEGER NOT NULL,
     last_sent_at INTEGER,
     last_error TEXT
+  );
+  CREATE TABLE IF NOT EXISTS approvals (
+    id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    client_name TEXT NOT NULL,
+    op TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    decided_at INTEGER,
+    updated_at INTEGER NOT NULL
   );
   ${AUDIT_SCHEMA}
 `
@@ -811,6 +842,118 @@ export class HubDO extends DurableObject<Env> {
       }
     }))
     return outcome
+  }
+
+  // --- hub maintenance parked for the owner (OWNER_APPROVED_OPERATIONS) ------------
+
+  private readonly approvalWaiters = new Map<string, Set<() => void>>()
+
+  private approvalRow(id: string): ApprovalRecord | null {
+    const row = this.sql.exec<{ id: string; client_id: string; client_name: string; op: string; state: string; created_at: number; expires_at: number; decided_at: number | null }>(
+      'SELECT id, client_id, client_name, op, state, created_at, expires_at, decided_at FROM approvals WHERE id = ?', id,
+    ).toArray()[0]
+    return row ? { id: row.id, clientId: row.client_id, clientName: row.client_name, operation: row.op, state: row.state as ConfirmationState, createdAt: row.created_at, expiresAt: row.expires_at, decidedAt: row.decided_at } : null
+  }
+
+  /** Pending past their deadline → expired; old settled rows are dropped. */
+  private settleApprovals(now = Date.now()): void {
+    const overdue = this.sql.exec<{ id: string }>("SELECT id FROM approvals WHERE state = 'pending' AND expires_at <= ?", now).toArray()
+    for (const { id } of overdue) {
+      this.sql.exec("UPDATE approvals SET state = 'expired', updated_at = ? WHERE id = ?", now, id)
+      this.wakeApproval(id)
+    }
+    this.sql.exec("DELETE FROM approvals WHERE state != 'pending' AND updated_at < ?", now - 7 * 24 * 60 * 60_000)
+  }
+
+  private wakeApproval(id: string): void {
+    for (const wake of this.approvalWaiters.get(id) ?? []) wake()
+    this.approvalWaiters.delete(id)
+  }
+
+  /** Park a client's call. Refuses when the client already has too many waiting. */
+  async requestApproval(clientId: string, clientName: string, operation: string, origin: string | null): Promise<ApprovalRecord | { error: 'too_many' }> {
+    const now = Date.now()
+    this.settleApprovals(now)
+    if (this.count("SELECT COUNT(*) AS n FROM approvals WHERE state = 'pending' AND client_id = ?", clientId) >= APPROVALS_PENDING_PER_CLIENT) return { error: 'too_many' }
+    const id = `${HUB_CONFIRMATION_PREFIX}${base32(randomBytes(10))}`
+    this.sql.exec(
+      "INSERT INTO approvals (id, client_id, client_name, op, state, created_at, expires_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+      id, clientId, clientName.slice(0, 200), operation, now, now + CONFIRMATION_REQUEST_TTL_MS, now,
+    )
+    await this.audit({ actor: clientId, actorName: clientName, operation: `${operation}.requested`, hostId: null, outcome: 'ok', layer: null, reason: null })
+    const what = operation === 'audit.export' ? '監査ログの書き出し' : operation === 'hub.export' ? 'ハブ設定の書き出し' : operation
+    this.ctx.waitUntil(this.notify([{ type: 'attention', kind: 'confirmation', hostId: null, host: 'ハブ', title: `${clientName.slice(0, 40)}: ${what}`, url: `/confirm/hub/${id}`, expiresAt: now + CONFIRMATION_REQUEST_TTL_MS }], origin).catch(() => undefined))
+    return this.approvalRow(id) as ApprovalRecord
+  }
+
+  /** One request; with `clientId`, only that client's own. Waits up to `timeoutMs` while it is pending. */
+  async approvalFor(id: string, clientId?: string, timeoutMs = 0): Promise<ApprovalRecord | null> {
+    this.settleApprovals()
+    const visible = (row: ApprovalRecord | null) => (row && (clientId === undefined || row.clientId === clientId) ? row : null)
+    const row = visible(this.approvalRow(id))
+    if (!row || row.state !== 'pending' || timeoutMs <= 0) return row
+    const wait = Math.min(TASK_WAIT_MAX_MS, timeoutMs, Math.max(0, row.expiresAt - Date.now()) + 50)
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(() => {
+        this.approvalWaiters.get(id)?.delete(wake)
+        resolve()
+      }, wait)
+      const wake = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+      const set = this.approvalWaiters.get(id) ?? new Set()
+      set.add(wake)
+      this.approvalWaiters.set(id, set)
+    })
+    this.settleApprovals()
+    return visible(this.approvalRow(id))
+  }
+
+  async pendingApprovals(): Promise<ApprovalRecord[]> {
+    this.settleApprovals()
+    return this.sql.exec<{ id: string }>("SELECT id FROM approvals WHERE state = 'pending' ORDER BY created_at").toArray().map(({ id }) => this.approvalRow(id) as ApprovalRecord)
+  }
+
+  /** The owner approved (after a passkey re-authentication) or refused. False when it is no longer pending. */
+  async decideApproval(id: string, approve: boolean): Promise<boolean> {
+    this.settleApprovals()
+    const row = this.approvalRow(id)
+    if (!row || row.state !== 'pending') return false
+    const now = Date.now()
+    this.sql.exec('UPDATE approvals SET state = ?, decided_at = ?, updated_at = ? WHERE id = ?', approve ? 'done' : 'denied', now, now, id)
+    await this.audit({ actor: 'owner', actorName: 'オーナー', operation: `${row.operation}.${approve ? 'approved' : 'refused'}`, hostId: null, outcome: approve ? 'ok' : 'denied', layer: null, reason: row.clientId })
+    this.wakeApproval(id)
+    return true
+  }
+
+  /** Settings for hub.export: everything but secrets (no token values, endpoints or keys of devices, no recovery codes). */
+  async exportSettings(): Promise<{
+    allowOtherClients: boolean
+    hosts: { hostId: string; name: string; publicKeyFingerprint: string; pairedAt: number; revokedAt: number | null }[]
+    clients: { clientId: string; name: string; kind: string; createdAt: number; lastUsedAt: number | null; revokedAt: number | null; grants: { hostId: string; level: string; overrides: Record<string, boolean>; fullAccessExpiresAt: number | null }[] }[]
+    personalTokens: PersonalTokenRecord[]
+    passkeys: { credentialId: string; label: string; algorithm: number; createdAt: number; lastUsedAt: number | null }[]
+    pushDevices: { label: string; types: string[]; createdAt: number; lastSentAt: number | null }[]
+  }> {
+    const state = await this.state()
+    const hosts = await Promise.all((await this.listHosts(true)).map(async host => ({ hostId: host.hostId, name: host.name, publicKeyFingerprint: (await sha256Hex(host.publicKey)).slice(0, 16), pairedAt: host.pairedAt, revokedAt: host.revokedAt })))
+    const clients = (await this.listClients()).map(client => ({
+      clientId: client.clientId, name: client.name, kind: client.kind, createdAt: client.createdAt, lastUsedAt: client.lastUsedAt, revokedAt: client.revokedAt,
+      grants: client.grants.map(grant => ({ hostId: grant.hostId, level: grant.level, overrides: { ...(grant.overrides ?? {}) } as Record<string, boolean>, fullAccessExpiresAt: grant.fullAccessExpiresAt })),
+    }))
+    const passkeys = (await this.listPasskeys()).map(passkey => ({ credentialId: passkey.credentialId, label: passkey.label, algorithm: passkey.algorithm, createdAt: passkey.createdAt, lastUsedAt: passkey.lastUsedAt }))
+    const pushDevices = (await this.listPushDevices()).map(device => ({ label: device.label, types: [...device.types], createdAt: device.createdAt, lastSentAt: device.lastSentAt }))
+    return { allowOtherClients: state.allowOtherClients, hosts, clients, personalTokens: await this.listPersonalTokens(), passkeys, pushDevices }
+  }
+
+  /** A host proved a new key (host.rotate-key) and authenticated with it: it replaces the paired key. */
+  async replaceHostKey(hostId: string, publicKey: string): Promise<boolean> {
+    const row = this.sql.exec<{ revoked_at: number | null }>('SELECT revoked_at FROM hosts WHERE host_id = ?', hostId).toArray()[0]
+    if (!row || row.revoked_at !== null) return false
+    this.sql.exec('UPDATE hosts SET public_key = ? WHERE host_id = ?', publicKey, hostId)
+    await this.audit({ actor: 'host', actorName: 'ホスト', operation: 'host.key-rotated', hostId, outcome: 'ok', layer: null, reason: (await sha256Hex(publicKey)).slice(0, 16) })
+    return true
   }
 
   // --- audit --------------------------------------------------------------------

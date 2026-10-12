@@ -4,15 +4,17 @@
  * the host Durable Object (or answer hub operations here).
  */
 import { stampAnswerUrls } from './attention.ts'
-import { FREE_TIER, RATE_LIMITS } from './config.ts'
+import { AUDIT_MAX_ROWS, FREE_TIER, RATE_LIMITS, dcrEnabled } from './config.ts'
 import type { ConfirmationView, ExecuteResult, HostLive } from './host-do.ts'
 import { denied } from './host-do.ts'
+import { APPROVAL_RESULT_MS, type ApprovalRecord } from './hub-do.ts'
+import { HUB_VERSION } from './version.ts'
 import { hostStub, hubStub } from './meter.ts'
 import type { CallContext } from './types.ts'
 import { hostIdOfTask } from './util.ts'
 import {
-  CONFIRMATION_LEDGER_OPERATIONS, HUB_OPERATIONS, INPUT_SCHEMAS, TASK_LEDGER_OPERATIONS, decide, findOperation, validateParams,
-  type Confirmation, type Grant, type HostSummary, type OperationId, type RemoraError, type StatusResult,
+  CONFIRMATION_LEDGER_OPERATIONS, HUB_CONFIRMATION_PREFIX, HUB_MAINTENANCE_OPERATIONS, HUB_OPERATIONS, INPUT_SCHEMAS, TASK_LEDGER_OPERATIONS, decide, findOperation, validateParams,
+  type AuditExportResult, type Confirmation, type ConfirmationInfo, type Grant, type HostSummary, type HubExportResult, type OperationId, type RemoraError, type StatusResult,
 } from './vendor/protocol/index.ts'
 
 export interface Caller {
@@ -83,6 +85,24 @@ async function runOperationInner(env: Env, caller: Caller, op: string, rawParams
   if (!context.ok) {
     if (context.error === 'rate_limited') return err('rate_limited', 'Too many calls from this client; slow down and retry in a minute.')
     return err('denied', 'This client was disconnected on the hub.', { denial: { layer: 'hub', reason: 'switched-off' }, fix: 'hub:/connections' })
+  }
+
+  if (HUB_MAINTENANCE_OPERATIONS.has(op)) {
+    // Parked until the owner approves it on the hub page; then confirmation.get carries the result.
+    const decision = decide({ operation: op, ceiling: { level: 'full' }, hubGrant: { level: 'view' }, tokenScopes: caller.scopes, now: Date.now() })
+    if (!decision.allowed) return { ok: false, error: denied(decision.layer, decision.reason, op) }
+    const parked = await hubStub(env).requestApproval(caller.clientId, caller.clientName, op, options.origin ?? null)
+    if ('error' in parked) return err('rate_limited', 'This client already has 5 requests waiting for the owner; wait until the owner answers them or they expire (10 minutes).')
+    return { ok: true, result: await approvalInfo(env, parked, options.origin) }
+  }
+
+  if (CONFIRMATION_LEDGER_OPERATIONS.has(op) && typeof params.confirmationId === 'string' && params.confirmationId.startsWith(HUB_CONFIRMATION_PREFIX)) {
+    const decision = decide({ operation: op, ceiling: { level: 'full' }, hubGrant: { level: 'view' }, tokenScopes: caller.scopes, now: Date.now() })
+    if (!decision.allowed) return { ok: false, error: denied(decision.layer, decision.reason, op) }
+    const timeoutMs = typeof params.timeoutMs === 'number' ? params.timeoutMs : 0
+    const row = await hubStub(env).approvalFor(params.confirmationId, caller.kind === 'owner' ? undefined : caller.clientId, timeoutMs)
+    if (!row) return err('not_found', 'No confirmation with this id is known to the hub for this client.')
+    return { ok: true, result: await approvalInfo(env, row, options.origin) }
   }
 
   if (HUB_OPERATIONS.has(op)) {
@@ -195,6 +215,46 @@ export function confirmations(env: Env, hostId: string) {
     run: (id: string, input: { requestId: string; confirmation: Confirmation; grant: Grant | null; origin?: string }) =>
       host.confirmRun(id, input) as unknown as Promise<ExecuteResult>,
     deny: (id: string) => host.denyConfirmation(id) as Promise<boolean>,
+  }
+}
+
+/** A parked hub maintenance request as clients see it; an approved export carries its result for an hour. */
+async function approvalInfo(env: Env, row: ApprovalRecord, origin: string | undefined): Promise<ConfirmationInfo> {
+  const info: ConfirmationInfo = { confirmationId: row.id, hostId: '', operation: row.operation, state: row.state, createdAt: row.createdAt, expiresAt: row.expiresAt }
+  if (origin) info.confirmUrl = `${origin}/confirm/hub/${row.id}`
+  if (row.state === 'done' && row.decidedAt !== null && Date.now() - row.decidedAt < APPROVAL_RESULT_MS) info.result = await maintenanceResult(env, row.operation, origin ?? '')
+  return info
+}
+
+/** Built when asked for, never stored: the hub's audit chains, or its settings without secrets. */
+export async function maintenanceResult(env: Env, op: string, origin: string): Promise<AuditExportResult | HubExportResult> {
+  const hub = hubStub(env)
+  if (op === 'hub.export') {
+    const settings = await hub.exportSettings()
+    return {
+      format: 'remora-hub-export/v1',
+      exportedAt: Date.now(),
+      hubOrigin: origin,
+      hubVersion: HUB_VERSION,
+      settings: { allowOtherClients: settings.allowOtherClients, dynamicClientRegistration: dcrEnabled(env) },
+      hosts: settings.hosts,
+      clients: settings.clients,
+      personalTokens: settings.personalTokens,
+      passkeys: settings.passkeys,
+      pushDevices: settings.pushDevices,
+    }
+  }
+  // Every kept row: pruning runs every 50 appends, so a log can hold a few more than the cap.
+  const limit = AUDIT_MAX_ROWS + 100
+  const hosts = await hub.listHosts(true)
+  const [hubRows, ...hostRows] = await Promise.all([hub.listAudit(limit), ...hosts.map(host => hostStub(env, host.hostId).listAudit(limit))])
+  return {
+    exportedAt: Date.now(),
+    hubOrigin: origin,
+    logs: [
+      { log: 'hub', name: 'hub', records: [...(hubRows ?? [])].reverse() },
+      ...hosts.map((host, index) => ({ log: host.hostId, name: host.name, records: [...(hostRows[index] ?? [])].reverse() })),
+    ],
   }
 }
 

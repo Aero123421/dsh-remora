@@ -12,16 +12,16 @@ import type { HostLive, PendingConfirmation } from '../host-do.ts'
 import { html, json, readForm, readJson, redirect, sameOrigin } from '../http.ts'
 import { hostStub, hubStub } from '../meter.ts'
 import { oauthEnv, oauthFor, resourcesFor } from '../oauth.ts'
-import { confirmations, finalParams, liveHosts, ownerGrant, refreshParked, revokeHostEverywhere, runOperation, type Caller } from '../ops.ts'
+import { confirmations, finalParams, liveHosts, maintenanceResult, ownerGrant, refreshParked, revokeHostEverywhere, runOperation, type Caller } from '../ops.ts'
 import { PUSH_TYPES, type ClientWithGrants, type GrantLevel, type PushType } from '../types.ts'
 import { isPushEndpoint, isSubscriptionKey } from '../webpush.ts'
 import { safeNext } from '../next.ts'
 import { randomToken } from '../util.ts'
 import { HUB_VERSION } from '../version.ts'
 import {
-  CLI_CLIENT_ID, LEVEL_RANK, PROTOCOL_VERSION, SCOPES,
+  CLI_CLIENT_ID, LEVEL_RANK, OWNER_APPROVED_OPERATIONS, PROTOCOL_VERSION, SCOPES,
   type AttentionItem, type Confirmation, type ConfirmationInfo, type HostSummary, type RemoraError, type ScheduleInfo, type SearchHit, type SessionForkResult,
-  type SessionGetResult, type SessionSummary, type TaskInfo, type TerminalRunOutput, type WorkspaceSummary,
+  type HostRotateKeyResult, type SessionGetResult, type SessionSummary, type TaskInfo, type TerminalRunOutput, type WorkspaceSummary,
 } from '../vendor/protocol/index.ts'
 import { whenFromForm } from './schedule-form.ts'
 import { ATTENTION_LABEL, LEVEL_LABEL, STATE_LABEL, dateTime, flash, h, page, raw, reauthForm, relativeTime, visibleText, type NavKey, type Raw } from './layout.ts'
@@ -54,6 +54,8 @@ const MESSAGES: Readonly<Record<string, [string, 'ok' | 'error']>> = {
   'schedule-created': ['スケジュールを追加しました。', 'ok'],
   'schedule-deleted': ['スケジュールを削除しました。', 'ok'],
   'schedule-gone': ['そのスケジュールはもうありませんでした。', 'ok'],
+  'approved': ['承認しました。依頼したクライアントが結果を受け取れます（1 時間）。', 'ok'],
+  'key-rotated': ['ホスト鍵を更新しました。ホストは新しい鍵でつなぎ直しました。', 'ok'],
 }
 
 function message(url: URL): Raw {
@@ -136,14 +138,16 @@ function loginPage(url: URL): Response {
 interface Overview {
   hosts: { summary: HostSummary; live: HostLive }[]
   clients: ClientWithGrants[]
+  /** Hub maintenance waiting for the owner, as inbox rows. */
+  approvals: PendingConfirmation[]
 }
 
 async function overview(env: Env): Promise<Overview> {
   const hub = hubStub(env)
   const hosts = (await hub.listHosts()).map(host => ({ hostId: host.hostId, name: host.name }))
   const context = { ok: true, hosts, grants: Object.fromEntries(hosts.map(host => [host.hostId, { level: 'full' as const }])) }
-  const [live, clients] = await Promise.all([liveHosts(env, context), hub.listClients()])
-  return { hosts: live, clients }
+  const [live, clients, approvals] = await Promise.all([liveHosts(env, context), hub.listClients(), hub.pendingApprovals()])
+  return { hosts: live, clients, approvals: approvals.map(row => ({ confirmationId: row.id, operation: row.operation, clientName: row.clientName, what: row.operation, createdAt: row.createdAt, expiresAt: row.expiresAt })) }
 }
 
 function fullAccessOn(summary: HostSummary, clients: ClientWithGrants[], now = Date.now()): boolean {
@@ -193,6 +197,16 @@ function attentionRow(item: AttentionItem, hostName: string): Raw {
 /** Operations that wait for the owner's passkey, in words. */
 const CONFIRM_LABEL: Readonly<Record<string, string>> = {
   'terminal.run': 'ターミナルでコマンドを実行',
+  'host.rotate-key': 'ホスト鍵の更新',
+  'audit.export': '監査ログの書き出し',
+  'hub.export': 'ハブ設定の書き出し',
+}
+
+/** What the owner approves for hub maintenance, in words. */
+const MAINTENANCE_EXPLAIN: Readonly<Record<string, string>> = {
+  'audit.export': 'ハブとすべてのホストの監査ログ（誰が・いつ・どの操作を・どこへ。本文は含みません）を渡します。受け取った側でハッシュ連鎖を検査できます。',
+  'hub.export': 'ハブの設定（ホスト、クライアントと付与範囲、個人トークン・パスキー・通知デバイスの一覧）を渡します。トークンの値、鍵、通知の送り先などの秘密は含みません。',
+  'host.rotate-key': 'ホストに新しい鍵を作らせ、古い鍵と新しい鍵の両方の署名を確かめてから、新しい鍵に切り替えます。ホストは新しい鍵でつなぎ直します。',
 }
 
 const confirmPath = (hostId: string, confirmationId: string) => `/confirm/${hostId}/${confirmationId}`
@@ -220,7 +234,10 @@ async function homePage(env: Env, url: URL): Promise<Response> {
   const [state, data, meter] = await Promise.all([hub.state(), overview(env), hub.meterToday()])
   const names = new Map(data.hosts.map(entry => [entry.summary.hostId, entry.summary.name]))
   const attention = data.hosts.flatMap(entry => entry.live.attention)
-  const pending = data.hosts.flatMap(entry => entry.live.confirmations.map(item => ({ item, hostId: entry.summary.hostId, name: entry.summary.name })))
+  const pending = [
+    ...data.approvals.map(item => ({ item, hostId: 'hub', name: 'ハブ' })),
+    ...data.hosts.flatMap(entry => entry.live.confirmations.map(item => ({ item, hostId: entry.summary.hostId, name: entry.summary.name }))),
+  ]
   const waiting = attention.length + pending.length
   const running = data.hosts.flatMap(entry => entry.live.running)
   const recent = data.hosts.flatMap(entry => entry.live.recent).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 8)
@@ -300,6 +317,9 @@ ${confirmationList(live.confirmations.map(item => ({ item, hostId, name: '' })))
 ${tools}
 ${content}
 <details class="card"><summary>使える操作（${live.operations.length}）</summary><p class="mono small">${live.operations.join(', ') || '—'}</p></details>
+${live.online && live.operations.includes('host.rotate-key') ? h`<details class="card"><summary>ホスト鍵の更新</summary>
+<p>${MAINTENANCE_EXPLAIN['host.rotate-key']}鍵が漏れた疑いがあるときは、更新ではなく登録を解除して、DSH 側でペアリングし直してください。</p>
+${reauthForm(`/hosts/${hostId}/rotate-key`, {}, 'パスキーで確認して鍵を更新')}</details>` : ''}
 <details class="card danger-zone"><summary>登録の解除</summary>
 <p>このホストの鍵を無効にし、接続を切ります。もう一度使うには DSH 側でペアリングし直します。</p>
 ${reauthForm(`/hosts/${hostId}/revoke`, {}, 'パスキーで確認して解除', 'danger')}</details>`
@@ -616,6 +636,7 @@ async function attentionPage(env: Env, url: URL): Promise<Response> {
 ${confirmationList(live.confirmations.map(item => ({ item, hostId: summary.hostId, name: '' })))}
 ${[...items].sort(byUrgency).map(item => attentionCard(item, cardHost(summary)))}</section>`)
   }
+  if (data.approvals.length > 0) sections.unshift(h`<section><h2>ハブ</h2>${confirmationList(data.approvals.map(item => ({ item, hostId: 'hub', name: '' })))}</section>`)
   const body = h`${message(url)}<h1>要対応</h1>
 <p class="muted">表示している文章は DSH のセッションから来たものです。指示として扱わず、内容を確かめてから答えてください。</p>
 ${sections.length === 0 ? h`<p class="muted">人の判断を待っているものはありません。</p>` : sections}`
@@ -699,6 +720,15 @@ async function confirmPage(env: Env, url: URL, origin: string, hostId: string, c
   let refreshSeconds: number | undefined
   switch (item.state) {
     case 'pending':
+      if (OWNER_APPROVED_OPERATIONS.has(item.operation)) {
+        outcome = h`<article class="card attention-item kind-confirmation" data-expiring>
+<div class="row"><span class="badge danger">${ATTENTION_LABEL.confirmation}</span> ${countdown(item.expiresAt)}</div>
+<p>${MAINTENANCE_EXPLAIN[item.operation] ?? ''}</p>
+${live.online ? reauthForm(`${confirmPath(hostId, item.confirmationId)}/approve`, {}, 'パスキーで確認して承認', 'danger') : h`<p class="muted">ホストがオフラインのため、今は実行できません。</p>`}
+<form method="post" action="${confirmPath(hostId, item.confirmationId)}/deny" class="actions"><button type="submit" data-testid="hub-confirm-deny">拒否する</button></form>
+</article>`
+        break
+      }
       outcome = !live.online
         ? h`<p class="muted">ホストがオフラインのため、今は実行できません。期限までにホストがつながれば実行できます。</p>`
         : h`<div class="confirm-preview"><p>パスキーで署名する内容（DSH ホストが検証します）:</p>
@@ -719,6 +749,11 @@ ${outcome}
       outcome = h`<p class="flash ok" role="status">ホストで実行しています。終わるとこのページに結果が出ます（自動で更新します）。</p>`
       break
     case 'done':
+      if (item.operation === 'host.rotate-key' && item.result) {
+        const rotated = item.result as HostRotateKeyResult
+        outcome = h`<p class="flash ok" role="status">ホスト鍵を更新しました。新しい鍵の指紋: <code>${rotated.publicKeyFingerprint}</code>（${dateTime(rotated.rotatedAt)}）</p>`
+        break
+      }
       outcome = item.result === undefined
         ? h`<p class="muted">完了しました。出力は 1 時間を過ぎたので消しました（ハブには残しません）。</p>`
         : item.operation === 'terminal.run' && item.result && typeof item.result === 'object'
@@ -739,8 +774,55 @@ ${outcome}
 }
 
 async function denyConfirmation(env: Env, hostId: string, confirmationId: string): Promise<Response> {
-  const denied = await confirmations(env, hostId).deny(confirmationId)
+  const denied = hostId === 'hub' ? await hubStub(env).decideApproval(confirmationId, false) : await confirmations(env, hostId).deny(confirmationId)
   return redirect(`${confirmPath(hostId, confirmationId)}?msg=${denied ? 'confirmation-denied' : 'confirmation-gone'}`)
+}
+
+/** /confirm/hub/<id>: a client asks for hub maintenance (an export); the owner approves with a passkey re-authentication. */
+async function hubApprovalPage(env: Env, url: URL, id: string): Promise<Response> {
+  const row = await hubStub(env).approvalFor(id)
+  if (!row) return notFound()
+  const facts = h`<dl class="facts">
+  <dt>操作</dt><dd>${CONFIRM_LABEL[row.operation] ?? row.operation} <span class="muted mono">${row.operation}</span></dd>
+  <dt>依頼したもの</dt><dd>${row.clientName}</dd>
+  <dt>状態</dt><dd><span class="state ${row.state}" data-testid="hub-confirm-state">${CONFIRMATION_STATE[row.state] ?? row.state}</span> <span class="muted">${dateTime(row.createdAt)}</span></dd>
+</dl>`
+  const path = confirmPath('hub', id)
+  const outcome = row.state === 'pending'
+    ? h`<article class="card attention-item kind-confirmation" data-expiring>
+<div class="row"><span class="badge danger">${ATTENTION_LABEL.confirmation}</span> ${countdown(row.expiresAt)}</div>
+<p>${MAINTENANCE_EXPLAIN[row.operation] ?? ''}</p>
+<p class="muted">承認すると、依頼したクライアントが 1 時間だけ結果を受け取れます。ハブは結果を保存せず、受け取りのたびに作ります。</p>
+${reauthForm(`${path}/approve`, {}, 'パスキーで確認して承認', 'danger')}
+<form method="post" action="${path}/deny" class="actions"><button type="submit" data-testid="hub-confirm-deny">拒否する</button></form>
+</article>`
+    : row.state === 'done' ? h`<p class="flash ok">承認済みです（${row.decidedAt ? dateTime(row.decidedAt) : ''}）。</p>`
+      : row.state === 'denied' ? h`<p class="muted">この依頼は拒否しました。</p>`
+        : h`<p class="muted">承認されないまま期限が切れました。</p>`
+  const body = h`${message(url)}<p class="crumbs"><a href="/">ホーム</a> / <a href="/attention">要対応</a> / ハブ</p><h1>パスキーでの確認</h1>${facts}${outcome}`
+  return view('パスキーでの確認', 'attention', body)
+}
+
+type Outcome = { ok: true } | { ok: false; error: RemoraError }
+
+/** POST /confirm/<hub|host>/<id>/approve, after a fresh passkey re-authentication. */
+async function approveMaintenance(env: Env, origin: string, fresh: boolean, where: string, id: string): Promise<Response> {
+  const path = confirmPath(where, id)
+  if (!fresh) return redirect(`${path}?msg=reauth`)
+  if (where === 'hub') {
+    const decided = await hubStub(env).decideApproval(id, true)
+    return redirect(`${path}?msg=${decided ? 'approved' : 'confirmation-gone'}`)
+  }
+  const ran = (await hostStub(env, where).approveRun(id, origin)) as Outcome
+  return ran.ok ? redirect(path) : view('失敗しました', 'attention', h`${errorFlash(ran.error)}<p><a class="button" href="${path}">戻る</a></p>`)
+}
+
+/** The host page's "rotate the key" button (the owner is present: nothing to park). */
+async function rotateHostKey(env: Env, hostId: string, fresh: boolean): Promise<Response> {
+  if (!fresh) return redirect(`/hosts/${hostId}?msg=reauth`)
+  const outcome = (await hostStub(env, hostId).rotateKey()) as Outcome
+  if (outcome.ok) return redirect(`/hosts/${hostId}?msg=key-rotated`)
+  return view('失敗しました', 'home', h`${errorFlash(outcome.error, '鍵を更新できませんでした')}<p><a class="button" href="/hosts/${hostId}">戻る</a></p>`)
 }
 
 /** The host page's terminal form: park the command, then confirm it on its page. */
@@ -891,6 +973,7 @@ async function auditPage(env: Env, url: URL): Promise<Response> {
   const rows = chains.flatMap(([, list]) => list).filter(row => filter !== 'denied' || row.outcome !== 'ok').sort((a, b) => b.at - a.at).slice(0, 300)
   const body = h`<h1>監査ログ</h1>
 <p class="muted">誰が・いつ・どの操作を・どこへ行ったかだけを記録します（本文は残しません）。ハブとホストごとにハッシュ連鎖でつないでいます。</p>
+<p><a class="button small" href="/audit/export.json" download data-testid="hub-audit-export">JSON で書き出す</a> <span class="muted">ハブの外で検査するには <code>remora audit verify --file &lt;書き出したファイル&gt;</code>、またはハブから直接 <code>remora audit verify</code>（毎回ここでの承認が要ります）。</span></p>
 ${broken.length === 0 ? flash('表示中の範囲でハッシュ連鎖は正常です。', 'ok') : flash(`ハッシュ連鎖が途切れています: ${broken.map(([name, seq]) => `${name} #${seq}`).join(', ')}`, 'error')}
 <p><a href="/audit"${raw(filter !== 'denied' ? ' aria-current="page"' : '')}>すべて</a> ・ <a href="/audit?filter=denied"${raw(filter === 'denied' ? ' aria-current="page"' : '')}>拒否とエラーだけ</a></p>
 <ul class="audit">${rows.map(row => h`<li class="${row.outcome}">
@@ -959,6 +1042,7 @@ ${reauthForm('/settings/allow-other-clients', { allow: state.allowOtherClients ?
 <dl class="facts"><dt>版</dt><dd>${HUB_VERSION}（プロトコル ${PROTOCOL_VERSION}）</dd><dt>オリジン</dt><dd class="mono">${origin}</dd><dt>パスキーの RP ID</dt><dd class="mono">${rpIdOf(origin)}</dd>
 <dt>MCP</dt><dd class="mono">${resources.mcp}</dd><dt>HTTP API</dt><dd class="mono">${resources.api}/&lt;操作&gt;</dd><dt>OAuth 発行者</dt><dd class="mono">${origin}</dd><dt>CLI のクライアント ID</dt><dd class="mono">${CLI_CLIENT_ID}</dd></dl>
 <p class="muted">ドメインを変えるとパスキーと OAuth の発行者が変わります。リカバリーコードでログインしてパスキーを登録し直し、各クライアントも接続し直してください。</p>
+<p><a class="button small" href="/settings/export.json" download data-testid="hub-settings-export">設定を JSON で書き出す</a> <span class="muted">ホスト・クライアントと付与範囲・トークンやパスキーの一覧。秘密（トークンの値、鍵、通知の送り先）は含みません。CLI では <code>remora hub export</code>。</span></p>
 <form method="post" action="/auth/logout"><button type="submit">ログアウト</button></form></section>`
   return view('設定', 'settings', body, ['/js/webauthn.js', '/js/live.js', '/js/push.js'])
 }
@@ -996,7 +1080,7 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
       const state = await hub.state()
       return state.setupComplete ? redirect('/') : setupPage(env)
     }
-    const known = path === '/' || path === '/attention' || path.startsWith('/attention/') || path === '/connections' || path === '/audit' || path === '/settings' || path.startsWith('/hosts/') || path.startsWith('/tasks/') || path.startsWith('/confirm/')
+    const known = path === '/' || path === '/attention' || path.startsWith('/attention/') || path === '/connections' || path === '/audit' || path === '/audit/export.json' || path === '/settings' || path === '/settings/export.json' || path.startsWith('/hosts/') || path.startsWith('/tasks/') || path.startsWith('/confirm/')
     if (!known) return null
     if (path === '/') {
       const state = await hub.state()
@@ -1025,6 +1109,13 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
     if (sessionMatch) return sessionPage(env, url, sessionMatch[1] as string, decodeURIComponent(sessionMatch[2] as string))
     const taskMatch = /^\/tasks\/([a-z0-9-]{8,80})$/.exec(path)
     if (taskMatch) return taskPage(env, url, taskMatch[1] as string)
+    const hubApproval = /^\/confirm\/hub\/(hub-[a-z2-7]{8,40})$/.exec(path)
+    if (hubApproval) return hubApprovalPage(env, url, hubApproval[1] as string)
+    if (path === '/audit/export.json' || path === '/settings/export.json') {
+      const audit = path === '/audit/export.json'
+      const result = await maintenanceResult(env, audit ? 'audit.export' : 'hub.export', origin)
+      return json(result, { headers: { 'content-disposition': `attachment; filename="${audit ? 'remora-audit' : 'remora-hub'}-${new Date().toISOString().slice(0, 10)}.json"`, 'cache-control': 'no-store' } })
+    }
     const confirmMatch = /^\/confirm\/([a-z0-9]{8,64})\/([a-z0-9-]{8,80})$/.exec(path)
     if (confirmMatch) return confirmPage(env, url, origin, confirmMatch[1] as string, confirmMatch[2] as string)
     return notFound()
@@ -1044,8 +1135,12 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
   const sessionAct = /^\/hosts\/([a-z0-9]{8,64})\/sessions\/([^/]+)\/(prompt|steer|cancel|compact|model|fork|job-stop|schedule-create|schedule-delete)$/.exec(path)
   if (sessionAct) return sessionAction(env, request, sessionAct[1] as string, decodeURIComponent(sessionAct[2] as string), sessionAct[3] as string)
 
-  const deny = /^\/confirm\/([a-z0-9]{8,64})\/([a-z0-9-]{8,80})\/deny$/.exec(path)
+  const deny = /^\/confirm\/(hub|[a-z0-9]{8,64})\/([a-z0-9-]{8,80})\/deny$/.exec(path)
   if (deny) return denyConfirmation(env, deny[1] as string, deny[2] as string)
+  const approve = /^\/confirm\/(hub|[a-z0-9]{8,64})\/([a-z0-9-]{8,80})\/approve$/.exec(path)
+  if (approve) return approveMaintenance(env, origin, session.fresh, approve[1] as string, approve[2] as string)
+  const rotate = /^\/hosts\/([a-z0-9]{8,64})\/rotate-key$/.exec(path)
+  if (rotate) return rotateHostKey(env, rotate[1] as string, session.fresh)
   const terminal = /^\/hosts\/([a-z0-9]{8,64})\/terminal$/.exec(path)
   if (terminal) return terminalRequest(env, request, origin, terminal[1] as string)
 

@@ -3,9 +3,8 @@
  * Rows record who did what, where and with which outcome; never content
  * (no prompts, replies, file names or parameters).
  */
-import { canonicalJson, type DenialLayer } from './vendor/protocol/index.ts'
+import { AUDIT_GENESIS_HASH, auditHash as chainHash, verifyAuditRecords, type DenialLayer } from './vendor/protocol/index.ts'
 import { AUDIT_MAX_ROWS } from './config.ts'
-import { sha256Hex } from './util.ts'
 
 export type AuditOutcome = 'ok' | 'denied' | 'error'
 
@@ -45,11 +44,11 @@ export const AUDIT_SCHEMA = `
   );
 `
 
-export const GENESIS_HASH = '0'.repeat(64)
+export const GENESIS_HASH = AUDIT_GENESIS_HASH
 
-/** The hash of a row covers its sequence number, its fields and the previous hash. */
+/** The hash of a row covers its sequence number, its fields and the previous hash (packages/protocol/src/audit.ts). */
 export function auditHash(seq: number, entry: AuditEntry, prevHash: string): Promise<string> {
-  return sha256Hex(`remora-audit/v1\n${prevHash}\n${canonicalJson({ seq, ...entry })}`)
+  return chainHash(seq, entry, prevHash)
 }
 
 type Row = { seq: number; at: number; actor: string; actor_name: string; operation: string; host_id: string | null; outcome: string; layer: string | null; reason: string | null; prev_hash: string; hash: string }
@@ -90,14 +89,6 @@ export function listAudit(sql: SqlStorage, limit: number): AuditRow[] {
 }
 
 /** Recompute the chain; returns the first broken sequence number, or null when intact. */
-export async function verifyAuditChain(rows: readonly AuditRow[]): Promise<number | null> {
-  const ordered = [...rows].sort((a, b) => a.seq - b.seq)
-  let prev = ordered[0]?.prevHash ?? GENESIS_HASH
-  for (const row of ordered) {
-    const { seq, prevHash, hash, ...entry } = row
-    if (prevHash !== prev) return seq
-    if ((await auditHash(seq, entry, prevHash)) !== hash) return seq
-    prev = hash
-  }
-  return null
+export function verifyAuditChain(rows: readonly AuditRow[]): Promise<number | null> {
+  return verifyAuditRecords(rows)
 }

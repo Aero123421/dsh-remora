@@ -15,16 +15,22 @@ import { DurableObject } from 'cloudflare:workers'
 import { AUDIT_SCHEMA, appendAudit, listAudit, type AuditRow } from './audit.ts'
 import { OWNER_CLIENT_ID, PARKED_TASK_TTL_MS, RELAY_TIMEOUT_MS } from './config.ts'
 import { HUB_OBJECT_NAME } from './hub-do.ts'
-import { newTaskId, parseJson, randomToken, verifyEd25519 } from './util.ts'
+import { isRawEd25519Key, newTaskId, parseJson, randomToken, sha256Hex, verifyEd25519 } from './util.ts'
 import {
-  CONFIRMATION_REQUEST_TTL_MS, KEEPALIVE_PING, KEEPALIVE_PONG, REQUIRES_CONFIRMATION, TASK_WAIT_MAX_MS, TERMINAL_TASK_STATES, decide, fixFor, hostAuthMessage,
-  isSupportedProtocol, parseHostFrame,
+  CONFIRMATION_REQUEST_TTL_MS, KEEPALIVE_PING, KEEPALIVE_PONG, OWNER_APPROVED_OPERATIONS, REQUIRES_CONFIRMATION, TASK_WAIT_MAX_MS, TERMINAL_TASK_STATES, decide, fixFor, hostAuthMessage,
+  isSupportedProtocol, parseHostFrame, rotateKeyMessage,
+  type HostRotateKeyResult, type RotateKeyProofFrame,
   type Actor, type AttentionItem, type Confirmation, type ConfirmationInfo, type ConfirmationState, type DenialLayer, type Grant, type HelloFrame, type HostEvent,
   type HubFrame, type RemoraError, type ResponseFrame, type TaskInfo, type TaskState,
 } from './vendor/protocol/index.ts'
 
 /** How long a host has to answer the challenge. */
 const AUTH_WINDOW_MS = 60_000
+/** Requests one client may have waiting for the owner's passkey on one host at once. */
+const CONFIRMATIONS_PENDING_PER_CLIENT = 5
+/** Key rotation: time for the host's proof, then for its reconnection with the new key. */
+const ROTATE_PROOF_MS = 15_000
+const ROTATE_RECONNECT_MS = 20_000
 /** A host must stay offline this long before "offline" is notified. */
 const OFFLINE_NOTIFY_AFTER_MS = 60_000
 /** Attention kinds that trigger a notification when they appear. */
@@ -349,18 +355,34 @@ export class HostDO extends DurableObject<Env> {
       case 'auth': {
         const hostId = this.hostId
         const publicKey = this.info('public_key')
+        // A key the host proved during a rotation; accepted until a handshake decides between them.
+        const next = this.info('next_public_key')
         const fresh = Date.now() - attachment.issuedAt <= AUTH_WINDOW_MS
-        const ok = attachment.stage === 'hello' && hostId !== null && publicKey !== null && fresh && frame.nonce === attachment.nonce
-          && (await verifyEd25519(publicKey, hostAuthMessage(attachment.origin, hostId, attachment.nonce, attachment.issuedAt), frame.signature))
-        if (!ok || !attachment.hello) {
+        let used: 'current' | 'next' | null = null
+        if (attachment.stage === 'hello' && hostId !== null && publicKey !== null && fresh && frame.nonce === attachment.nonce) {
+          const message = hostAuthMessage(attachment.origin, hostId, attachment.nonce, attachment.issuedAt)
+          if (await verifyEd25519(publicKey, message, frame.signature)) used = 'current'
+          else if (next && (await verifyEd25519(next, message, frame.signature))) used = 'next'
+        }
+        if (used === 'next' && next && !(await this.promoteKey(next))) used = null
+        if (!used || !attachment.hello) {
           send(ws, { t: 'close', reason: 'auth_failed' })
           ws.close(4001, fresh ? 'authentication failed' : 'challenge expired')
           await this.audit('host', 'host.connect', 'denied', { reason: fresh ? 'auth-failed' : 'stale-challenge' })
           return
         }
-        await this.onAuthenticated(ws, attachment, attachment.hello)
+        if (used === 'current' && next) {
+          // The host came back with its old key: it never switched, so the rotation is off.
+          this.setInfo('next_public_key', null)
+          await this.audit('host', 'host.rotate-key.cancelled', 'denied', { reason: 'old-key-used' })
+        }
+        await this.onAuthenticated(ws, attachment, attachment.hello, used === 'next')
         return
       }
+      case 'rotate-key-proof':
+        if (attachment.stage !== 'ready') { ws.close(4001, 'not authenticated'); return }
+        if (this.rotation && frame.nonce === this.rotation.nonce) this.rotation.resolve(frame)
+        return
       case 'response':
         if (attachment.stage !== 'ready') { ws.close(4001, 'not authenticated'); return }
         await this.onResponse(frame)
@@ -378,10 +400,15 @@ export class HostDO extends DurableObject<Env> {
     }
   }
 
-  private async onAuthenticated(ws: WebSocket, attachment: Attachment, hello: HelloFrame): Promise<void> {
+  private async onAuthenticated(ws: WebSocket, attachment: Attachment, hello: HelloFrame, rotated = false): Promise<void> {
     // One live connection per host: the newest wins and the older is told why.
     for (const other of this.readySockets()) {
       if (other === ws) continue
+      if (rotated) {
+        // The same host leaving its old-key connection behind, not a second holder of the key.
+        other.close(4003, 'key rotated')
+        continue
+      }
       send(other, { t: 'close', reason: 'duplicate_connection' })
       other.close(4002, 'duplicate connection')
       this.setInfo('duplicate_connections', String(Number(this.info('duplicate_connections') ?? '0') + 1))
@@ -693,12 +720,91 @@ export class HostDO extends DurableObject<Env> {
     if (TASK_CREATING.has(call.op)) return this.createTask(call)
     // Every call of these needs the owner's passkey: park it until the owner confirms it on the hub.
     if (REQUIRES_CONFIRMATION.has(call.op) && !call.confirmation) return this.requestConfirmation(call)
+    // Approved by the owner on the hub page (passkey re-authentication), then run by approveRun.
+    if (OWNER_APPROVED_OPERATIONS.has(call.op)) return this.requestConfirmation(call)
     const ws = this.readySockets()[0]
     if (!ws) return { ok: false, error: err('host_offline', 'The DSH host is offline. Start DSH Web on that machine and try again.') }
     const frame = await this.relay(ws, call.requestId ?? `r_${randomToken(12)}`, call, RELAY_TIMEOUT_MS)
     if (!frame) return { ok: false, error: err('unavailable', 'The DSH host did not answer in time.') }
     if (frame.ok) return { ok: true, result: stampHostId(frame.result ?? null, this.hostId ?? '') }
     return { ok: false, error: this.explainRefusal(call, frame.error ?? err('internal', 'The host returned an error without details.')) }
+  }
+
+  // --- host key rotation (host.rotate-key) ---------------------------------------------------
+
+  private rotation: { nonce: string; resolve: (frame: RotateKeyProofFrame | null) => void } | null = null
+
+  /** The host authenticated with the key it proved: it replaces the paired key on the hub. */
+  private async promoteKey(publicKey: string): Promise<boolean> {
+    try {
+      if (!(await this.hub().replaceHostKey(this.hostId as string, publicKey))) return false
+    } catch {
+      return false
+    }
+    this.setInfo('public_key', publicKey)
+    this.setInfo('next_public_key', null)
+    await this.audit('host', 'host.rotate-key.finished', 'ok')
+    this.notify('key-rotated')
+    return true
+  }
+
+  /**
+   * Replace the host key, once the owner approved it: the host proves a new
+   * key with the old and the new one, the hub accepts both until the host
+   * reconnects with the new one (see the frames in protocol/frames.ts).
+   */
+  async rotateKey(): Promise<{ ok: true; result: HostRotateKeyResult } | { ok: false; error: RemoraError }> {
+    const hostId = this.hostId
+    const current = this.info('public_key')
+    const origin = this.info('origin')
+    if (!this.schemaReady || !hostId || !current || this.info('revoked') === '1') return { ok: false, error: err('gone', 'This host is not paired with the hub.') }
+    const ws = this.readySockets()[0]
+    if (!ws || !origin) return { ok: false, error: err('host_offline', 'The DSH host is offline. Start DSH Web on that machine, then try again.') }
+    if (!(this.operations() ?? []).includes('host.rotate-key')) return { ok: false, error: err('unavailable', 'This DSH host\'s plugin cannot rotate its key. Update the plugin, or pair again from the DSH settings tab.', { fix: 'dsh:settings/remora#compatibility' }) }
+    if (this.rotation) return { ok: false, error: err('conflict', 'A key rotation for this host is already running.') }
+    const nonce = randomToken(24)
+    const issuedAt = Date.now()
+    const proof = await new Promise<RotateKeyProofFrame | null>(resolve => {
+      const timer = setTimeout(() => resolve(null), ROTATE_PROOF_MS)
+      this.rotation = { nonce, resolve: frame => { clearTimeout(timer); resolve(frame) } }
+      send(ws, { t: 'rotate-key', nonce, issuedAt })
+    }).finally(() => { this.rotation = null })
+    if (!proof) return { ok: false, error: err('unavailable', 'The DSH host did not answer the key rotation in time. Its key was not changed.') }
+    const message = rotateKeyMessage(origin, hostId, nonce, issuedAt, proof.publicKey)
+    const valid = isRawEd25519Key(proof.publicKey) && proof.publicKey !== current
+      && (await verifyEd25519(current, message, proof.signature)) && (await verifyEd25519(proof.publicKey, message, proof.newSignature))
+    if (!valid) {
+      await this.audit('host', 'host.rotate-key.proof', 'denied', { reason: 'invalid-proof' })
+      return { ok: false, error: err('invalid_request', 'The DSH host\'s proof for its new key did not verify. Its key was not changed.') }
+    }
+    this.setInfo('next_public_key', proof.publicKey)
+    send(ws, { t: 'rotate-key-commit', nonce, publicKey: proof.publicKey })
+    if (this.info('public_key') !== proof.publicKey) await this.waitFor('key-rotated', ROTATE_RECONNECT_MS)
+    if (this.info('public_key') !== proof.publicKey) {
+      return { ok: false, error: err('unavailable', 'The DSH host has not reconnected with its new key yet. It keeps working with its old key until it does; the rotation finishes on its first connection with the new key.') }
+    }
+    return { ok: true, result: { hostId, publicKeyFingerprint: (await sha256Hex(proof.publicKey)).slice(0, 16), rotatedAt: Date.now() } }
+  }
+
+  /** The owner approved a parked host maintenance request on the hub (after a passkey re-authentication). */
+  async approveRun(id: string, origin?: string): Promise<ExecuteResult> {
+    if (!this.schemaReady || !this.hostId) return { ok: false, error: err('gone', 'This host is not paired with the hub.') }
+    this.settleOverdue()
+    const row = this.confirmationRow(id)
+    if (!row) return { ok: false, error: err('not_found', 'No such request.') }
+    if (!OWNER_APPROVED_OPERATIONS.has(row.op)) return { ok: false, error: err('invalid_request', 'This request needs a passkey confirmation the DSH host checks.') }
+    if (row.state !== 'pending') return { ok: false, error: err('conflict', `This request is already ${row.state}.`) }
+    const started = Date.now()
+    this.sql.exec("UPDATE confirmations SET state = 'running', deadline_at = ?, updated_at = ? WHERE id = ?", started + ROTATE_PROOF_MS + ROTATE_RECONNECT_MS + 10_000, started, id)
+    this.notify(`c:${id}`)
+    await this.audit({ clientId: OWNER_CLIENT_ID, clientName: 'オーナー' }, `${row.op}.approved`, 'ok')
+    const outcome = await this.rotateKey()
+    const now = Date.now()
+    if (outcome.ok) this.sql.exec("UPDATE confirmations SET state = 'done', result = ?, updated_at = ? WHERE id = ?", JSON.stringify(outcome.result), now, id)
+    else this.sql.exec("UPDATE confirmations SET state = 'failed', error = ?, updated_at = ? WHERE id = ?", JSON.stringify(outcome.error), now, id)
+    this.notify(`c:${id}`)
+    await this.scheduleAlarm()
+    return { ok: true, result: this.confirmationInfo(this.confirmationRow(id) as ConfirmationRow, origin) }
   }
 
   // --- confirmations: operations that wait for the owner's passkey -------------------------
@@ -741,6 +847,11 @@ export class HostDO extends DurableObject<Env> {
 
   private async requestConfirmation(call: ExecuteCall): Promise<ExecuteResult> {
     const now = Date.now()
+    this.settleOverdue(now)
+    const waiting = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM confirmations WHERE state = 'pending' AND client_id = ?", call.actor.clientId).one().n
+    if (waiting >= CONFIRMATIONS_PENDING_PER_CLIENT) {
+      return { ok: false, error: err('rate_limited', `This client already has ${waiting} requests waiting for the owner on this host; wait until the owner answers them or they expire (10 minutes).`) }
+    }
     const id = newTaskId(this.hostId as string)
     this.sql.exec(
       "INSERT INTO confirmations (id, client_id, client_name, op, params, scopes, state, created_at, expires_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
@@ -749,7 +860,7 @@ export class HostDO extends DurableObject<Env> {
     await this.scheduleAlarm()
     if (call.actor.clientId !== OWNER_CLIENT_ID) {
       // Like every notification, no content: who asks for what kind of operation, not the command.
-      const what = call.op === 'terminal.run' ? 'コマンドの実行' : call.op
+      const what = call.op === 'terminal.run' ? 'コマンドの実行' : call.op === 'host.rotate-key' ? 'ホスト鍵の更新' : call.op
       this.push([{ type: 'attention', kind: 'confirmation', hostId: this.hostId, host: this.displayName(), title: pushText(`${call.actor.clientName}: ${what}`), url: `/confirm/${this.hostId ?? ''}/${id}`, expiresAt: now + CONFIRMATION_REQUEST_TTL_MS }])
     }
     return { ok: true, result: this.confirmationInfo(this.confirmationRow(id) as ConfirmationRow, call.origin) }
@@ -818,6 +929,7 @@ export class HostDO extends DurableObject<Env> {
     const row = this.confirmationRow(id)
     if (!row) return { ok: false, error: err('not_found', 'No such confirmation.') }
     if (row.state !== 'pending') return { ok: false, error: err('conflict', `This request is already ${row.state}.`) }
+    if (OWNER_APPROVED_OPERATIONS.has(row.op)) return { ok: false, error: err('invalid_request', 'The owner approves this request on its hub page, not with a DSH-checked confirmation.') }
     if (!input.grant) {
       this.sql.exec("UPDATE confirmations SET state = 'failed', error = ?, params = '{}', updated_at = ? WHERE id = ?", JSON.stringify(denied('hub', 'switched-off', row.op)), Date.now(), id)
       this.notify(`c:${id}`)
