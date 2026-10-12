@@ -21,18 +21,23 @@
 //   terminal.run     the "request" token is refused; with "Full remote access" on in DSH the
 //                    owner runs a command from the host page, confirms it with the passkey on
 //                    /confirm/… and reads its output there; a second one is denied
+//   maintenance.audit  a personal token with dsh.admin asks for audit.export; the owner approves it
+//                    on /confirm/hub/… with the passkey; every chain it gets verifies here
+//   maintenance.rotate-key  the owner rotates the host key from the host page: the real plugin proves
+//                    a new key, reconnects with it, and a task still completes
 //   kill-switch      kill switch on in DSH → task.start is refused → off again → tasks run
 //
 // Each step detects features that are not there yet (501 from the hub, a
 // missing control in the UI) and skips with the reason, so this scenario
 // grows into the full E2E as the hub and plugin streams land.
 import { randomBytes, randomUUID } from 'node:crypto'
-import { readdirSync, realpathSync } from 'node:fs'
+import { readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { ANSWERED_PREFIX, APPROVE_MARKER, ASK_BLOCKING_MARKER, ASK_MARKER, JOB_MARKER, JOB_PREFIX, REPLY_PREFIX, WRITE_PREFIX, approvalFile } from './lib/mock-llm.mjs'
 import { addVirtualAuthenticator, firstPresent, instrument, mustBePresent, requirePresent, shot } from './lib/browser.mjs'
 import { HUB_PATHS, dsh as DSH_SELECTORS, hub as HUB, remora as REMORA } from './lib/selectors.mjs'
 import { hubApi, startHub } from './lib/hub.mjs'
+import { verifyAuditRecords } from '../packages/protocol/src/audit.ts'
 import { Skip } from './lib/steps.mjs'
 import { killSwitchOn, openRemoraSubTab, openRemoraTab, openSettings, rpcBody, toggleKillSwitch } from './browser-check.mjs'
 
@@ -521,6 +526,60 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
     } finally {
       await setCeiling('request')
     }
+  })
+
+  await r.step('maintenance.audit', 'audit.export from a dsh.admin token waits for the owner\'s passkey on the hub; the chains verify outside the hub', { needs: ['task.complete', 'hub.owner'], timeoutMs: 120_000, onFailure: failShot('maintenance-audit') }, async () => {
+    const page = state.hubPage
+    await page.goto(`${state.hub.origin}${HUB_PATHS.tokens}`)
+    const form = await requirePresent(page, HUB.tokenForm, `no personal-token form at ${HUB_PATHS.tokens}`)
+    const name = `remora-e2e-admin-${randomBytes(3).toString('hex')}`
+    await (await mustBePresent(form, HUB.tokenName, 'the token name field')).fill(name)
+    for (const scope of ['dsh.read', 'dsh.admin']) await HUB.tokenScope(scope)(form).check()
+    await (await mustBePresent(form, HUB.tokenCreate, 'the issue button')).click()
+    const admin = hubApi(state.hub.origin, (await (await mustBePresent(page, HUB.tokenValue, 'the new token value', 20_000)).innerText()).trim())
+    const { body: parked } = await admin('audit.export')
+    if (parked.state !== 'pending' || !parked.confirmUrl?.startsWith(`${state.hub.origin}/confirm/hub/`)) throw new Error(`audit.export did not wait for the owner: ${JSON.stringify(parked)}`)
+    const { body: early } = await admin('confirmation.get', { confirmationId: parked.confirmationId })
+    if (early.state !== 'pending' || early.result !== undefined) throw new Error(`before approval: ${JSON.stringify(early)}`)
+    await page.goto(parked.confirmUrl)
+    await shot(page, artifacts, 'flow-hub-approve-audit')
+    await Promise.all([page.waitForURL(/msg=approved/, { timeout: 30_000 }), page.locator('form[action$="/approve"] button[type="submit"]').click()])
+    const { body: done } = await admin('confirmation.get', { confirmationId: parked.confirmationId })
+    if (done.state !== 'done' || !Array.isArray(done.result?.logs)) throw new Error(`after approval: ${JSON.stringify(done).slice(0, 500)}`)
+    const summary = []
+    for (const log of done.result.logs) {
+      const broken = await verifyAuditRecords(log.records)
+      if (broken !== null) throw new Error(`the ${log.log} chain breaks at #${broken}`)
+      summary.push(`${log.log === 'hub' ? 'hub' : 'host'} ${log.records.length} rows`)
+    }
+    if (!done.result.logs.some(log => log.log === state.host.hostId)) throw new Error('the host\'s log is missing from the export')
+    return `token "${name}" asked; the owner approved on ${new URL(parked.confirmUrl).pathname} with the passkey; chains verify: ${summary.join(', ')}`
+  })
+
+  await r.step('maintenance.rotate-key', 'The owner rotates the host key from the host page: the plugin proves a new key, reconnects with it, and tasks still run', { needs: ['task.complete', 'hub.owner'], timeoutMs: 180_000, onFailure: failShot('rotate-key') }, async () => {
+    const hubPage = state.hubPage
+    await hubPage.goto(`${state.hub.origin}/hosts/${state.host.hostId}`)
+    const summary = hubPage.locator('details.card').filter({ hasText: 'ホスト鍵の更新' }).locator('summary')
+    if (await summary.count() === 0) throw new Error('the host page offers no key rotation (does the plugin advertise host.rotate-key?)')
+    await summary.first().click()
+    await Promise.all([hubPage.waitForURL(/msg=key-rotated/, { timeout: 60_000 }), hubPage.locator(`form[action="/hosts/${state.host.hostId}/rotate-key"] button[type="submit"]`).click()])
+    const shotPath = await shot(hubPage, artifacts, 'flow-hub-key-rotated')
+    // The DSH tab is connected again, and work goes on over the new key.
+    const { section } = await ensureRemoraTab(dshSession.page)
+    await openRemoraSubTab(section, REMORA.tabs.connection)
+    await mustBePresent(section, REMORA.hubConnected, 'Connected after the key rotation', 60_000)
+    const nonce = `r${randomBytes(4).toString('hex')}`
+    const { body: started } = await state.api('task.start', { hostId: state.host.hostId, target: state.target, prompt: `Remora E2E after key rotation nonce=${nonce}`, idempotencyKey: randomUUID() })
+    const task = await waitTask(state.api, started.taskId, value => TERMINAL.has(value) || value === 'needs_attention')
+    if (task.state !== 'completed' || !task.result?.reply?.includes(`${REPLY_PREFIX} ${nonce}`)) throw new Error(`after the rotation: ${JSON.stringify(task)}`)
+    // The old key is gone from wherever the plugin keeps keys (DSH's credential store, or its data folder).
+    const keyFile = findFile(world.root, 'host-key-previous.json')
+    if (keyFile) throw new Error(`the previous key is still on disk: ${keyFile}`)
+    let store = ''
+    try { store = readFileSync(join(world.dshHome, '.credentials.yaml'), 'utf8') } catch { /* no credential store file */ }
+    if (store.includes('dsh-remora/host-key-previous')) throw new Error('the previous key is still in the DSH credential store')
+    if (store !== '' && !store.includes('dsh-remora/host-key')) throw new Error('the DSH credential store holds no host key')
+    return `rotated from the host page (${shotPath}); the DSH tab reconnected; a task completed over the new key ("${task.result.reply}")`
   })
 
   await r.step('kill-switch.enforced', 'With the kill switch on, task.start is refused; off again and tasks run', { needs: ['task.complete'], timeoutMs: 120_000, onFailure: failShot('kill-switch', 'dsh') }, async () => {

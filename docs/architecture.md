@@ -64,6 +64,13 @@ DSH のサンドボックスが制限するのはファイルの書き込みだ�
 3. ハブは依頼したクライアントの今の付与で権限を判定し直し、`confirmation` 付きでホストへ送る。DSH 側のプラグインが署名を検証してから実行する（ハブが乗っ取られても偽造できない）。
 4. クライアントは `confirmation.get`（最長 25 秒ずつ待てる）で `pending`→`running`→`done`／`failed`／`denied`／`expired` を見て、`done` なら `result` に出力が入る。自分の依頼しか見えない。期限切れや拒否の行は params を消す。
 
+### ハブの保守（オーナーが毎回承認する操作）
+
+`OWNER_APPROVED_OPERATIONS`（`audit.export`、`hub.export`、`host.rotate-key`）は HTTP API だけの操作で（MCP のツールにはしない）、`dsh.admin` が要る。DSH 側で検証できるものが無いので、承認はハブでのパスキーの再確認（`session.fresh`）で行う。
+
+- `audit.export`・`hub.export`: ハブの Durable Object に保留し（`approvals`、10 分、1 クライアント 5 件まで）、オーナーが `/confirm/hub/<ID>` で承認すると、依頼したクライアントが `confirmation.get` で 1 時間だけ結果を受け取れる。結果は保存せず、受け取りのたびに作る。監査ログのハッシュの定義は `packages/protocol/src/audit.ts` にあり、CLI はそれでハブの外で計算し直す。
+- `host.rotate-key`: ホストの Durable Object に保留し、承認されると `rotate-key` フレームを送る。ホストは新しい鍵を作り、`rotateKeyMessage(...)` に古い鍵と新しい鍵の両方で署名して返す。ハブは両方を確かめて新しい鍵を「次の鍵」として持ち、`rotate-key-commit` を返す。ホストは両方の鍵を保存してから新しい鍵でつなぎ直し、ハブはその握手で次の鍵を正式な鍵にする（ハブ全体の Durable Object の記録も更新）。古い鍵で握手してきたら次の鍵を捨てる（更新の取り消し）。ホストは握手を断られたらもう一方の鍵で試し直すので、途中で止まっても締め出されない。
+
 ## 要対応と完了判定
 
 - 承認待ち: ログの `approval/asked` に `approval/decided` がまだ無い。
