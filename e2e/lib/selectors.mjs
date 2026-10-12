@@ -52,6 +52,9 @@ export const remora = {
   ceilingRequest: [testid('remora-ceiling-request'), css('button[role="radio"][data-level="request"]')],
   // Scope tab: the workspace allow list (Switch per workspace).
   scopeSwitches: [css('[role="switch"]')],
+  // Permissions tab, "Answers from outside".
+  answers: [testid('remora-answers'), css('#answers')],
+  approvalsFromRemote: [role('switch', { name: 'Allow approvals from MCP and CLI', exact: true }), role('switch', { name: '承認を MCP・CLI からも許可する', exact: true })],
 }
 
 /** Hub pages (hub/src/ui/routes.ts, hub/src/pair.ts), Japanese UI. */
@@ -78,6 +81,12 @@ export const hub = {
   /** /connections: one card per client, a level <select> per host. */
   clientCard: name => scope => scope.locator('article.card').filter({ hasText: name }),
   grantSelect: [testid('hub-grant-level'), css('select[name="level"]')],
+  /** The page an attention item's answerUrl opens (/attention/<hostId>/<attentionId>). */
+  attentionItem: [testid('hub-attention-item'), css('article.attention-item')],
+  questionOption: label => scope => scope.locator('label.check').filter({ hasText: label }).locator('input[type="radio"]'),
+  questionAnswer: [testid('hub-question-answer')],
+  approvalAllow: [testid('hub-approval-allow')],
+  approvalReject: [testid('hub-approval-reject')],
   /** OAuth consent at /oauth/authorize. */
   consentApprove: [testid('hub-consent-approve'), role('button', { name: /^(allow|approve|authorize)|許可|承認/i })],
 }

@@ -7,15 +7,23 @@
 //   token.mint       personal token on /settings (passkey re-auth), granted "request" on /connections
 //   task.complete    POST /api/v1/ops/task.start → task.wait until completed → reply is the mock's
 //   task.attention   ask_user_question (timed mode) → needs_attention → attention.respond → completed
+//   answer.web-open  blocking ask_user_question while DSH Web is open: Remora holds it too,
+//                    attention.respond answers it (no deadline while the Web card waits)
+//   answer.no-web    the same with no DSH Web tab: held with a deadline, answered on the hub page
+//   approval.passkey a write asking for a sandbox escalation: approval.respond without the
+//                    passkey is refused with the hub link; the owner allows it there with the passkey
+//   approval.remote  "Allow approvals from MCP and CLI" on (this PC): approval.respond rejects it
 //   kill-switch      kill switch on in DSH → task.start is refused → off again → tasks run
 //
 // Each step detects features that are not there yet (501 from the hub, a
 // missing control in the UI) and skips with the reason, so this scenario
 // grows into the full E2E as the hub and plugin streams land.
 import { randomBytes, randomUUID } from 'node:crypto'
-import { ANSWERED_PREFIX, ASK_MARKER, REPLY_PREFIX } from './lib/mock-llm.mjs'
+import { readdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { ANSWERED_PREFIX, APPROVE_MARKER, ASK_BLOCKING_MARKER, ASK_MARKER, REPLY_PREFIX, WRITE_PREFIX, approvalFile } from './lib/mock-llm.mjs'
 import { addVirtualAuthenticator, firstPresent, instrument, mustBePresent, requirePresent, shot } from './lib/browser.mjs'
-import { HUB_PATHS, hub as HUB, remora as REMORA } from './lib/selectors.mjs'
+import { HUB_PATHS, dsh as DSH_SELECTORS, hub as HUB, remora as REMORA } from './lib/selectors.mjs'
 import { hubApi, startHub } from './lib/hub.mjs'
 import { Skip } from './lib/steps.mjs'
 import { killSwitchOn, openRemoraSubTab, openRemoraTab, openSettings, rpcBody, toggleKillSwitch } from './browser-check.mjs'
@@ -33,6 +41,35 @@ async function waitTask(api, taskId, until, deadlineMs = 120_000) {
     if (until(task.state)) return task
   }
   throw new Error(`task ${taskId} still ${task?.state} after ${deadlineMs} ms: ${JSON.stringify(task)}`)
+}
+
+/** Path of a file named `name` under `root` (a few levels deep), or null. */
+function findFile(root, name, depth = 5) {
+  let entries
+  try { entries = readdirSync(root, { withFileTypes: true }) } catch { return null }
+  for (const entry of entries) if (entry.isFile() && entry.name === name) return join(root, entry.name)
+  if (depth === 0) return null
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === 'node_modules' || entry.name.startsWith('.')) continue
+    const found = findFile(join(root, entry.name), name, depth - 1)
+    if (found) return found
+  }
+  return null
+}
+
+/** Poll task.get until an attention item matches, or throw with the last list. */
+async function waitAttention(api, taskId, match, deadlineMs = 30_000) {
+  const deadline = Date.now() + deadlineMs
+  let items = []
+  while (Date.now() < deadline) {
+    const { body } = await api('task.get', { taskId })
+    items = body.attention ?? []
+    const found = items.find(match)
+    if (found) return found
+    if (TERMINAL.has(body.state)) throw new Error(`task ${taskId} ended ${body.state} while waiting for attention: ${JSON.stringify(body)}`)
+    await new Promise(resolve => setTimeout(resolve, 500))
+  }
+  throw new Error(`no matching attention item after ${deadlineMs} ms: ${JSON.stringify(items)}`)
 }
 
 async function ensureRemoraTab(page) {
@@ -222,6 +259,102 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
     const done = await waitTask(state.api, started.taskId, value => TERMINAL.has(value))
     if (done.state !== 'completed' || !done.result?.reply?.includes(`${ANSWERED_PREFIX} ${nonce}`)) throw new Error(`after answering: ${JSON.stringify(done)}`)
     return `question "${item.title}" answered with ${option?.label ?? 'text'}; reply "${done.result.reply}"`
+  })
+
+  await r.step('answer.web-open', 'Blocking ask_user_question while DSH Web is open: Remora holds it too and attention.respond answers it', { needs: ['task.complete'], timeoutMs: 180_000, onFailure: failShot('answer-web', 'dsh') }, async () => {
+    const nonce = `b${randomBytes(4).toString('hex')}`
+    const { body: started } = await state.api('task.start', { hostId: state.host.hostId, target: state.target, prompt: `Remora E2E blocking question ${ASK_BLOCKING_MARKER} nonce=${nonce}`, idempotencyKey: randomUUID() })
+    const item = await waitAttention(state.api, started.taskId, entry => entry.kind === 'question' && entry.answerVia === 'remote')
+    await shot(dshSession.page, artifacts, 'flow-dsh-blocking-question')
+    if (!item.answerable) throw new Error(`held question is not answerable: ${JSON.stringify(item)}`)
+    if (!item.answerUrl?.startsWith(state.hub.origin)) throw new Error(`no hub answerUrl on the item: ${JSON.stringify(item)}`)
+    const option = item.options?.find(entry => /Navy/.test(entry.label))
+    if (!option) throw new Error(`no Navy option: ${JSON.stringify(item.options)}`)
+    await state.api('attention.respond', { hostId: state.host.hostId, attentionId: item.attentionId, sessionId: item.sessionId, answer: { optionId: option.id } })
+    const done = await waitTask(state.api, started.taskId, value => TERMINAL.has(value))
+    if (done.state !== 'completed' || !done.result?.reply?.includes(`${ANSWERED_PREFIX} ${nonce}`) || !done.result.reply.includes('Navy')) throw new Error(`after answering: ${JSON.stringify(done)}`)
+    const path = await shot(dshSession.page, artifacts, 'flow-dsh-blocking-answered')
+    const deadline = item.expiresAt === null || item.expiresAt === undefined ? 'no deadline (DSH Web holds the card too)' : `deadline in ${Math.round((item.expiresAt - Date.now()) / 1000)} s (DSH Web passed it on)`
+    return `held question answered with Navy through the API; ${deadline}; reply "${done.result.reply}"; ${path}`
+  })
+
+  await r.step('answer.no-web', 'Blocking ask_user_question with no DSH Web tab: held with a deadline, answered on the hub page', { needs: ['answer.web-open'], timeoutMs: 180_000, onFailure: failShot('answer-no-web') }, async () => {
+    const page = dshSession.page
+    const back = page.url()
+    // Leaving DSH Web closes its event stream: nothing but Remora can answer now.
+    await page.goto('about:blank')
+    await new Promise(resolve => setTimeout(resolve, 2000))
+    try {
+      const nonce = `n${randomBytes(4).toString('hex')}`
+      const { body: started } = await state.api('task.start', { hostId: state.host.hostId, target: state.target, prompt: `Remora E2E no-web question ${ASK_BLOCKING_MARKER} nonce=${nonce}`, idempotencyKey: randomUUID() })
+      const item = await waitAttention(state.api, started.taskId, entry => entry.kind === 'question' && entry.answerVia === 'remote' && typeof entry.expiresAt === 'number')
+      const left = Math.round((item.expiresAt - Date.now()) / 1000)
+      if (left <= 0 || left > 10 * 60 + 30) throw new Error(`deadline ${left} s away; expected about 10 minutes`)
+      const hubPage = state.hubPage
+      await hubPage.goto(item.answerUrl)
+      const card = await mustBePresent(hubPage, HUB.attentionItem, 'the attention item on its answer page')
+      await shot(hubPage, artifacts, 'flow-hub-question-page')
+      await HUB.questionOption('Teal')(card).check()
+      await Promise.all([hubPage.waitForURL(/\/attention\?msg=sent/, { timeout: 20_000 }), (await mustBePresent(card, HUB.questionAnswer, 'the answer button')).click()])
+      const done = await waitTask(state.api, started.taskId, value => TERMINAL.has(value))
+      if (done.state !== 'completed' || !done.result?.reply?.includes(`${ANSWERED_PREFIX} ${nonce}`) || !done.result.reply.includes('Teal')) throw new Error(`after answering on the hub: ${JSON.stringify(done)}`)
+      return `deadline ${left} s away with no DSH Web tab; answered Teal on ${new URL(item.answerUrl).pathname}; reply "${done.result.reply}"`
+    } finally {
+      await page.goto(back)
+      const notice = await firstPresent(page, DSH_SELECTORS.previewNoticeContinue, 3000)
+      if (notice) await notice.click()
+      await mustBePresent(page, DSH_SELECTORS.settingsOpen, 'DSH Web again after the no-web test', 30_000)
+    }
+  })
+
+  await r.step('approval.passkey', 'An approval (write asking for a sandbox escalation): approval.respond without the passkey is refused with the hub link; the owner allows it there', { needs: ['task.complete'], timeoutMs: 180_000, onFailure: failShot('approval-passkey') }, async () => {
+    const nonce = `p${randomBytes(4).toString('hex')}`
+    const { body: started } = await state.api('task.start', { hostId: state.host.hostId, target: state.target, prompt: `Remora E2E approval ${APPROVE_MARKER} nonce=${nonce}`, idempotencyKey: randomUUID() })
+    const item = await waitAttention(state.api, started.taskId, entry => entry.kind === 'approval' && entry.answerable)
+    if (item.answerVia !== 'hub-passkey') throw new Error(`expected the hub-passkey route by default: ${JSON.stringify(item)}`)
+    const params = { hostId: state.host.hostId, sessionId: item.sessionId, attentionId: item.attentionId, answer: { approve: true } }
+    const refused = await state.api('approval.respond', params, { allow: [403] })
+    if (refused.status !== 403 || refused.body?.error?.denial?.reason !== 'confirmation-failed') throw new Error(`approval.respond without a passkey: ${refused.status} ${JSON.stringify(refused.body)}`)
+    const link = refused.body.error.fix ?? refused.body.error.answerUrl
+    if (!link?.startsWith(state.hub.origin)) throw new Error(`the refusal carries no hub link: ${JSON.stringify(refused.body)}`)
+    const hubPage = state.hubPage
+    await hubPage.goto(link)
+    const card = await mustBePresent(hubPage, HUB.attentionItem, 'the approval on its answer page')
+    await shot(hubPage, artifacts, 'flow-hub-approval-page')
+    await Promise.all([hubPage.waitForURL(/\/attention\?msg=sent/, { timeout: 30_000 }), (await mustBePresent(card, HUB.approvalAllow, 'the "allow once with passkey" button')).click()])
+    const done = await waitTask(state.api, started.taskId, value => TERMINAL.has(value))
+    if (done.state !== 'completed' || !done.result?.reply?.includes(`${WRITE_PREFIX} ${nonce} done`)) throw new Error(`after allowing: ${JSON.stringify(done)}`)
+    const written = findFile(world.root, approvalFile(nonce))
+    if (!written) throw new Error(`the allowed write left no ${approvalFile(nonce)} under ${world.root}`)
+    return `MCP/CLI refused (${refused.body.error.denial.reason}) with ${new URL(link).pathname}; allowed with the passkey on the hub; reply "${done.result.reply}"; wrote ${written.slice(world.root.length + 1)}`
+  })
+
+  await r.step('approval.remote', '"Allow approvals from MCP and CLI" on (this PC): approval.respond answers without the passkey', { needs: ['approval.passkey'], timeoutMs: 180_000, onFailure: failShot('approval-remote', 'dsh') }, async () => {
+    const page = dshSession.page
+    const toggle = async on => {
+      const { section } = await ensureRemoraTab(page)
+      await openRemoraSubTab(section, REMORA.tabs.permissions)
+      const control = await mustBePresent(section, REMORA.approvalsFromRemote, 'the "Allow approvals from MCP and CLI" switch')
+      if ((await control.getAttribute('aria-checked') === 'true') === on) return
+      const reply = page.waitForResponse(response => /\/api\/remora\/answers$/.test(response.url()), { timeout: 15_000 })
+      await control.click()
+      const body = await rpcBody(await reply)
+      if (!body?.result?.ok || body.result.value.settings.approvalsFromRemote !== on) throw new Error(`answers RPC failed: ${JSON.stringify(body)}`)
+    }
+    await toggle(true)
+    const shotPath = await shot(page, artifacts, 'flow-dsh-approvals-from-remote')
+    try {
+      const nonce = `m${randomBytes(4).toString('hex')}`
+      const { body: started } = await state.api('task.start', { hostId: state.host.hostId, target: state.target, prompt: `Remora E2E approval ${APPROVE_MARKER} nonce=${nonce}`, idempotencyKey: randomUUID() })
+      const item = await waitAttention(state.api, started.taskId, entry => entry.kind === 'approval' && entry.answerVia === 'remote')
+      await state.api('approval.respond', { hostId: state.host.hostId, sessionId: item.sessionId, attentionId: item.attentionId, answer: { approve: false } })
+      const done = await waitTask(state.api, started.taskId, value => TERMINAL.has(value))
+      if (done.state !== 'completed' || !done.result?.reply?.includes(`${WRITE_PREFIX} ${nonce} refused`)) throw new Error(`after rejecting: ${JSON.stringify(done)}`)
+      if (findFile(world.root, approvalFile(nonce))) throw new Error('the rejected write happened anyway')
+      return `switch on (${shotPath}); approval.respond rejected it without a passkey; reply "${done.result.reply}"; no file written`
+    } finally {
+      await toggle(false)
+    }
   })
 
   await r.step('kill-switch.enforced', 'With the kill switch on, task.start is refused; off again and tasks run', { needs: ['task.complete'], timeoutMs: 120_000, onFailure: failShot('kill-switch', 'dsh') }, async () => {

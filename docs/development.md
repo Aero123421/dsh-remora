@@ -43,7 +43,7 @@ npm test
 - プラグインのデータは `$DSH_HOME/storages/dsh-remora/` の JSON（スキーマ版数つき、tmp → rename で原子的に書く）、ホスト鍵は `ctx.credentials`（無ければ `host-key.json`、どちらも平文・0600）に置きます。
 - 設定 RPC で権限や範囲を広げる変更は、ループバックの DSH Web からだけ受け付けます（`src/routes.ts` の `isLocalRequest`）。狭める変更と緊急停止はどこからでも可。
 - ハブへの WebSocket がプロキシを通るのは、DSH を `NODE_USE_ENV_PROXY=1` で起動したときだけです（Node 22.21 以上。Node 22.22 で確認）。
-- 外から答えられる質問は `tool-ask-user` が `timed` モードのものだけです。プランの確認と承認は外から答えられません。
+- 質問・プランの確認・承認への外からの回答は `src/adapter/answerer.ts` が DSH の waterfall に入って受け付けます。`timed` モードの質問は `userQuestions.answer` で答えます。承認はパスキー確認が既定で、DSH 側のスイッチで MCP・CLI からも許可できます。
 - `packages/protocol` や `assets/` のロゴを変えたら `pnpm vendor:sync` を実行し、`hub/` 側のコピーも一緒にコミットします。
 
 ## 確認済みのこと（2026-10-12、v0.1.0）

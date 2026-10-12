@@ -63,7 +63,7 @@ DSH に渡す環境変数:
 `e2e.patch.yml` は次の 2 つを入れるオーバーレイです（プロファイルには書き込みません）。
 
 - `workspace-controller` の `documentsDirectory` を一時ディレクトリの `Documents` に固定する。Linux では「書類」フォルダを `xdg-user-dir` で調べるため、これが無いコンテナでは既定のワークスペースが作られず（`spawn xdg-user-dir ENOENT`）、チャット欄が出ません。
-- 各エージェントプリセット（`preset-standard`・`preset-ptc`・`preset-cordis`）の `tool-ask-user` を `mode: timed`（1 秒）にする。既定の `legacy` モードの質問は DSH Web が抱えたままで、Remora からは答えられません。timed モードでは 1 秒後に質問が「続き」扱いになり、`attention.respond` が `userQuestions.answer` で答えられます。ツールの行はプリセットの `config.plugins` の中にあり、パッチで id 指定できないため、`dsh --dump-config` からプリセットの行を写して `config` を足したものを追記します（`enableTimedQuestions`）。
+- 各エージェントプリセット（`preset-standard`・`preset-ptc`・`preset-cordis`）の `tool-ask-user` を `mode: timed`（1 秒）にする。timed モードでは 1 秒後に質問が「続き」扱いになり、`attention.respond` が `userQuestions.answer` で答えられます。モックが `timeout: -1` を付けると、timed モードでも legacy と同じく答えが来るまで止まる質問になり、Remora が waterfall で受け付けた質問への回答を試せます。ツールの行はプリセットの `config.plugins` の中にあり、パッチで id 指定できないため、`dsh --dump-config` からプリセットの行を写して `config` を足したものを追記します（`enableTimedQuestions`）。
 
 ### モックのモデル（`e2e/lib/mock-llm.mjs`）
 
@@ -74,7 +74,10 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 | 通常 | `REMORA-MOCK-REPLY <nonce>`（発話中の `nonce=<id>`、無ければ `none`） |
 | `remora-e2e:ask` を含む（`ask_user_question` が使えるとき） | `ask_user_question` のツール呼び出し（Teal／Navy の 2 択） |
 | timed モードで回答待ちのツール結果の直後 | `REMORA-MOCK-WAITING <nonce>` |
+| `remora-e2e:ask-blocking` を含む | 同じ質問に `timeout: -1` を付けたもの（答えが来るまで止まる質問） |
+| `remora-e2e:approve` を含む（`write` が使えるとき） | `write`（`remora-e2e-<nonce>.txt`）を `sandbox_permissions: danger-full-access` 付きで呼ぶ。DSH はこれを承認としてユーザーに尋ねる |
 | 回答（legacy のツール結果、または timed の `answer_to_pending_question`）の直後 | `REMORA-MOCK-ANSWERED <nonce> <回答>` |
+| `write` の結果の直後 | `REMORA-MOCK-WRITE <nonce> done`（書けた）／`refused`（拒否・エラー） |
 
 `node e2e/lib/mock-llm.mjs --port 4200` で単体でも起動できます。DSH の pi-ai 経由で試す場合は、プロファイルの `cordis.patch.yml` に `llm-pi-ai` のカスタムプロバイダー（`api: openai-completions`、`baseURL: http://127.0.0.1:4200/v1`）を足します。
 
@@ -115,6 +118,10 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 | `token.mint` | ハブの設定画面で個人トークン（`dsh.read`・`dsh.content`・`dsh.tasks`）をパスキーの再確認つきで発行し、「接続」画面でそのホストに「依頼できる」を付与する（ハブが DSH の上限を知るまで待つ） |
 | `task.complete` | `hosts.list` → `sessions.list` → `task.start`（同じ `idempotencyKey` で 2 回送って同じタスクになること）→ `task.wait` で `completed`、返答がモックの `REMORA-MOCK-REPLY <nonce>` で、モックがそのプロンプトを受け取っている |
 | `task.attention` | `ask_user_question`（timed モード）で `needs_attention`、`attention.list` に出て、`attention.respond` で答えると続きのターンが `REMORA-MOCK-ANSWERED <nonce> Teal` を返して `completed` |
+| `answer.web-open` | DSH Web を開いたまま、答えが来るまで止まる質問を出す。Remora も受け付け（`answerVia: remote`、DSH Web が画面で待つ間は締め切り無し）、`attention.respond` で Navy と答えると続きが `REMORA-MOCK-ANSWERED <nonce> … Navy …` で `completed` |
+| `answer.no-web` | DSH Web のページを離れて（イベントの流れが切れる）同じ質問を出す。締め切り（約 10 分後）付きで受け付けられ、項目の `answerUrl`（ハブの回答ページ）で Teal を選んで答えると `completed`。最後に DSH Web へ戻る |
+| `approval.passkey` | モックが `write` に権限の拡大を求め、DSH が承認を尋ねる。既定では `answerVia: hub-passkey`、HTTP API の `approval.respond` は 403（`confirmation-failed`）でハブの回答ページへのリンクを返す。そのページで「パスキーで確認して今回だけ許可」を押すと、DSH 側が署名を確かめて許可し、`REMORA-MOCK-WRITE <nonce> done` で `completed`（ファイルが既定のワークスペースにできる） |
+| `approval.remote` | Remora タブで「Allow approvals from MCP and CLI」をオンにすると、項目が `answerVia: remote` になり、`approval.respond`（拒否）がパスキーなしで通って `REMORA-MOCK-WRITE <nonce> refused` で `completed`、ファイルはできない。最後にスイッチを戻す |
 | `kill-switch.enforced` | DSH 側で緊急停止を入れると `task.start` が 403（`denied`、層は dsh）で拒否され、切ると再接続してタスクがまた完了する |
 
 ハブは `http://localhost:8788` として使います。WebAuthn は IP アドレスを RP ID にできないためです。ハブの状態は一時ディレクトリに置くので、毎回オーナー未登録の状態から始まります。`wrangler dev` には `WRANGLER_SEND_METRICS=false` と `CLOUDFLARE_CF_FETCH_ENABLED=false`（`Request.cf` を取りに行かない）を渡します。
@@ -125,12 +132,13 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 
 | 場所 | `data-testid` |
 | --- | --- |
-| Remora ページ（`packages/dsh-remora/src/ui/`） | `remora-page`、`remora-kill-switch`（`data-on` で状態）、`remora-hub-status`（`data-state` に接続状態）、`remora-hub-url`、`remora-pair-start`、`remora-pair-code`、`remora-ceiling-<view\|request\|full\|custom>` |
+| Remora ページ（`packages/dsh-remora/src/ui/`） | `remora-page`、`remora-kill-switch`（`data-on` で状態）、`remora-hub-status`（`data-state` に接続状態）、`remora-hub-url`、`remora-pair-start`、`remora-pair-code`、`remora-ceiling-<view\|request\|full\|custom>`、`remora-answers`（「外からの回答」。承認のスイッチは名前で探す） |
 | ハブ: 初回登録（`/`） | `hub-setup-token`、`hub-setup-label`、`hub-register-passkey`、`hub-recovery-codes`、`hub-recovery-ack` |
 | ハブ: ログイン後のナビ | `hub-signed-in` |
 | ハブ: 個人トークン（`/settings#tokens`） | `hub-token-name`、`hub-token-create`、一度だけ表示する値は `hub-secret` |
 | ハブ: 接続（`/connections`） | `hub-grant-level`（クライアントごと・ホストごとの付与範囲） |
 | ハブ: ペアリング（`/pair?code=`） | まだ無し（`strong.code` と `button[name=decision][value=approve]` で探す） |
+| ハブ: 要対応の回答ページ（`/attention/<hostId>/<attentionId>`） | `hub-attention-item`、`hub-question-answer`、`hub-plan-approve`／`hub-plan-reject`、`hub-approval-allow`／`hub-approval-reject` |
 
 ## 後片付け
 
@@ -149,5 +157,7 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 - `dsh plugin add` は pnpm のメタデータを取りに npm レジストリへアクセスします。オフラインでは動きません。
 - サンドボックスなど `HTTPS_PROXY` がある環境では、Chromium を `--no-proxy-server` で起動します。プロキシ経由になると、非ループバックのアドレスへの WebSocket（`/api/remote.mux`）がプロキシに 403 で拒否され、DSH の不具合のように見えるためです。
 - `remote.*` は同じマシンの別アドレスから開くだけで、本当の別端末ではありません。DSH から見るとループバック以外の接続になる、という点だけを確かめます。
-- 質問への遠隔回答は timed モードが前提です。プラン確認（`exit_plan_mode`）と承認は遠隔では答えられないため、フローでは扱いません。
+- 答えが来るまで止まる質問は、timed モードの `ask_user_question` に `timeout: -1` を付けて出します。既定の legacy ツール（呼び出し id を渡さない）とは入口が違うため、そちらは単体テストで確かめています。
+- プランの確認（`exit_plan_mode`）は、プランモードへの切り替えをフローで扱わないため通していません（単体テストのみ）。
+- 承認は `write` の権限拡大で出します。ツールの実行前の確認（フックなど）からの承認は通していません。
 - トークンは個人トークンで作ります。OAuth＋PKCE の経路（`remora-cli`）はハブの単体テストと CLI 側の範囲で、このフローでは通しません。

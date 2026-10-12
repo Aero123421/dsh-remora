@@ -12,9 +12,16 @@
 //
 //   default                      -> "REMORA-MOCK-REPLY <nonce>"   (nonce from `nonce=<id>`, else "none")
 //   contains "remora-e2e:ask"    -> an `ask_user_question` tool call (only when the request offers that tool)
+//   contains "remora-e2e:ask-blocking"
+//                                -> the same with `timeout: -1`: a blocking ask that waits for an
+//                                   answer like the default legacy tool, even in timed mode
+//   contains "remora-e2e:approve"
+//                                -> a `write` call asking for a sandbox escalation, which DSH puts
+//                                   to the user as an approval
 //   newest message is the answer -> "REMORA-MOCK-ANSWERED <nonce> <answer json>"
 //   timed question still pending -> "REMORA-MOCK-WAITING <nonce>", then the
 //   answer_to_pending_question user message -> "REMORA-MOCK-ANSWERED <nonce> <label>"
+//   newest message is a `write` result -> "REMORA-MOCK-WRITE <nonce> done|refused"
 //
 // Run standalone: node e2e/lib/mock-llm.mjs --port 4200
 import { createServer } from 'node:http'
@@ -24,7 +31,11 @@ export const REPLY_PREFIX = 'REMORA-MOCK-REPLY'
 export const ANSWERED_PREFIX = 'REMORA-MOCK-ANSWERED'
 export const WAITING_PREFIX = 'REMORA-MOCK-WAITING'
 export const ASK_MARKER = 'remora-e2e:ask'
+export const ASK_BLOCKING_MARKER = 'remora-e2e:ask-blocking'
+export const APPROVE_MARKER = 'remora-e2e:approve'
+export const WRITE_PREFIX = 'REMORA-MOCK-WRITE'
 export const ASK_TOOL = 'ask_user_question'
+export const WRITE_TOOL = 'write'
 export const MOCK_MODEL = 'remora-mock'
 
 const NONCE = /nonce=([A-Za-z0-9_-]{1,64})/
@@ -44,6 +55,28 @@ function nonceIn(messages) {
   return 'none'
 }
 
+/** Name of the tool whose call the newest message answers (the previous assistant turn's call). */
+function answeredTool(messages, protocol) {
+  const last = messages.at(-1)
+  for (let index = messages.length - 2; index >= 0; index--) {
+    const message = messages[index]
+    if (message?.role !== 'assistant') continue
+    if (protocol === 'openai') {
+      const call = (message.tool_calls ?? []).find(item => item?.id === last?.tool_call_id) ?? message.tool_calls?.[0]
+      return call?.function?.name
+    }
+    const id = Array.isArray(last?.content) ? last.content.find(block => block?.type === 'tool_result')?.tool_use_id : undefined
+    const blocks = Array.isArray(message.content) ? message.content.filter(block => block?.type === 'tool_use') : []
+    return (blocks.find(block => block.id === id) ?? blocks[0])?.name
+  }
+  return undefined
+}
+
+/** File the approval test writes, inside the session's working directory. */
+export function approvalFile(nonce) {
+  return `remora-e2e-${nonce}.txt`
+}
+
 /**
  * Decide the reply for a conversation in a protocol-neutral form.
  * @param {{ messages: any[], toolNames: string[], protocol: 'anthropic' | 'openai' }} request
@@ -57,6 +90,11 @@ export function decide({ messages, toolNames, protocol }) {
     : (Array.isArray(last?.content) ? last.content.find(block => block?.type === 'tool_result') : undefined)
   if (answer !== undefined) {
     const text = typeof answer === 'string' ? answer : textOf(answer.content)
+    if (answeredTool(messages, protocol) === WRITE_TOOL) {
+      // DSH's write tool answers "Created file" / "Updated file"; anything else is a refusal or an error.
+      const done = /\b(Created|Updated) file\b/.test(text)
+      return { kind: 'text', text: `${WRITE_PREFIX} ${nonce} ${done ? 'done' : 'refused'}` }
+    }
     // Legacy mode returns the answers; timed mode returns a "pending" notice
     // and the answer arrives later as a user message (answer_to_pending_question).
     if (!/"answers"/.test(text)) return { kind: 'text', text: `${WAITING_PREFIX} ${nonce}` }
@@ -66,6 +104,19 @@ export function decide({ messages, toolNames, protocol }) {
   if (/answer_to_pending_question/.test(lastText)) {
     const picked = /Teal|Navy/.exec(lastText)?.[0] ?? 'other'
     return { kind: 'text', text: `${ANSWERED_PREFIX} ${nonce} ${picked}` }
+  }
+  if (lastText.includes(APPROVE_MARKER) && toolNames.includes(WRITE_TOOL)) {
+    return {
+      kind: 'tool',
+      id: `toolu_remora_${nonce}_${Date.now().toString(36)}`,
+      name: WRITE_TOOL,
+      input: {
+        file_path: approvalFile(nonce),
+        content: `written after an approval from outside (${nonce})\n`,
+        sandbox_permissions: 'danger-full-access',
+        justification: `Remora E2E approval test (${nonce})`,
+      },
+    }
   }
   if (lastText.includes(ASK_MARKER) && toolNames.includes(ASK_TOOL)) {
     return {
@@ -79,6 +130,7 @@ export function decide({ messages, toolNames, protocol }) {
           question: `Which color should the E2E pick? (${nonce})`,
           options: [{ label: 'Teal', description: 'The Remora brand color.' }, { label: 'Navy', description: 'The hub background.' }],
         }],
+        ...(lastText.includes(ASK_BLOCKING_MARKER) ? { timeout: -1 } : {}),
       },
     }
   }

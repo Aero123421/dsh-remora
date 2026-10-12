@@ -51,8 +51,10 @@ DSH のサンドボックスが制限するのはファイルの書き込みだ�
 
 ## 要対応と完了判定
 
-- 承認待ち: ログの `approval/asked` に `approval/decided` がまだ無い（`approval/request` waterfall には差し込まない）。
-- AI からの質問・プランの確認: `ask_user_question`／`exit_plan_mode` の `tool/call` に結果が無い。外から答えられるのは `tool-ask-user` が `timed` モードの質問だけ（DSH の既定 `legacy` では不可）。プランの確認と承認は外から答えられない。設定タブにプリセットごとのモードを出し、ローカルから `timed` に切り替えられる。
+- 承認待ち: ログの `approval/asked` に `approval/decided` がまだ無い。
+- AI からの質問・プランの確認: `ask_user_question`／`exit_plan_mode` の `tool/call` に結果が無い（`timed` モードで「続き」になった質問は `userQuestions` プロジェクションから）。
+- 外からの回答（`src/adapter/answerer.ts`）: プラグインは `user-questions/request` と `approval/request` の waterfall に `prepend`・`global` で入り、`next()`（DSH Web・TUI・ACP）と外からの回答を競わせる。外が勝つと、下流に渡した `request.signal` を差し替えた AbortSignal で中断し、DSH Web のカードを閉じさせる。下流があきらめた（`NO_PROVIDER`／`'unavailable'`）か、DSH Web が一つもつながっていない（`typertGateway.hasLiveClient()`）ときだけ、設定の待ち時間で締め切り、誰も答えなければ質問は `NO_PROVIDER`、承認は `'unavailable'`（DSH は拒否扱い）で返す。受け付けるのはハブ接続中・緊急停止オフ・上限が答える操作を許す・範囲内・信頼済みワークスペースのときだけ。項目には `answerVia`（`remote`／`hub-passkey`／`dsh-web`）と `expiresAt` を付ける。
+- 承認（`approval.respond`、「依頼できる」）は `CONFIRMATION_UNLESS_ALLOWED`: DSH 側の「承認を MCP・CLI からも許可する」（既定オフ、ローカルからだけオン）がオフの間は、オーナーのパスキー確認（`confirmationChallenge`）が無いと DSH 側で `confirmation-failed` として断る。ハブはその断りにハブの回答ページのリンクを付けて返す。
 - 完了: `requestId`（＝ `remora:<clientId>:<taskId>`、user メッセージの `source.rpcId`）が一致するターンが終わり、セッションで何も動いておらず、キューが空で、要対応が無い。
 
 ## 無料枠
