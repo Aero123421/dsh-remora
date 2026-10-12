@@ -23,7 +23,9 @@ loop); `JsonlSessionPersistence` (real files in a temp dir);
 `storage-json` + `StorageDomain`; `WorkspaceRegistry`; `session-turn-outline`;
 `TokenMeter`; `SessionTitleService`; `UserQuestionService`; `tool-ask-user`
 in **timed** mode (1 s); `ApprovalService` (`dsh-user-approval`, policy
-`ask`); `SessionQueryEngine` (point reads and listings);
+`ask`); `ScheduleService` (`dsh-schedule`, real timers and delivery);
+`LocalSubprocessRuntime` (`dsh-subprocess-local`, real processes);
+`SessionQueryEngine` (point reads and listings);
 `SessionController` (list, inspect, projections, create, rename, prompt with
 requestId dedupe, updateQueue, cancel, resolveAgent / resume).
 
@@ -39,6 +41,10 @@ requestId dedupe, updateQueue, cancel, resolveAgent / resume).
 | timed question | the model calls `ask_user_question`; after the 1 s window the question is `continued`; the task goes `needs_attention` with an answerable item; an AttentionEvent without `detail` is emitted; attention.respond → `userQuestions.answer` steers the reply and the task completes with the follow-up turn's reply; a second answer is refused |
 | blocking question | the model calls `ask_user_question` with `timeout: -1` (a blocking ask, as in the default legacy mode): Remora's answerer, first in the real `user-questions/request` chain, holds it (nothing else answers in this run, so with a deadline); attention.list shows it answerable from outside; attention.respond answers through the chain and the tool result carries the answer |
 | approvals | during an open turn, `ctx.approval.request(...)` logs `approval/asked` and runs the real `approval/request` chain: Remora holds it (route `hub-passkey`), approval.respond resolves it `allowed-once` and DSH logs that outcome; a second request nobody answers comes back `unavailable` after the wait |
+| search | sessions.search finds the prompt in the real log read through `inspect`, with the turn and a snippet |
+| fork | session.fork at turn 1 goes through the real `sessionController.fork`: the new session is in the workspace, carries the title, and holds only turn 1; the original keeps every turn |
+| schedules | schedule.create / schedules.list / schedule.delete against the real schedule service (idempotent create, DSH's own rule validation); a one-shot `afterSeconds: 1` schedule really delivers its prompt to the session as a new turn |
+| terminal | terminal.run through the real local subprocess service: runs in the workspace folder, exit code and stderr come back, output is redacted, a 1 s timeout ends `sleep 20`, a workspace out of scope is `denied` |
 | resubmit / steer | resubmit re-sends the prompt read back from the log; steer on an idle session is queued |
 | cancel | a prompt queued behind a running turn is removed through `session.updateQueue`; the running one is stopped through `session.cancel` |
 | scope / archive | a workspace outside the scope is `denied`; an archived session (real `archiveSession`) is refused before DSH and hidden from sessions.list |
@@ -55,4 +61,5 @@ requestId dedupe, updateQueue, cancel, resolveAgent / resume).
 - Loading through the DSH plugin loader / `cordis.patch.yml`, the Remora core, the hub connection.
 - The legacy-mode `ask_user_question` tool itself (it passes no call id; covered by unit tests and the E2E run), `exit_plan_mode` plan reviews (plan mode is not composed; unit tests only), DSH Web's card being withdrawn when an outside answer wins (no gateway here; unit tests and the E2E run), approvals asked by a real tool's permission prompt (the request is made directly), goals (`ctx.goals`), slash commands (`ctx.commands`), background jobs (`ctx.jobs`), workspace changes and deliverables (`workspaceChanges`, `present` tool), the skill catalog (`sessionSkillCatalog` needs `workingDirectory`, not composed), `selectModel` / `modelCatalog` against real providers, agent presets other than the default, subagent sessions, `workspace.create` with a real `git` (covered by unit tests with a fake git).
 - DSH Web presence (`hasLiveClient` is a heuristic; the gateway's `hasLiveClient()` that decides the answer deadline is not composed), multiple processes, Windows.
+- Background jobs (`ctx.jobs` is not composed: job.stop and the jobs on session.get are covered by unit tests), and the passkey check that guards terminal.run (core tests).
 - Unpinned DSH versions: run with `DSH_UPSTREAM_DIR` pointing at another checkout to try one.

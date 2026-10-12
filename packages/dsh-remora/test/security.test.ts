@@ -107,7 +107,10 @@ test('no remote path drives agent turns in an untrusted or cloning workspace', a
     assert.equal(await code(handlers['command.run']({ sessionId, command: '/goal', args: 'do things' }, context())), expected, `command ${sessionId}`)
     assert.equal(await code(handlers['command.run']({ sessionId, command: '/compact' }, context())), expected)
     assert.equal(await code(handlers['task.start']({ target: { sessionId }, prompt: 'x', idempotencyKey: sessionId }, context({ taskId: `t-${sessionId}` }))), expected)
+    // A schedule starts turns later: same rule.
+    assert.equal(await code(handlers['schedule.create']({ sessionId, title: 'later', prompt: 'x', when: { afterSeconds: 60 }, idempotencyKey: `s-${sessionId}` }, context())), expected, `schedule ${sessionId}`)
   }
+  assert.equal(dsh.scheduleRows.length, 0, 'no schedule was created')
   assert.equal(await code(handlers['attention.respond']({ sessionId: 'su', attentionId: 'call-1', answer: { optionId: '0' } }, context())), 'denied')
   assert.deepEqual(dsh.answers, [])
   assert.equal(dsh.calls.filter(call => ['command', 'prompt', 'resolveAgent'].includes(call.method)).length, 0, 'no agent was woken or driven')

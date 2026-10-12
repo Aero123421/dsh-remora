@@ -12,7 +12,7 @@ import type { OperationContext } from '../ops/types.ts'
 import { OperationError } from '../ops/types.ts'
 import { redact, redactLine, redactTruncate } from '../redact.ts'
 import type {
-  DshFileDiff, DshJobs, DshProjectionValues, DshSessionEvent, DshSessionSkillCatalog, DshSkills, DshWorkspaceChanges,
+  DshFileDiff, DshProjectionValues, DshSessionEvent, DshSessionSkillCatalog, DshSkills, DshWorkspaceChanges,
 } from './dsh-types.ts'
 import { SERVICES } from './dsh-types.ts'
 import { denied, fromDsh, invalid, notFound, unavailable } from './errors.ts'
@@ -20,6 +20,7 @@ import {
   changesEvents, countTurns, findTaskTurn, lastReply, presentedFiles, transcriptItems, turnPreviews,
 } from './events.ts'
 import { hasContent, type Runtime, type SessionRow } from './runtime.ts'
+import { jobsOf } from './jobs.ts'
 import { failedClones } from './workspace-create.ts'
 
 type Params<Op extends keyof OperationParams> = OperationParams[Op]
@@ -223,6 +224,8 @@ export function createReads(rt: Runtime) {
         recentTurns,
         queueLength: queueLength(values),
         attention: forCaller(attention, context),
+        // Command lines are session content: without dsh.content only ids and states.
+        jobs: jobsOf(rt, row.sessionId).map(job => (content ? job : { ...job, label: '' })),
         hasLiveClient: rt.hasLiveClient(row.sessionId),
         untrusted: true,
       }
@@ -380,41 +383,6 @@ export function createReads(rt: Runtime) {
       const base = row.workspacePath ?? row.summary.cwd
       if (!base) throw denied('the session has no working directory to read deliverables from')
       return readDeliverable(file.path, base, params.maxBytes ?? 256_000, file.description)
-    },
-
-    async 'job.output'(params: Params<'job.output'>, context: OperationContext): Promise<Result<'job.output'>> {
-      if (!hasContent(context)) throw new OperationError('denied', 'reading job output needs the dsh.content scope', { denial: { layer: 'token', reason: 'missing-scope' } })
-      const jobs = rt.get<DshJobs>(SERVICES.jobs)
-      if (!jobs) throw unavailable('DSH background jobs are not available')
-      // Jobs are fenced by owning session; find an owner the caller may reach.
-      const rows = await rt.catalog(context.signal)
-      let owner: string | undefined
-      let view: ReturnType<DshJobs['get']> | undefined
-      for (const candidate of [undefined, ...rows.filter(row => rt.liveAgent(row.sessionId) !== undefined || row.summary.agentAvailable).map(row => row.sessionId)]) {
-        try {
-          view = jobs.get(params.jobId, candidate)
-          owner = candidate
-          break
-        } catch {
-          // not visible to this caller
-        }
-      }
-      if (!view) throw notFound(`job ${params.jobId} not found`)
-      if (view.owner !== undefined) {
-        const row = rows.find(item => item.sessionId === view!.owner)
-        if (!row || !rt.canAccess(row)) throw denied(`job ${params.jobId} belongs to a session outside Remora's reach`)
-      }
-      const tail = params.tailBytes ?? 64_000
-      const from = Math.max(view.output.earliest, view.output.total - tail)
-      const read = jobs.readAt(params.jobId, from, owner)
-      const output = read.chunks.map(chunk => chunk.text).join('')
-      const bounded = redactTruncate(output, tail)
-      return {
-        output: bounded.text,
-        truncated: read.lossy || from > 0 || bounded.truncated,
-        running: view.status === 'running' || view.status === 'stopping',
-        untrusted: true,
-      }
     },
   }
 }

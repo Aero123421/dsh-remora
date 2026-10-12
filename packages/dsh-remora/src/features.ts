@@ -34,10 +34,15 @@ export const SERVICE_REQUIREMENTS: Readonly<Record<OperationId, readonly string[
   'command.run': ['sessionController', 'commands'],
   // Answered by holding the `approval/request` chain (adapter/answerer.ts).
   'approval.respond': ['sessionController', 'approval'],
-  // P2, not implemented.
-  'terminal.run': ['terminals'],
-  'job.stop': ['jobs'],
-  'schedule.manage': ['schedule'],
+  'sessions.search': ['sessionController'],
+  'session.fork': ['sessionController'],
+  'job.stop': ['sessionController', 'jobs'],
+  'schedules.list': ['sessionController', 'schedule'],
+  'schedule.create': ['sessionController', 'schedule'],
+  'schedule.delete': ['sessionController', 'schedule'],
+  'terminal.run': ['workspaceRegistry', 'subprocess'],
+  // Answered by the hub from its confirmation ledger; never offered by a host.
+  'confirmation.get': [],
 }
 
 /**
@@ -54,6 +59,8 @@ export const IMPLEMENTED: ReadonlySet<OperationId> = new Set<OperationId>([
   'attention.respond', 'changes.get', 'patch.get', 'deliverable.read', 'session.usage',
   'task.steer', 'task.cancel', 'task.resubmit', 'goal.manage', 'job.output',
   'workspace.create', 'model.select', 'command.run', 'approval.respond',
+  // P2
+  'sessions.search', 'session.fork', 'job.stop', 'schedules.list', 'schedule.create', 'schedule.delete', 'terminal.run',
 ])
 
 export interface FeatureReport {

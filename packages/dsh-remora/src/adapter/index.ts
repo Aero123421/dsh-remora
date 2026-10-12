@@ -13,6 +13,10 @@ import type { HostContext } from '../dsh.ts'
 import type { AdapterDeps, CreateAdapter, OperationContext, OperationHandlers } from '../ops/types.ts'
 import { createActions } from './actions.ts'
 import { Answerer } from './answerer.ts'
+import { createJobs } from './jobs.ts'
+import { createSchedules } from './schedules.ts'
+import { createSearch } from './search.ts'
+import { createTerminal } from './terminal.ts'
 import { createReads } from './reads.ts'
 import { Runtime } from './runtime.ts'
 import { Tasks } from './tasks.ts'
@@ -40,6 +44,10 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
   const handlers: OperationHandlers = {
     ...reads,
     ...actions,
+    ...createJobs(rt),
+    ...createSchedules(rt),
+    ...createSearch(rt),
+    ...createTerminal(rt),
     ...workspaces.handlers,
     'task.start': (params, context: OperationContext) => tasks.start(params, context),
     'task.get': (params, context) => tasks.get(params, context),
@@ -47,7 +55,6 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
     'task.steer': (params, context) => tasks.steer(params, context),
     'task.cancel': (params, context) => tasks.cancel(params, context),
     'task.resubmit': (params, context) => tasks.resubmit(params, context),
-    // Not implemented (no clean DSH API at 0.2.1-alpha.2): terminal.run, job.stop, schedule.manage.
   }
 
   return {

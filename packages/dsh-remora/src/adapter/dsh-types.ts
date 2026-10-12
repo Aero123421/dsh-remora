@@ -135,6 +135,8 @@ export interface DshSessionController {
   selectModel(request: { sessionId: string } & DshModelSelection): Promise<{ selected: DshModelSelection }>
   modelCatalog(): Promise<DshModelCatalog>
   resolveAgent(sessionId: string): Promise<{ agent: DshAgent } | { error: DshRemoteErrorLike }>
+  /** New ordinary session from an exact event prefix (`atSeq` inclusive; default: the latest finished turn). */
+  fork?(request: { sessionId: string; atSeq?: number; allowMigration?: boolean }): Promise<{ sessionId: string }>
 }
 
 // --- workspaces ---------------------------------------------------------------
@@ -233,6 +235,68 @@ export interface DshJobView {
 export interface DshJobs {
   get(id: string, caller?: string): DshJobView
   readAt(id: string, from: number, caller?: string): { chunks: readonly { at: number; text: string }[]; next: number; lossy: boolean }
+  /** Caller-owned and unowned jobs in registration order. */
+  list(caller?: string): DshJobView[]
+  /** Request cancellation; `already-finished` for settled work. */
+  kill(id: string, caller?: string, reason?: string): 'requested' | 'already-finished'
+}
+
+// --- schedules (packages/schedule/schedule/src/{index,types}.ts) -------------------
+
+export type DshScheduleRecord =
+  | { id: string; kind: 'after'; title: string; prompt: string; afterSeconds: number; scheduledAt: string }
+  | { id: string; kind: 'at'; title: string; prompt: string; scheduledAt: string }
+  | { id: string; kind: 'every'; title: string; prompt: string; everySeconds: number; scheduledAt: string }
+  | { id: string; kind: 'daily'; title: string; prompt: string; time: string; timeZone: string; scheduledAt: string }
+  | { id: string; kind: 'weekly'; title: string; prompt: string; time: string; timeZone: string; weekdays: number[]; scheduledAt: string }
+  | { id: string; kind: 'cron'; title: string; prompt: string; expression: string; timeZone: string; scheduledAt: string }
+
+export type DshScheduleCatalogEntry = DshScheduleRecord & {
+  sessionId: string
+  status: 'active' | 'inactive'
+  lastDelivery?: { scheduledAt: string; deliveredAt: string; messageId: string }
+}
+
+export interface DshScheduleCreateRequest {
+  prompt: string
+  title: string
+  after_seconds?: number
+  at?: string
+  every_seconds?: number
+  daily?: { time: string; time_zone: string }
+  weekly?: { time: string; time_zone: string; weekdays: number[] }
+  cron?: { expression: string; time_zone: string }
+}
+
+export interface DshSchedule {
+  create(sessionId: string, request: DshScheduleCreateRequest, signal?: AbortSignal): Promise<DshScheduleRecord>
+  catalog(): Promise<DshScheduleCatalogEntry[]>
+  delete(request: { sessionId: string; id: string }, signal?: AbortSignal): Promise<{ id: string; deleted: true } | { id: string; deleted: false; code: string }>
+}
+
+// --- subprocess (packages/process/subprocess/src/{index,types}.ts) -----------------
+
+export interface DshSubprocessReader {
+  readFrom(fromByte: number): { text: string; nextOffset: number; lossy: boolean }
+}
+
+export interface DshSubprocessHandle {
+  readonly collected: { stdout?: DshSubprocessReader; stderr?: DshSubprocessReader }
+  readonly done: Promise<{ exitCode: number | null; signal: string | null }>
+  terminate(): void
+}
+
+export interface DshSubprocess {
+  terminalEnvironment(signal?: AbortSignal): Promise<{ platform: 'posix' | 'windows'; defaultShell?: string }>
+  resolveExecutable(command: string, env?: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<string>
+  spawn(spec: {
+    argv: readonly string[]
+    cwd: string
+    stdio: { stdin: 'ignore'; stdout: { maxBytes: number }; stderr: { maxBytes: number } }
+    graceMs: number
+    signal?: AbortSignal
+    env?: Record<string, string | undefined>
+  }): DshSubprocessHandle
 }
 
 // --- deliverables -------------------------------------------------------------
@@ -307,6 +371,8 @@ export const SERVICES = {
   workspaceChanges: 'workspaceChanges',
   sessionSkillCatalog: 'sessionSkillCatalog',
   skills: 'skills',
+  schedule: 'schedule',
+  subprocess: 'subprocess',
 } as const
 
 export interface DshAgents {

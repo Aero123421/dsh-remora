@@ -79,7 +79,7 @@ export function PermissionsSection({ snapshot, t, run, busy }: SectionProps) {
       <div className="rmr-section-head"><h3>{t('perm.ops')}</h3><span className="rmr-muted">{t('perm.opsHint')}</span></div>
       {groups.map(group => <div key={group} className="rmr-list">
         <div className="rmr-group-title">{t(`perm.group.${group}`)}</div>
-        {snapshot.operations.filter(op => op.level === group && op.id !== 'status' && op.id !== 'hosts.list').map(op => <div key={op.id} className="rmr-item">
+        {snapshot.operations.filter(op => op.level === group && op.id !== 'status' && op.id !== 'hosts.list' && op.id !== 'confirmation.get').map(op => <div key={op.id} className="rmr-item">
           <div className="rmr-item-text">
             <span>{t(`op.${op.id}` as CopyKey)}</span>
             <span className="rmr-inline"><span className="rmr-faint rmr-mono">{op.id}</span>{op.available ? null : <Tag tone="quiet">{t('perm.unavailable')}</Tag>}</span>

@@ -23,6 +23,8 @@ export { default as SessionTitleService } from '@deepseek-ai/dsh-session-title'
 export { default as UserQuestionService } from '@deepseek-ai/dsh-user-questions'
 export * as ToolAskUser from '@deepseek-ai/dsh-tool-ask-user'
 export { default as ApprovalService } from '@deepseek-ai/dsh-user-approval'
+export { default as ScheduleService } from '@deepseek-ai/dsh-schedule'
+export { default as SubprocessLocal } from '@deepseek-ai/dsh-subprocess-local'
 // DSH's own scripted model adapter (packages/core/agent-loop/tests/mock-adapter.ts).
 export { MockAdapter, textResponse, toolCallResponse } from '@dsh-compat/mock-adapter'
 

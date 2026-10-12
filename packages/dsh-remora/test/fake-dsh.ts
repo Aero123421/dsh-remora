@@ -3,6 +3,7 @@
  * (sessionController, workspaceRegistry, agents, userQuestions, goals,
  * commands, workspaceChanges), plus a recording ScopePolicy and TaskStore.
  */
+import { spawn as spawnChild } from 'node:child_process'
 import type { HostEvent, PlacementInfo } from '@dsh-remora/protocol'
 import type { AdapterDeps, OperationContext, ScopePolicy, SessionScopeInput, TaskRecord, TaskStore } from '../src/ops/types.ts'
 import type {
@@ -197,6 +198,15 @@ export class FakeDsh {
       ] }],
       failures: [],
     }),
+    fork: async (request: { sessionId: string; atSeq?: number }) => {
+      this.calls.push({ method: 'fork', args: request })
+      const source = this.session(request.sessionId)
+      const id = `${request.sessionId}-fork-${this.sessions.size}`
+      const workspace = this.workspaces.find(w => w.sessionIds.includes(request.sessionId))
+      const copy = this.addSession(id, { ...(workspace ? { workspace: workspace.id } : {}), live: true, title: `${source.values.title ?? ''} (fork)` })
+      copy.events = source.events.filter(event => request.atSeq === undefined || event.seq <= request.atSeq).map(event => ({ ...event }))
+      return { sessionId: id }
+    },
     resolveAgent: async (id: string) => {
       this.calls.push({ method: 'resolveAgent', args: id })
       try {
@@ -226,6 +236,81 @@ export class FakeDsh {
     },
   }
 
+  /** Background jobs: id → view + output. */
+  jobList: { id: string; kind: string; label: string; owner?: string; status: string; output: string }[] = []
+
+  readonly jobs = ((self: FakeDsh) => ({
+    visible(id: string, caller?: string) {
+      const job = self.jobList.find(item => item.id === id)
+      if (!job || (job.owner !== undefined && job.owner !== caller)) throw new Error(`job ${id} not found`)
+      return job
+    },
+    view(job: { id: string; kind: string; label: string; owner?: string; status: string; output: string }) {
+      return { id: job.id, kind: job.kind, label: job.label, ...(job.owner ? { owner: job.owner } : {}), status: job.status, output: { total: job.output.length, earliest: 0 } }
+    },
+    get(id: string, caller?: string) { return this.view(this.visible(id, caller)) },
+    readAt(id: string, from: number, caller?: string) {
+      const job = this.visible(id, caller)
+      return { chunks: [{ at: from, text: job.output.slice(from) }], next: job.output.length, lossy: false }
+    },
+    list(caller?: string) { return self.jobList.filter(job => job.owner === undefined || job.owner === caller).map(job => this.view(job)) },
+    kill(id: string, caller?: string, reason?: string) {
+      const job = this.visible(id, caller)
+      self.calls.push({ method: 'kill', args: { id, caller, reason } })
+      if (job.status !== 'running') return 'already-finished' as const
+      job.status = 'killed'
+      return 'requested' as const
+    },
+  }))(this)
+
+  /** Automation tasks. */
+  scheduleRows: { id: string; sessionId: string; status: 'active' | 'inactive'; record: any }[] = []
+  readonly schedule = ((self: FakeDsh) => ({
+    async create(sessionId: string, request: any) {
+      self.calls.push({ method: 'schedule.create', args: { sessionId, request } })
+      if (request.title.trim() === '') throw Object.assign(new Error('A task name is required.'), { name: 'ScheduleInputError', code: 'invalid_prompt' })
+      const id = `schedule-${self.scheduleRows.length + 1}`
+      const base = { id, title: request.title, prompt: request.prompt, scheduledAt: '2026-10-13T00:00:00.000Z' }
+      const record = request.daily ? { ...base, kind: 'daily', time: request.daily.time, timeZone: request.daily.time_zone }
+        : request.cron ? { ...base, kind: 'cron', expression: request.cron.expression, timeZone: request.cron.time_zone }
+          : request.every_seconds ? { ...base, kind: 'every', everySeconds: request.every_seconds }
+            : request.weekly ? { ...base, kind: 'weekly', time: request.weekly.time, timeZone: request.weekly.time_zone, weekdays: request.weekly.weekdays }
+              : request.at ? { ...base, kind: 'at' } : { ...base, kind: 'after', afterSeconds: request.after_seconds }
+      self.scheduleRows.push({ id, sessionId, status: 'active', record })
+      return record
+    },
+    async catalog() { return self.scheduleRows.map(row => ({ ...row.record, sessionId: row.sessionId, status: row.status })) },
+    async delete(request: { sessionId: string; id: string }) {
+      const before = self.scheduleRows.length
+      self.scheduleRows = self.scheduleRows.filter(row => !(row.id === request.id && row.sessionId === request.sessionId))
+      return self.scheduleRows.length < before ? { id: request.id, deleted: true as const } : { id: request.id, deleted: false as const, code: 'schedule_not_found' }
+    },
+  }))(this)
+
+  /** Runs real commands with /bin/sh, like DSH's local subprocess provider. */
+  readonly subprocess = {
+    terminalEnvironment: async () => ({ platform: 'posix' as const, defaultShell: '/bin/sh' }),
+    resolveExecutable: async (command: string) => command,
+    spawn: (spec: { argv: readonly string[]; cwd: string; signal?: AbortSignal; stdio: { stdout: { maxBytes: number }; stderr: { maxBytes: number } } }) => {
+      this.calls.push({ method: 'spawn', args: { argv: spec.argv, cwd: spec.cwd } })
+      let stdout = ''
+      let stderr = ''
+      // Its own process group, terminated as a whole like DSH's managed range.
+      const child = spawnChild(spec.argv[0]!, spec.argv.slice(1), { cwd: spec.cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+      const killGroup = () => { try { process.kill(-child.pid!, 'SIGTERM') } catch { /* gone */ } }
+      if (spec.signal?.aborted) killGroup()
+      else spec.signal?.addEventListener('abort', killGroup, { once: true })
+      child.stdout.on('data', chunk => { stdout += String(chunk) })
+      child.stderr.on('data', chunk => { stderr += String(chunk) })
+      const done = new Promise<{ exitCode: number | null; signal: string | null }>(resolve => {
+        child.on('error', () => {})
+        child.on('close', (code, signal) => resolve({ exitCode: code, signal }))
+      })
+      const reader = (get: () => string, max: number) => ({ readFrom: (from: number) => ({ text: get().slice(-max).slice(from), nextOffset: get().length, lossy: get().length > max }) })
+      return { collected: { stdout: reader(() => stdout, spec.stdio.stdout.maxBytes), stderr: reader(() => stderr, spec.stdio.stderr.maxBytes) }, done, terminate: killGroup }
+    },
+  }
+
   readonly commands = {
     execute: async (_agent: DshAgent, line: string) => {
       this.calls.push({ method: 'command', args: line })
@@ -250,6 +335,9 @@ export class FakeDsh {
       userQuestions: this.userQuestions,
       commands: this.commands,
       sessionSkillCatalog: this.sessionSkillCatalog,
+      jobs: this.jobs,
+      schedule: this.schedule,
+      subprocess: this.subprocess,
     }
     return {
       connection: { fetch: { register: () => undefined } },

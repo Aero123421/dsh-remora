@@ -14,11 +14,11 @@ test('operations are offered only when implemented and every service is present'
   assert.deepEqual(report.missing, [{ operation: 'command.run', services: ['commands'] }])
 })
 
-test('every P0 and P1 operation is implemented; P2 ones are not', () => {
+test('every operation a host serves is implemented; hub-only ones are never offered', () => {
   const available = new Set(detectFeatures(() => true).available)
   for (const spec of OPERATIONS) {
-    if (spec.id === 'hosts.list') continue
-    assert.equal(available.has(spec.id), spec.phase !== 'P2', spec.id)
+    const hubOnly = spec.id === 'hosts.list' || spec.id === 'confirmation.get'
+    assert.equal(available.has(spec.id), !hubOnly, spec.id)
   }
 })
 

@@ -219,6 +219,39 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
       throw unavailable(NOT_HELD)
     },
 
+    async 'session.fork'(params: Params<'session.fork'>, context: OperationContext): Promise<Result<'session.fork'>> {
+      // Forking copies history into a new session; it starts no turn.
+      const source = await rt.row(params.sessionId, context.signal)
+      if (source.subagent) throw invalid(`session ${source.sessionId} is a subagent session; fork its parent instead`)
+      const controller = rt.sessions
+      if (typeof controller.fork !== 'function') throw unavailable('this DSH version cannot fork sessions')
+      let atSeq: number | undefined
+      if (params.atTurn !== undefined) {
+        const events = await rt.events(source.sessionId, context.signal)
+        const end = events.find(event => event.type === 'turn/end' && event.data?.turn === params.atTurn)
+        if (!end) throw invalid(`turn ${params.atTurn} has not finished in session ${source.sessionId}`)
+        atSeq = end.seq
+      }
+      let forked: { sessionId: string }
+      try {
+        forked = await controller.fork({ sessionId: source.sessionId, ...(atSeq !== undefined ? { atSeq } : {}), allowMigration: false })
+      } catch (error) {
+        throw fromDsh(error, 'forking the session failed')
+      }
+      // DSH makes the fork a live Agent; Remora woke it, not a browser.
+      rt.noteWake(forked.sessionId, false)
+      const title = params.title?.trim()
+      if (title) {
+        try {
+          await controller.rename({ sessionId: forked.sessionId, title })
+        } catch (error) {
+          rt.deps.logger.warn(`Remora: renaming the fork ${forked.sessionId} failed`, error)
+        }
+      }
+      const row = await rt.row(forked.sessionId, context.signal)
+      return { session: rt.summaryOf(row), forkedFrom: source.sessionId }
+    },
+
     async 'model.select'(params: Params<'model.select'>, context: OperationContext): Promise<Result<'model.select'>> {
       // Selecting a model starts no turn.
       const row = await sessionFor(params.sessionId, context, false)

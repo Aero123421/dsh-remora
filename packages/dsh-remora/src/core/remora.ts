@@ -654,7 +654,7 @@ export class RemoraCore {
   // --- reads ----------------------------------------------------------------------
 
   private operationIds(): string[] {
-    return this.features().available.filter(id => id !== 'status' && id !== 'hosts.list')
+    return this.features().available.filter(id => id !== 'status' && id !== 'hosts.list' && id !== 'confirmation.get')
   }
 
   private features(): FeatureReport {

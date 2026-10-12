@@ -65,11 +65,13 @@
   },
   "devDependencies": {
     "@dsh-remora/protocol": "workspace:*",
+    "@js-temporal/polyfill": "0.5.1",
     "@types/react": "18.3.31",
     "@types/ws": "8.18.1",
     "clsx": "2.1.1",
     "mime-types": "3.0.2",
     "qrcode-generator": "1.5.2",
+    "undici": "8.11.2",
     "ws": "8.18.3",
     "zod": "4.4.3"
   }

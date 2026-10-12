@@ -96,6 +96,7 @@ async function boot() {
   await ctx.plugin(dsh.UserQuestionService)
   await ctx.plugin(dsh.ToolAskUser, { mode: 'timed', timeout: 1 })
   await ctx.plugin(dsh.ApprovalService, { policy: 'ask' })
+  await ctx.plugin(dsh.SubprocessLocal, {})
   // Host services the Session Controller injects but the compat run does not exercise
   // (same stand-ins as DSH's own session-controller test harness).
   ctx.provide('typert', { lookups: { configure: () => () => {} }, contexts: { configureHost: () => () => {} } })
@@ -113,7 +114,8 @@ async function boot() {
   ctx.provide('fs', {})
   await ctx.plugin(dsh.CompatSessionQuery)
   await ctx.plugin(dsh.SessionController, {})
-  for (const name of ['sessionController', 'workspaceRegistry', 'agents', 'userQuestions', 'sessionQuery', 'sessionTitle', 'approval']) {
+  await ctx.plugin(dsh.ScheduleService, {})
+  for (const name of ['sessionController', 'workspaceRegistry', 'agents', 'userQuestions', 'sessionQuery', 'sessionTitle', 'approval', 'schedule', 'subprocess']) {
     assert.ok(ctx.get(name) !== undefined, `${name} is mounted`)
   }
 
@@ -332,6 +334,57 @@ await step('approvals: a DSH approval request is held; approval.respond allows i
   answerWait = 30_000
   await h['task.cancel']({ taskId: 't11' }, context())
   await waitFor('agent idle', () => ctx.agents.get(sessionId)?.status !== 'running')
+})
+
+await step('sessions.search: finds a prompt in the real session log (inspect), only in reachable sessions', async () => {
+  const found = await h['sessions.search']({ query: 'HELLO there' }, context())
+  const hit = found.hits.find(entry => entry.sessionId === sessionId && entry.role === 'user')
+  assert.ok(hit, JSON.stringify(found))
+  assert.equal(hit.turn, 1)
+  assert.match(hit.snippet, /hello there/)
+  assert.equal(found.partial, false)
+})
+
+await step('session.fork: the real sessionController.fork copies up to the end of turn 1 into a new session in the workspace', async () => {
+  const forked = await h['session.fork']({ sessionId, atTurn: 1, title: 'Compat fork' }, context())
+  assert.equal(forked.forkedFrom, sessionId)
+  assert.equal(forked.session.workspaceId, workspace.id)
+  assert.equal(forked.session.title, 'Compat fork')
+  const copy = await h['session.read']({ sessionId: forked.session.sessionId, depth: 'turns' }, context())
+  assert.equal(copy.turns.length, 1, 'only the first turn was copied')
+  assert.match(copy.turns[0].request, /hello there/)
+  assert.ok((await h['session.read']({ sessionId, depth: 'turns' }, context())).turns.length > 1, 'the original keeps every turn')
+})
+
+await step('schedules: the real schedule service creates, lists and deletes; a one-shot delivers its prompt as a new turn', async () => {
+  const daily = await h['schedule.create']({ sessionId, title: 'Compat daily', prompt: 'daily check', when: { daily: { time: '09:00', timeZone: 'Asia/Tokyo' } }, idempotencyKey: 'sch-1' }, context())
+  assert.equal(daily.schedule.rule, 'daily 09:00 Asia/Tokyo')
+  assert.ok(daily.schedule.nextAt > Date.now())
+  assert.equal((await h['schedule.create']({ sessionId, title: 'Compat daily', prompt: 'daily check', when: { daily: { time: '09:00', timeZone: 'Asia/Tokyo' } }, idempotencyKey: 'sch-1' }, context())).schedule.scheduleId, daily.schedule.scheduleId)
+  await assert.rejects(h['schedule.create']({ sessionId, title: 'Bad', prompt: 'x', when: { cron: { expression: 'not a cron', timeZone: 'UTC' } }, idempotencyKey: 'sch-bad' }, context()), { code: 'invalid_request' })
+  const before = userMessages(sessionId)
+  const once = await h['schedule.create']({ sessionId, title: 'Compat once', prompt: 'scheduled hello from compat', when: { afterSeconds: 1 }, idempotencyKey: 'sch-2' }, context())
+  assert.equal(once.schedule.kind, 'after')
+  const listed = await h['schedules.list']({ sessionId }, context())
+  assert.ok(listed.schedules.some(entry => entry.scheduleId === daily.schedule.scheduleId && entry.status === 'active'))
+  await waitFor('the scheduled prompt reached the session', () => userMessages(sessionId) > before, 20_000)
+  const delivered = ctx.sessions.get(sessionId).snapshotEvents().filter(e => e.type === 'user/message').at(-1)
+  assert.match(JSON.stringify(delivered.data.content), /scheduled hello from compat/)
+  await waitFor('agent idle after the scheduled turn', () => ctx.agents.get(sessionId)?.status !== 'running')
+  assert.deepEqual(await h['schedule.delete']({ sessionId, scheduleId: daily.schedule.scheduleId }, context()), { deleted: true })
+  assert.ok(!(await h['schedules.list']({ sessionId }, context())).schedules.some(entry => entry.scheduleId === daily.schedule.scheduleId))
+})
+
+await step('terminal.run: the real local subprocess service runs one command in the workspace folder, with a timeout', async () => {
+  const ran = await h['terminal.run']({ cwdWorkspaceId: workspace.id, command: 'pwd; echo OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx; echo to-stderr >&2; exit 4' }, context())
+  assert.equal(ran.exitCode, 4)
+  assert.equal(ran.stdout.split('\n')[0], workspacePath)
+  assert.ok(!ran.stdout.includes('sk-abcdefghijklmnop'), 'redacted')
+  assert.equal(ran.stderr.trim(), 'to-stderr')
+  const slow = await h['terminal.run']({ cwdWorkspaceId: workspace.id, command: 'sleep 20', timeoutMs: 1000 }, context())
+  assert.equal(slow.timedOut, true)
+  assert.ok(slow.durationMs < 10_000, `took ${slow.durationMs} ms`)
+  await assert.rejects(h['terminal.run']({ cwdWorkspaceId: outside.id, command: 'ls' }, context()), { code: 'denied' })
 })
 
 await step('scope and target rules: out-of-scope workspace denied, archived session refused before DSH', async () => {
