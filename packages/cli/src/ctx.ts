@@ -4,6 +4,7 @@
  * browser, keychain or clock.
  */
 import { spawn } from 'node:child_process'
+import { realpathSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 
 export interface ExecResult { code: number; stdout: string; stderr: string }
@@ -25,6 +26,8 @@ export interface Ctx {
   execPath: string
   /** True when running as a Node single executable application. */
   isSea: boolean
+  /** The `remora.mjs` being run by Node (script form), or null. */
+  scriptPath: string | null
   stdin: NodeJS.ReadableStream
   stdinIsTTY: boolean
   stderrIsTTY: boolean
@@ -80,6 +83,12 @@ function isSea(): boolean {
   }
 }
 
+function scriptPath(): string | null {
+  const script = process.argv[1]
+  if (!script) return null
+  try { return realpathSync(script) } catch { return script }
+}
+
 export function defaultCtx(): Ctx {
   return {
     out: line => process.stdout.write(`${line}\n`),
@@ -92,6 +101,7 @@ export function defaultCtx(): Ctx {
     cwd: process.cwd(),
     execPath: process.execPath,
     isSea: isSea(),
+    scriptPath: scriptPath(),
     stdin: process.stdin,
     stdinIsTTY: process.stdin.isTTY === true,
     stderrIsTTY: process.stderr.isTTY === true,

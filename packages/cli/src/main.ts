@@ -11,8 +11,9 @@ import { CliError, EXIT } from './errors.ts'
 import { login, logout } from './commands/auth.ts'
 import { attention, hosts, sessions, workspaces } from './commands/read.ts'
 import { answer, patch, run, tasks } from './commands/tasks.ts'
+import { approve, reject } from './commands/approvals.ts'
 import { doctor, mcp, NOT_YET, open, selfUpdateCommand } from './commands/misc.ts'
-import { cleanupOldBinary } from './selfupdate.ts'
+import { cleanupOldBinary, installOf } from './selfupdate.ts'
 import { CLI_VERSION } from './version.ts'
 
 export { CLI_VERSION } from './version.ts'
@@ -21,13 +22,13 @@ export type { Ctx } from './ctx.ts'
 export type Io = Ctx
 
 export const COMMANDS: readonly CommandDef[] = [
-  login, logout, hosts, sessions, tasks, run, attention, answer, patch, workspaces, open, doctor, mcp, selfUpdateCommand, ...NOT_YET,
+  login, logout, hosts, sessions, tasks, run, attention, answer, approve, reject, patch, workspaces, open, doctor, mcp, selfUpdateCommand, ...NOT_YET,
 ]
 
 const EXIT_CODE_HELP = [
   '終了コード:',
-  '  0 成功 / 1 失敗（タスクの失敗・取り消しを含む） / 2 未対応の機能 / 3 人の判断待ちで停止',
-  '  4 未ログイン・ログイン切れ / 5 権限で拒否 / 6 見つからない / 7 ハブやホストに届かない',
+  '  0 成功 / 1 失敗（タスクの失敗・取り消しを含む） / 2 未対応の機能 / 3 人の判断待ちで停止（承認待ちを含む）',
+  '  4 未ログイン・ログイン切れ / 5 権限で拒否（ハブでのパスキーが必要な承認を含む） / 6 見つからない / 7 ハブやホストに届かない',
   '  8 待機の打ち切り / 64 使い方の誤り / 130 待機中の Ctrl-C（タスクは続行）',
 ]
 
@@ -61,12 +62,15 @@ function report(ctx: Ctx, json: boolean, error: CliError): void {
   }
   ctx.err(`remora: ${error.message}`)
   if (error.detail.hint) ctx.err(error.detail.hint)
-  if (error.detail.fix) ctx.err(`直す場所: ${error.detail.fix}`)
+  if (error.detail.fix) ctx.err(/^https?:\/\//.test(error.detail.fix) ? `  ${error.detail.fix}` : `直す場所: ${error.detail.fix}`)
 }
 
 export async function main(argv: readonly string[], ctx: Ctx): Promise<number> {
   const [name, ...rest] = argv
-  if (ctx.isSea && ctx.platform === 'win32') await cleanupOldBinary(ctx.execPath)
+  if (ctx.platform === 'win32') {
+    const installed = installOf(ctx).path
+    if (installed) await cleanupOldBinary(installed)
+  }
   if (name === undefined || name === 'help' || name === '--help' || name === '-h') {
     const topic = name === 'help' ? COMMANDS.find(c => c.name === rest[0]) : undefined
     if (topic) commandHelp(ctx, topic)

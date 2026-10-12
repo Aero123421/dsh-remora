@@ -4,12 +4,12 @@
 //
 //   1. re-bundle dist/remora.mjs as CommonJS (Node 22's SEA entry must be CJS)
 //   2. node --experimental-sea-config  → preparation blob
-//   3. copy the node binary, inject the blob with postject (pinned 1.0.0-alpha.6)
+//   3. copy the node binary (Linux: strip symbols), inject the blob with postject (pinned 1.0.0-alpha.6)
 //   4. macOS: remove the signature before injecting, ad-hoc sign afterwards
 //   5. smoke test: `<binary> --version` must print the package version
 //
 // Usage (from the repo root, after `pnpm build`):
-//   node packages/cli/scripts/build-binaries.mjs [--out-dir artifacts/cli] [--node <path>] [--skip-smoke]
+//   node packages/cli/scripts/build-binaries.mjs [--out-dir artifacts/cli] [--node <path>] [--skip-smoke] [--no-strip]
 //
 // Output: <out-dir>/remora-<process.platform>-<process.arch>[.exe]
 // (linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64). The last line
@@ -35,6 +35,7 @@ const { values } = parseArgs({
     'out-dir': { type: 'string', default: join(repoRoot, 'artifacts/cli') },
     node: { type: 'string', default: process.execPath },
     'skip-smoke': { type: 'boolean', default: false },
+    'no-strip': { type: 'boolean', default: false },
   },
 })
 
@@ -87,6 +88,17 @@ try {
   await rm(output, { force: true })
   await copyFile(nodeBinary, output)
   await chmod(output, 0o755)
+  // Linux: drop the symbol tables before injecting (about −15 %, e.g. 123 → 105 MB).
+  // Not on macOS (it would invalidate more than the signature we redo anyway, for
+  // little gain on the already lean official builds) and not on Windows (PE is
+  // already symbol-free; packers such as UPX trigger antivirus false positives).
+  if (platform === 'linux' && !values['no-strip']) {
+    try {
+      run('strip', ['--strip-all', output])
+    } catch (error) {
+      console.warn(`strip failed or is missing; keeping the unstripped binary (${error.message})`)
+    }
+  }
   if (platform === 'darwin') run('codesign', ['--remove-signature', output])
   const require = createRequire(import.meta.url)
   const { inject } = require('postject')

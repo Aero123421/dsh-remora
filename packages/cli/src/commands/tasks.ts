@@ -8,7 +8,7 @@ import { readAll } from '../ctx.ts'
 import { CliError, EXIT, usageError } from '../errors.ts'
 import { clean, fmtElapsed, fmtTime, parseDuration, TASK_STATE_LABEL } from '../format.ts'
 import type { Hub } from '../hub.ts'
-import { attentionRows } from './read.ts'
+import { attentionLines, nextSteps } from '../attention.ts'
 
 const TARGET_FLAGS: FlagSpec = {
   host: 'string', session: 'string', latest: 'bool', title: 'string', alias: 'string', new: 'string',
@@ -76,7 +76,7 @@ function stateLine(info: TaskInfo): string {
   return `${info.taskId}  ${TASK_STATE_LABEL[info.state] ?? info.state}${info.sessionId ? `  セッション ${info.sessionId}` : ''}${info.hasLiveClient ? '  （DSH Web で誰かが見ています）' : ''}`
 }
 
-function printTask(cmd: Cmd, info: TaskInfo): void {
+function printTask(cmd: Cmd, info: TaskInfo, hubUrl: string): void {
   const out = cmd.ctx.out
   out(`タスク      ${info.taskId}`)
   out(`状態        ${TASK_STATE_LABEL[info.state] ?? info.state}`)
@@ -85,21 +85,16 @@ function printTask(cmd: Cmd, info: TaskInfo): void {
   out(`作成        ${fmtTime(info.createdAt)}  更新 ${fmtTime(info.updatedAt)}`)
   if (info.hasLiveClient) out('DSH Web で誰かがこのセッションを見ています。')
   if (info.error) out(`エラー      ${clean(info.error.message)}`)
-  printAttention(cmd, info)
+  printAttention(cmd, info, hubUrl)
   if (info.result) printResult(cmd, info)
 }
 
-function printAttention(cmd: Cmd, info: TaskInfo): void {
+function printAttention(cmd: Cmd, info: TaskInfo, hubUrl: string): void {
   if (!info.attention?.length) return
   cmd.ctx.out('')
   cmd.ctx.out('人の判断を待っています:')
-  for (const line of attentionRows(info.attention)) cmd.ctx.out(`  ${line}`)
-  for (const item of info.attention) {
-    if (item.detail) cmd.ctx.out(`  ${item.attentionId}: ${clean(item.detail, true).split('\n').join('\n    ')}`)
-    if (item.options?.length) cmd.ctx.out(`  ${item.attentionId} の選択肢: ${item.options.map(o => `${o.id}=${clean(o.label)}`).join('、')}`)
-  }
-  const answerable = info.attention.find(a => a.answerable)
-  if (answerable) cmd.ctx.out(`回答: remora answer ${answerable.attentionId} --text "…"（または --option <ID>）`)
+  for (const line of attentionLines(info.attention, hubUrl, cmd.ctx.now(), true)) cmd.ctx.out(`  ${line}`)
+  for (const step of nextSteps(info.attention)) cmd.ctx.out(step)
   cmd.ctx.out(`続けて待つ: remora tasks wait ${info.taskId}`)
 }
 
@@ -162,7 +157,7 @@ async function waitFor(cmd: Cmd, hub: Hub, first: TaskInfo, options: WaitOptions
       if (info.state === 'needs_attention') {
         if (options.stopAtAttention) return { info, timedOut: false }
         const key = (info.attention ?? []).map(a => a.attentionId).join(',')
-        if (key !== lastAttention && !cmd.json) { if (progress) ctx.errWrite('\n'); printAttention(cmd, info) }
+        if (key !== lastAttention && !cmd.json) { if (progress) ctx.errWrite('\n'); printAttention(cmd, info, hub.url) }
         lastAttention = key
       }
       const elapsed = ctx.now() - started
@@ -188,14 +183,14 @@ function timeoutOf(cmd: Cmd): number | null {
   return ms
 }
 
-async function finish(cmd: Cmd, result: { info: TaskInfo; timedOut: boolean }): Promise<number> {
+async function finish(cmd: Cmd, hub: Hub, result: { info: TaskInfo; timedOut: boolean }): Promise<number> {
   const { info, timedOut } = result
   if (cmd.json) {
     printJson(cmd.ctx, { ...info, ...(timedOut ? { timedOut: true } : {}) })
   } else if (timedOut) {
     cmd.ctx.err(`待機を打ち切りました（${TASK_STATE_LABEL[info.state] ?? info.state}）。続けて待つ: remora tasks wait ${info.taskId}`)
   } else if (info.state === 'needs_attention') {
-    printAttention(cmd, info)
+    printAttention(cmd, info, hub.url)
   } else if (info.state === 'completed') {
     printResult(cmd, info)
   } else {
@@ -237,13 +232,13 @@ export const tasks: CommandDef = {
       const hub = await hubOf(cmd)
       const info = await hub.op('task.get', { taskId: taskIdArg(cmd, sub) })
       if (cmd.json) printJson(cmd.ctx, info)
-      else printTask(cmd, info)
+      else printTask(cmd, info, hub.url)
       return EXIT.ok
     }
     if (sub === 'wait' || sub === 'watch') {
       const hub = await hubOf(cmd)
       const first = await hub.op('task.get', { taskId: taskIdArg(cmd, sub) })
-      return finish(cmd, await waitFor(cmd, hub, first, { stopAtAttention: sub === 'wait', timeoutMs: timeoutOf(cmd), log: sub === 'watch' }))
+      return finish(cmd, hub, await waitFor(cmd, hub, first, { stopAtAttention: sub === 'wait', timeoutMs: timeoutOf(cmd), log: sub === 'watch' }))
     }
     if (sub === 'steer') {
       const sessionId = str(cmd.args, 'session')
@@ -294,7 +289,7 @@ export const run: CommandDef = {
       return EXIT.ok
     }
     if (!cmd.json) cmd.ctx.err(`タスク ${info.taskId} を投入しました${info.sessionId ? `（セッション ${info.sessionId}）` : ''}。`)
-    return finish(cmd, await waitFor(cmd, hub, info, { stopAtAttention: true, timeoutMs, log: false }))
+    return finish(cmd, hub, await waitFor(cmd, hub, info, { stopAtAttention: true, timeoutMs, log: false }))
   },
 }
 
@@ -304,7 +299,7 @@ export const answer: CommandDef = {
   usage: [
     'remora answer <要対応 ID> (--text "<回答>" | --option <選択肢 ID> | --approve | --reject) [--session <ID>] [--host <ID>]',
     '',
-    '--session を省略すると remora attention の一覧から探します。承認待ちには答えられません（DSH で承認してください）。',
+    '--session を省略すると remora attention の一覧から探します。--approve／--reject はプラン確認用です。DSH の承認待ちには remora approve／reject を使います。',
   ],
   flags: { host: 'string', session: 'string', text: 'string', option: 'string', approve: 'bool', reject: 'bool' },
   async run(cmd) {
@@ -323,6 +318,7 @@ export const answer: CommandDef = {
       const listed = await hub.op('attention.list', { ...hostParam(cmd) })
       const item = listed.items.find(a => a.attentionId === attentionId)
       if (!item) throw new CliError(`要対応 ${attentionId} が見つかりません（すでに回答済みかもしれません）。`, EXIT.notFound, { code: 'not_found' })
+      if (item.kind === 'approval') throw usageError(`${attentionId} は承認です。remora approve ${attentionId} か remora reject ${attentionId} を使ってください。`)
       if (!item.answerable) throw new CliError('この要対応は Remora からは答えられません。DSH の画面で対応してください。', EXIT.denied, { code: 'not_answerable' })
       sessionId = item.sessionId
       hostId ??= item.hostId

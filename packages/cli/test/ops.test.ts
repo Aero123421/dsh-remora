@@ -72,7 +72,7 @@ test('hub errors map to exit codes with the denial layer and fix', async () => {
   const t = await loggedIn()
   assert.equal(await main(['attention'], t.ctx), EXIT.denied)
   assert.match(t.stderr(), /ハブでの付与で拒否/)
-  assert.match(t.stderr(), /hub:\/connections/)
+  assert.ok(t.stderr().includes(`${hub.url}/connections`), 'hub: links become URLs')
   hub.ops['attention.list'] = () => ({ status: 503, body: { error: { code: 'host_offline', message: 'ホストがオフラインです' } } })
   const j = await loggedIn()
   assert.equal(await main(['attention', '--json'], j.ctx), EXIT.unavailable)
@@ -228,4 +228,89 @@ test('open finds the host that has the session and prints the hub page URL', asy
   assert.equal(await main(['open', 's-2', '--host', 'h-a', '--json'], n.ctx), 0)
   assert.deepEqual(JSON.parse(n.stdout()), { url: `${hub.url}/hosts/h-a/sessions/s-2`, hostId: 'h-a', sessionId: 's-2', opened: false })
   assert.match(n.stderr(), /^$/)
+})
+
+function approval(id: string, extra: Partial<import('@dsh-remora/protocol').AttentionItem> = {}): import('@dsh-remora/protocol').AttentionItem {
+  return { attentionId: id, hostId: 'h-1', sessionId: 's-1', kind: 'approval', title: 'rm -rf build を実行', answerable: true, createdAt: null, ...extra }
+}
+
+test('attention shows how to answer, a countdown and the passkey link', async () => {
+  const now = Date.now()
+  hub.ops['attention.list'] = () => ({ items: [
+    approval('a-1', { answerVia: 'remote', expiresAt: now + 5 * 60_000 + 3000 }),
+    approval('a-2', { answerVia: 'hub-passkey', answerable: false, answerUrl: '/attention#h-1-a-2', expiresAt: now - 1 }),
+    { attentionId: 'q-1', hostId: 'h-1', sessionId: 's-2', kind: 'question', title: 'どちら？', answerable: true, answerVia: 'remote', createdAt: null, expiresAt: null },
+    approval('a-3', { answerable: false }),
+  ] })
+  const t = await loggedIn()
+  assert.equal(await main(['attention'], t.ctx), 0, t.stderr())
+  const out = t.stdout()
+  assert.match(out, /a-1\s+承認待ち\s+s-1\s+rm -rf build を実行\s+remora approve \/ reject\s+あと 5分0[23]秒/)
+  assert.match(out, /a-2 .*ハブでパスキー\s+期限切れ/)
+  assert.match(out, new RegExp(`a-2 はハブでパスキーを使って答えます: ${hub.url}/attention#h-1-a-2`))
+  assert.match(out, new RegExp(`a-3 はハブでパスキーを使って答えます: ${hub.url}/attention#h-1-a-3`), 'old hubs without answerVia: approvals go to the hub')
+  assert.match(out, /承認: remora approve a-1（拒否は remora reject a-1）/)
+  assert.match(out, /回答: remora answer q-1/)
+})
+
+test('approve and reject call approval.respond after confirmation', async () => {
+  hub.ops['attention.list'] = () => ({ items: [approval('a-1', { answerVia: 'remote', hostId: 'h-9', sessionId: 's-9' })] })
+  hub.ops['approval.respond'] = () => ({ accepted: true })
+  const asked: string[] = []
+  const t = await loggedIn({ confirm: async q => { asked.push(q); return true } })
+  assert.equal(await main(['approve', 'a-1'], t.ctx), 0, t.stderr())
+  assert.equal(asked.length, 1)
+  assert.match(t.stdout(), /許可しました/)
+  assert.deepEqual(hub.calls.find(c => c.op === 'approval.respond')?.params, { hostId: 'h-9', attentionId: 'a-1', sessionId: 's-9', answer: { approve: true } })
+
+  const r = await loggedIn({ confirm: async () => true })
+  assert.equal(await main(['reject', 'a-1', '--yes', '--json'], r.ctx), 0)
+  assert.deepEqual(hub.calls.find(c => c.op === 'approval.respond')?.params.answer, { approve: false })
+
+  const no = await loggedIn({ confirm: async () => false })
+  assert.equal(await main(['approve', 'a-1'], no.ctx), EXIT.failure)
+  assert.equal(hub.calls.filter(c => c.op === 'approval.respond').length, 0, 'declined: nothing sent')
+
+  const piped = await loggedIn({ stdinText: '' })
+  assert.equal(await main(['approve', 'a-1'], piped.ctx), EXIT.usage, 'no terminal and no --yes')
+  assert.equal(hub.calls.filter(c => c.op === 'approval.respond').length, 0)
+
+  hub.ops['attention.list'] = () => ({ items: [{ attentionId: 'q-1', hostId: 'h-1', sessionId: 's-1', kind: 'question', title: 'q', answerable: true, createdAt: null }] })
+  const q = await loggedIn()
+  assert.equal(await main(['approve', 'q-1', '--yes'], q.ctx), EXIT.usage)
+  assert.match(q.stderr(), /remora answer q-1/)
+})
+
+test('approvals that need the passkey print the hub link and exit 5', async () => {
+  hub.ops['attention.list'] = () => ({ items: [approval('a-2', { answerVia: 'hub-passkey', answerable: false, answerUrl: 'https://hub.example/attention#h-1-a-2' })] })
+  hub.ops['approval.respond'] = () => ({ accepted: true })
+  const t = await loggedIn()
+  assert.equal(await main(['approve', 'a-2'], t.ctx), EXIT.denied)
+  assert.match(t.stderr(), /パスキーが必要/)
+  assert.match(t.stderr(), /^ {2}https:\/\/hub\.example\/attention#h-1-a-2$/m)
+  assert.equal(hub.calls.filter(c => c.op === 'approval.respond').length, 0, 'known to need the passkey: not sent')
+
+  // The DSH host refuses (setting changed since the listing): the hub's link is shown.
+  hub.ops['attention.list'] = () => ({ items: [approval('a-3', { answerVia: 'remote' })] })
+  hub.ops['approval.respond'] = () => ({ status: 403, body: { error: { code: 'denied', message: 'needs a passkey', denial: { layer: 'dsh', reason: 'confirmation-failed' }, fix: 'hub:/attention#h-1-a-3' } } })
+  const j = await loggedIn()
+  assert.equal(await main(['approve', 'a-3', '--yes', '--json'], j.ctx), EXIT.denied)
+  const error = JSON.parse(j.stdout()).error
+  assert.equal(error.denial.reason, 'confirmation-failed')
+  assert.equal(error.fix, `${hub.url}/attention#h-1-a-3`)
+})
+
+test('run --wait stops on approvals with the same information', async () => {
+  hub.ops['task.start'] = () => task('running')
+  hub.ops['task.wait'] = () => task('needs_attention', { attention: [
+    approval('a-1', { answerVia: 'remote', expiresAt: Date.now() + 60_000 }),
+    approval('a-2', { answerVia: 'hub-passkey', answerable: false }),
+  ] })
+  const t = await loggedIn()
+  assert.equal(await main(['run', '--session', 's-1', 'x'], t.ctx), EXIT.attention)
+  const out = t.stdout()
+  assert.match(out, /人の判断を待っています/)
+  assert.match(out, /あと (59|60)秒|あと 1分00秒/)
+  assert.match(out, /承認: remora approve a-1/)
+  assert.match(out, new RegExp(`a-2 はハブでパスキーを使って答えます: ${hub.url}/attention#h-1-a-2`))
 })

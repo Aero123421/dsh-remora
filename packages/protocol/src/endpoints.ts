@@ -36,6 +36,8 @@ export function resourceIndicators(hubOrigin: string): { mcp: string; api: strin
 export const RELEASE_ASSETS = {
   plugin: (version: string) => `dsh-remora-${version}.tgz`,
   cli: (platform: string, arch: string) => `remora-${platform}-${arch}${platform === 'win32' ? '.exe' : ''}`,
+  /** The CLI as one ES module for Node.js 22.19+ (the primary install; the binaries above are the fallback). */
+  cliScript: 'remora.mjs',
   checksums: 'SHA256SUMS',
   installSh: 'install.sh',
   installPs1: 'install.ps1',

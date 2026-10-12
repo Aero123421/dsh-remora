@@ -1,9 +1,14 @@
 /**
- * `remora self-update`: fetch the latest (or a given) GitHub release, pick the
- * binary for this OS/arch, verify it against `SHA256SUMS`, and replace the
- * running executable atomically. On Windows the running .exe cannot be
- * overwritten but can be renamed, so it is moved aside to `<exe>.old` first
- * and removed on a later start.
+ * `remora self-update`: fetch the latest (or a given) GitHub release, verify
+ * the asset for this install against `SHA256SUMS`, and replace it atomically.
+ *
+ * Two install forms:
+ * - `script`: `remora.mjs` run by Node.js 22.19+ through a launcher (the
+ *   primary form; `RELEASE_ASSETS.cliScript`);
+ * - `binary`: the standalone executable for this OS/arch (`RELEASE_ASSETS.cli`).
+ *
+ * On Windows a running file cannot be overwritten but can be renamed, so it is
+ * moved aside to `<file>.old` first and removed on a later start.
  */
 import { createHash } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
@@ -18,8 +23,22 @@ import { CliError, EXIT } from './errors.ts'
 export const REPOSITORY = 'Aero123421/dsh-remora'
 export const DEFAULT_RELEASES_API = `https://api.github.com/repos/${REPOSITORY}/releases`
 
-export function assetName(platform: string, arch: string): string {
-  return RELEASE_ASSETS.cli(platform, arch)
+export type InstallForm = 'script' | 'binary'
+
+export function assetName(platform: string, arch: string, form: InstallForm = 'binary'): string {
+  return form === 'script' ? RELEASE_ASSETS.cliScript : RELEASE_ASSETS.cli(platform, arch)
+}
+
+/** A `remora.mjs` inside a source checkout (`packages/cli/dist`) is updated with git, not here. */
+export function isDevCheckout(scriptPath: string): boolean {
+  return /[\\/]packages[\\/]cli[\\/]dist[\\/][^\\/]+$/.test(scriptPath)
+}
+
+/** Which form is running, and the file that holds it. */
+export function installOf(ctx: Pick<Ctx, 'isSea' | 'execPath' | 'scriptPath'>): { form: InstallForm; path: string | null } {
+  if (ctx.isSea) return { form: 'binary', path: ctx.execPath }
+  const script = ctx.scriptPath
+  return { form: 'script', path: script && /\.mjs$/i.test(script) && !isDevCheckout(script) ? script : null }
 }
 
 interface ReleaseAsset { name: string; browser_download_url: string; size?: number }
@@ -116,6 +135,7 @@ export async function cleanupOldBinary(execPath: string): Promise<void> {
 export interface UpdateOutcome {
   current: string
   latest: string
+  form: InstallForm
   asset: string
   updated: boolean
   target?: string
@@ -126,29 +146,33 @@ export interface UpdateOptions {
   version?: string
   check: boolean
   force: boolean
-  /** Override the file to replace (tests, unusual installs). Defaults to the running binary. */
+  /** Override the file to replace (tests, unusual installs). Defaults to the running binary or script; a `.mjs` target means the script form. */
   target?: string
   currentVersion: string
 }
 
 export async function selfUpdate(ctx: Ctx, options: UpdateOptions): Promise<UpdateOutcome> {
+  const running = installOf(ctx)
+  const form: InstallForm = options.target ? (/\.mjs$/i.test(options.target) ? 'script' : 'binary') : running.form
   const release = await fetchRelease(ctx, options.version)
   const latest = versionOf(release.tag_name)
-  const name = assetName(ctx.platform, ctx.arch)
-  const outcome: UpdateOutcome = { current: options.currentVersion, latest, asset: name, updated: false }
+  const name = assetName(ctx.platform, ctx.arch, form)
+  const outcome: UpdateOutcome = { current: options.currentVersion, latest, form, asset: name, updated: false }
   if (options.check) return outcome
   if (latest === options.currentVersion && !options.force) return outcome
   const asset = release.assets.find(a => a.name === name)
-  if (!asset) throw new CliError(`このリリース（${release.tag_name}）には ${name} がありません。`, EXIT.notFound, { code: 'no_asset' })
+  if (!asset) {
+    const hint = form === 'script' ? '古いリリースには remora.mjs がありません。単体実行ファイル版を入れ直すか、--version で新しい版を指定してください。' : undefined
+    throw new CliError(`このリリース（${release.tag_name}）には ${name} がありません。`, EXIT.notFound, { code: 'no_asset', ...(hint ? { hint } : {}) })
+  }
   const sumsAsset = release.assets.find(a => a.name === RELEASE_ASSETS.checksums)
   if (!sumsAsset) throw new CliError(`このリリース（${release.tag_name}）には ${RELEASE_ASSETS.checksums} がないため、検証できません。`, EXIT.failure, { code: 'no_checksums' })
 
-  let target = options.target
+  const target = options.target ?? running.path
   if (!target) {
-    if (!ctx.isSea) throw new CliError('単体実行ファイルとして動いていないため、自己更新できません（ソースから使っている場合は git pull と pnpm build）。', EXIT.usage, { code: 'not_standalone' })
-    target = ctx.execPath
+    throw new CliError('インストールされた remora として動いていないため、自己更新できません（ソースから使っている場合は git pull と pnpm build）。', EXIT.usage, { code: 'not_installed' })
   }
-  await stat(target).catch(() => { throw new CliError(`置き換える実行ファイルが見つかりません: ${target}`, EXIT.failure) })
+  await stat(target).catch(() => { throw new CliError(`置き換えるファイルが見つかりません: ${target}`, EXIT.failure) })
 
   const sums = parseSums(await (await get(ctx, sumsAsset.browser_download_url, 'application/octet-stream')).text())
   const expected = sums.get(name)
@@ -157,7 +181,7 @@ export async function selfUpdate(ctx: Ctx, options: UpdateOptions): Promise<Upda
   const fresh = join(dirname(target), `.${basename(target)}.${process.pid}.download`)
   try {
     const actual = await download(ctx, asset.browser_download_url, fresh)
-    if (actual !== expected) throw new CliError(`ダウンロードしたファイルのハッシュが SHA256SUMS と一致しません（期待 ${expected}、実際 ${actual}）。更新を中止しました。`, EXIT.failure, { code: 'checksum_mismatch' })
+    if (actual !== expected) throw new CliError(`ダウンロードしたファイルのハッシュが ${RELEASE_ASSETS.checksums} と一致しません（期待 ${expected}、実際 ${actual}）。更新を中止しました。`, EXIT.failure, { code: 'checksum_mismatch' })
     await chmod(fresh, 0o755)
     await replaceBinary(target, fresh, ctx.platform)
   } finally {

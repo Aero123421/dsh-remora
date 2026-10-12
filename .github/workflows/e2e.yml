@@ -58,11 +58,11 @@ jobs:
         # The newest published DSH only on the nightly run.
         dsh: ${{ github.event_name == 'schedule' && fromJSON('["", "newest"]') || fromJSON('[""]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
@@ -84,7 +84,7 @@ jobs:
       - name: Summary
         if: always()
         run: test -f artifacts/e2e/summary.md && cat artifacts/e2e/summary.md >> "$GITHUB_STEP_SUMMARY" || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: e2e-${{ matrix.dsh || 'pinned' }}-${{ github.run_attempt }}
