@@ -72,12 +72,17 @@ export function CompatSection({ snapshot, t, ctx, busy }: Pick<SectionProps, 'sn
     setMessage(interrupted ? t('compat.resultLost') : null)
     setCheck(snapshot.update)
     setInstallation(snapshot.updateInstallation)
+    const requestGeneration = generation.current
+    call<UpdateInstallation | null>(ctx, 'update-reconcile', {}).then(value => {
+      if (generation.current === requestGeneration && value) { setInstallation(value); setMessage(null) }
+    }, () => {})
     return () => { generation.current++ }
   }, [ctx, snapshot.updateHostInstance])
   useEffect(() => {
     if (snapshot.update) setCheck(current => !current || current.checkedAt <= snapshot.update!.checkedAt ? snapshot.update : current)
     const next = snapshot.updateInstallation
     if (next) setInstallation(current => {
+      if (current?.phase === 'confirmed' && next.requestId === current.requestId) return current
       if (!current || next.attempt > current.attempt) return next
       if (next.attempt < current.attempt) return current
       // A poll started before settlement must not replace a terminal RPC result.
@@ -117,8 +122,8 @@ export function CompatSection({ snapshot, t, ctx, busy }: Pick<SectionProps, 'sn
     })
   }
   const latest = check?.latest
-  const installing = installation?.phase === 'downloading' || installation?.phase === 'installing'
-  const installed = installation?.version === latest?.version && (installation?.phase === 'applied' || installation?.phase === 'restart-required')
+  const installing = installation?.phase === 'downloading' || installation?.phase === 'installing' || installation?.phase === 'unknown'
+  const installed = installation?.version === latest?.version && (installation?.phase === 'applied' || installation?.phase === 'restart-required' || installation?.phase === 'confirmed')
   return <div className="rmr-section">
     <div className="rmr-row">
       <div className="rmr-row-text">
@@ -147,13 +152,15 @@ export function CompatSection({ snapshot, t, ctx, busy }: Pick<SectionProps, 'sn
     <div className="rmr-section-head" style={{ paddingTop: 16 }}>
       <div className="rmr-title-row"><h3>{t('compat.update')}</h3><Button variant="outline" size="sm" disabled={checking || busy || installing} onClick={() => runCheck(true)}>{t('compat.check')}</Button></div>
     </div>
+    {check?.installUnavailable ? <p className="rmr-muted">{t('compat.unavailable', { code: check.installUnavailable })}</p> : null}
+    {check?.restartRequired ? <p className="rmr-muted">{t('compat.installedPending', { version: check.installedVersion ?? '?', current: snapshot.version })}</p> : null}
     {check?.error ? <p className="rmr-error">{t('compat.checkFailed', { code: check.error })}</p> : null}
     {check && !check.error && !latest ? <p className="rmr-muted">{t('compat.noRelease')}</p> : null}
-    {check && latest && !check.newer ? <p className="rmr-muted">{t('compat.upToDate')}</p> : null}
+    {check && latest && !check.newer && !check.restartRequired ? <p className="rmr-muted">{t('compat.upToDate')}</p> : null}
     {check && latest && check.newer ? <div className="rmr-stack">
       <p>{t('compat.newer', { version: latest.version })}</p>
       {latest.notes ? <><span className="rmr-faint">{t('compat.notes')}</span><div className="rmr-notes">{latest.notes}</div></> : null}
-      {snapshot.canInstallUpdate && latest.tarball && latest.sums ? <div className="rmr-inline">
+      {snapshot.canInstallUpdate && !check.installUnavailable && latest.tarball && latest.sums ? <div className="rmr-inline">
         <Button variant="primary" size="sm" disabled={checking || busy || installing || installed || !snapshot.local} title={snapshot.local ? undefined : t('err.local-only')} onClick={install}>{t('compat.install')}</Button>
         <span className="rmr-faint">{t('compat.installHint')}</span>
       </div> : null}

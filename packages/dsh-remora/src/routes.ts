@@ -92,7 +92,11 @@ export function createMethods(core: RemoraCore): Record<string, Method> {
     return method(payload, info)
   }
   const methods: Record<string, Method> = {
-    state: (_, { local }) => core.snapshot(local),
+    state: (_, { local }) => {
+      // Status polling refreshes receipts without delaying the UI on a running installation.
+      void core.reconcileUpdate().catch(() => {})
+      return core.snapshot(local)
+    },
     catalog: () => core.catalog(),
     audit: async () => ({ entries: await core.auditEntries(200) }),
     clients: () => ({ clients: core.clients() }),
@@ -155,6 +159,7 @@ export function createMethods(core: RemoraCore): Record<string, Method> {
       await core.reconnect()
       return core.snapshot(local)
     },
+    'update-reconcile': async () => core.reconcileUpdate(),
     'update-check': async payload => core.checkUpdate(field(payload, 'force') === true),
     'update-install': async (payload, { local }) => core.installUpdate(local, field(payload, 'version')),
   }
