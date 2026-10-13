@@ -1,6 +1,6 @@
 {
   "name": "remora-hub",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Remora hub: a small self-hosted Cloudflare Worker that relays between your DSH hosts and ChatGPT, Claude, the CLI and the HTTP API.",
   "type": "module",

@@ -34,12 +34,64 @@ export interface UpdateCheck {
   error?: string
 }
 
+/** The subset of DSH 0.2.1-alpha.2's direct Host service used for self-updates. */
+export interface UpdatePluginManager {
+  listBundles(): Promise<{ name: string; enabled: boolean }[]>
+  installBundle(spec: string, options: { enabled: boolean }): Promise<BundleChangeResult>
+}
+
+export interface BundleChangeResult {
+  changed: boolean
+  application: 'applied' | 'restart-required' | 'overridden' | 'failed' | 'cancelled'
+  stage: 'install' | 'enable' | 'remove'
+  target: string
+  bundle?: string
+  version?: string
+  error?: { code: string; diagnostic?: string }
+  packageResult?: { exitCode: number; kind?: string }
+}
+
+export interface UpdateInstallation {
+  /** Increases within the Host instance so polling cannot replace a newer attempt. */
+  attempt: number
+  version: string
+  phase: 'downloading' | 'installing' | BundleChangeResult['application']
+  installedVersion?: string
+  stage?: BundleChangeResult['stage']
+  error?: string
+}
+
+/** HTTP/RPC completion alone is not evidence that DSH applied the requested version. */
+export function installationResult(result: BundleChangeResult, operation: UpdateInstallation): UpdateInstallation {
+  const state: UpdateInstallation = { ...operation, phase: result.application, stage: result.stage }
+  if (result.version) state.installedVersion = result.version
+  if (result.error) state.error = result.error.code
+  const successful = result.application === 'applied' || result.application === 'restart-required'
+  if (successful && (result.error || (result.packageResult && result.packageResult.exitCode !== 0))) {
+    state.phase = 'failed'
+    state.error ??= result.packageResult?.kind ?? 'package-failed'
+  } else if (successful && (result.bundle !== 'dsh-remora' || result.version !== operation.version)) {
+    state.phase = 'failed'
+    state.error = 'installed-version-mismatch'
+  } else if (!['applied', 'restart-required', 'overridden', 'failed', 'cancelled'].includes(result.application)) {
+    state.phase = 'failed'
+    state.error = 'invalid-result'
+  }
+  return state
+}
+
 type FetchLike = (input: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => Promise<Response>
 
-function parseVersion(version: string): { core: number[]; pre: string | null } | null {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.*)?$/.exec(version.trim())
+function parseVersion(version: string): { core: string[]; pre: string | null } | null {
+  const match = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(version.trim())
   if (!match) return null
-  return { core: [Number(match[1]), Number(match[2]), Number(match[3])], pre: match[4] ?? null }
+  const pre = match[4] ?? null
+  if (pre?.split('.').some(id => /^0\d+$/.test(id))) return null
+  return { core: [match[1]!, match[2]!, match[3]!], pre }
+}
+
+function compareNumeric(a: string, b: string): number {
+  return a.length !== b.length ? a.length - b.length : a === b ? 0 : a < b ? -1 : 1
 }
 
 /** Semver precedence: >0 when a is newer than b. Unparsable versions compare as equal. */
@@ -47,7 +99,10 @@ export function compareVersions(a: string, b: string): number {
   const x = parseVersion(a)
   const y = parseVersion(b)
   if (!x || !y) return 0
-  for (let i = 0; i < 3; i++) if ((x.core[i] as number) !== (y.core[i] as number)) return (x.core[i] as number) - (y.core[i] as number)
+  for (let i = 0; i < 3; i++) {
+    const order = compareNumeric(x.core[i]!, y.core[i]!)
+    if (order !== 0) return order
+  }
   if (x.pre === y.pre) return 0
   if (x.pre === null) return 1
   if (y.pre === null) return -1
@@ -60,7 +115,7 @@ export function compareVersions(a: string, b: string): number {
     if (q === undefined) return 1
     const pn = /^\d+$/.test(p)
     const qn = /^\d+$/.test(q)
-    if (pn && qn && Number(p) !== Number(q)) return Number(p) - Number(q)
+    if (pn && qn && p !== q) return compareNumeric(p, q)
     if (pn !== qn) return pn ? -1 : 1
     if (p !== q) return p < q ? -1 : 1
   }
@@ -79,11 +134,15 @@ export async function checkForUpdate(current: string, fetchImpl: FetchLike = fet
       tag_name?: unknown; name?: unknown; body?: unknown; html_url?: unknown; published_at?: unknown
       assets?: { name?: unknown; browser_download_url?: unknown }[]
     }
-    const version = String(body.tag_name ?? '').replace(/^v/, '')
+    if (!body || typeof body.tag_name !== 'string' || !parseVersion(body.tag_name) || body.tag_name !== body.tag_name.trim()) {
+      return { current, checkedAt: now, latest: null, newer: false, error: 'invalid-release' }
+    }
+    const version = body.tag_name.replace(/^v/, '')
     const assets = Array.isArray(body.assets) ? body.assets : []
     const asset = (match: (name: string) => boolean) => {
-      const found = assets.find(item => typeof item.name === 'string' && match(item.name) && typeof item.browser_download_url === 'string')
-      return found ? { name: found.name as string, url: found.browser_download_url as string } : null
+      const found = assets.filter(item => item && typeof item.name === 'string' && match(item.name) && typeof item.browser_download_url === 'string')
+      if (found.length > 1) throw new UpdateError('invalid-release', 'duplicate release assets')
+      return found[0] ? { name: found[0].name as string, url: found[0].browser_download_url as string } : null
     }
     const tarball = asset(name => name === `dsh-remora-${version}.tgz`)
     const sums = asset(name => name === 'SHA256SUMS')
@@ -98,7 +157,7 @@ export async function checkForUpdate(current: string, fetchImpl: FetchLike = fet
     }
     return { current, checkedAt: now, latest, newer: compareVersions(version, current) > 0 }
   } catch (error) {
-    return { current, checkedAt: now, latest: null, newer: false, error: (error as Error).name === 'TimeoutError' ? 'timeout' : 'network' }
+    return { current, checkedAt: now, latest: null, newer: false, error: error instanceof UpdateError ? error.code : error instanceof SyntaxError ? 'invalid-release' : (error as Error).name === 'TimeoutError' ? 'timeout' : 'network' }
   }
 }
 
@@ -113,10 +172,32 @@ export class UpdateError extends Error {
 
 async function readLimited(response: Response, limit: number): Promise<Uint8Array> {
   const declared = Number(response.headers.get('content-length') ?? '0')
-  if (declared > limit) throw new UpdateError('too-large', 'the download is too large')
-  const buffer = new Uint8Array(await response.arrayBuffer())
-  if (buffer.byteLength > limit) throw new UpdateError('too-large', 'the download is too large')
-  return buffer
+  if (declared > limit) {
+    await response.body?.cancel()
+    throw new UpdateError('too-large', 'the download is too large')
+  }
+  if (!response.body) return new Uint8Array()
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > limit) throw new UpdateError('too-large', 'the download is too large')
+      chunks.push(value)
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined)
+    throw error
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+  return bytes
 }
 
 /** Find `<hex>  <name>` in a SHA256SUMS file. */

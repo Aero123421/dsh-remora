@@ -26,8 +26,8 @@ function KillSwitch({ snapshot, t, run, busy }: { snapshot: RemoraSnapshot; t: T
 /** The Remora page in DSH's settings panel. */
 export function RemoraPage({ ctx }: { ctx: ClientContext }) {
   const t = useCopy(ctx.locale)
-  const { snapshot, setSnapshot, failed, reload } = useSnapshot(ctx, 2_000)
-  const { run, busy, error } = useAction(ctx, t, setSnapshot)
+  const { snapshot, store, failed, reload } = useSnapshot(ctx, 2_000)
+  const { run, busy, error } = useAction(t, store)
   const [tab, setTab] = useState<Tab>(() => {
     try {
       const stored = sessionStorage.getItem('dsh-remora:tab')
@@ -67,8 +67,8 @@ export function RemoraPage({ ctx }: { ctx: ClientContext }) {
 /** Small status chip beside Settings at the sidebar foot, with a one-click kill switch. */
 export function RemoraChip({ ctx, wide }: { ctx: ClientContext; wide: boolean }) {
   const t = useCopy(ctx.locale)
-  const { snapshot, setSnapshot } = useSnapshot(ctx, 15_000)
-  const { run, busy, error } = useAction(ctx, t, setSnapshot)
+  const { snapshot, store } = useSnapshot(ctx, 15_000)
+  const { run, busy, error } = useAction(t, store)
   const [open, setOpen] = useState(false)
   const wrap = useRef<HTMLDivElement>(null)
   useEffect(() => {

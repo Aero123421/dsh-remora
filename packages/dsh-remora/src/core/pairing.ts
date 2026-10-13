@@ -59,13 +59,15 @@ export interface PairingDeps {
   now?: () => number
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
   /** Persist the approved pairing and its key. Throwing turns the attempt into an error. */
-  onApproved: (pairing: ApprovedPairing, key: HostKey) => Promise<void>
+  onApproved: (pairing: ApprovedPairing, key: HostKey, signal: AbortSignal) => Promise<void>
   onChange?: (view: PairingView) => void
 }
 
 const defaultSleep = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
-  const timer = setTimeout(resolve, ms)
-  signal.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+  if (signal.aborted) { reject(signal.reason); return }
+  const onAbort = (): void => { clearTimeout(timer); reject(signal.reason) }
+  const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve() }, ms)
+  signal.addEventListener('abort', onAbort, { once: true })
 })
 
 /** rpId must be the hub's host or a registrable parent of it. */
@@ -136,6 +138,7 @@ export class PairingClient {
       this.set({ phase: 'error', hubOrigin: origin, error: errorCode(error) })
       return this.current
     }
+    if (abort.signal.aborted || this.abort !== abort) return this.current
     this.set({ phase: 'waiting', hubOrigin: origin, userCode: formatUserCode(started.userCode), verifyUrl: started.verifyUrl, expiresAt: started.expiresAt })
     const interval = Math.min(30_000, Math.max(1_000, typeof started.pollIntervalMs === 'number' ? started.pollIntervalMs : PAIRING_POLL_INTERVAL_MS))
     void this.poll(origin, started, key, interval, abort)
@@ -171,7 +174,8 @@ export class PairingClient {
         if (typeof result.rpId !== 'string' || !rpIdMatches(origin, result.rpId)) throw new PairingError('invalid-response', 'the passkey RP id does not match the hub')
         const owner = checkOwnerCredentials(result.owner)
         if (abort.signal.aborted) return
-        await this.deps.onApproved({ hostId: result.hostId, hubOrigin: origin, rpId: result.rpId, owner }, key)
+        await this.deps.onApproved({ hostId: result.hostId, hubOrigin: origin, rpId: result.rpId, owner }, key, abort.signal)
+        if (abort.signal.aborted || this.abort !== abort) return
         this.set({ phase: 'approved', hubOrigin: origin })
         return
       }

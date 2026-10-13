@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Button, Tag } from 'remora-official-primitives'
 import type { CopyKey } from '../locales.ts'
-import type { AuditEntry, ClientSummary, RemoraSnapshot, UpdateCheck } from '../state.ts'
-import { call, errorText, formatTime, type ClientContext, type Translate } from './api.ts'
+import type { AuditEntry, ClientSummary, RemoraSnapshot, UpdateCheck, UpdateInstallation } from '../state.ts'
+import { CallError, call, errorText, formatTime, type ClientContext, type Translate } from './api.ts'
 import type { SectionProps } from './connection.tsx'
 import { QuestionModeTags } from './question-mode.tsx'
 
@@ -56,18 +56,69 @@ export function ActivitySection({ snapshot, t, ctx }: { snapshot: RemoraSnapshot
 
 export function CompatSection({ snapshot, t, ctx, busy }: Pick<SectionProps, 'snapshot' | 't' | 'busy'> & { ctx: ClientContext }) {
   const [check, setCheck] = useState<UpdateCheck | null>(snapshot.update)
+  const [installation, setInstallation] = useState<UpdateInstallation | null>(snapshot.updateInstallation)
   const [checking, setChecking] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
+  const generation = useRef(0)
+  const hostInstance = useRef(snapshot.updateHostInstance)
+  const pending = useRef<'check' | 'install' | null>(null)
+  useLayoutEffect(() => {
+    const changedHost = hostInstance.current !== snapshot.updateHostInstance
+    const interrupted = changedHost && (pending.current === 'install' || installation?.phase === 'downloading' || installation?.phase === 'installing')
+    hostInstance.current = snapshot.updateHostInstance
+    generation.current++
+    pending.current = null
+    setChecking(false)
+    setMessage(interrupted ? t('compat.resultLost') : null)
+    setCheck(snapshot.update)
+    setInstallation(snapshot.updateInstallation)
+    return () => { generation.current++ }
+  }, [ctx, snapshot.updateHostInstance])
+  useEffect(() => {
+    if (snapshot.update) setCheck(current => !current || current.checkedAt <= snapshot.update!.checkedAt ? snapshot.update : current)
+    const next = snapshot.updateInstallation
+    if (next) setInstallation(current => {
+      if (!current || next.attempt > current.attempt) return next
+      if (next.attempt < current.attempt) return current
+      // A poll started before settlement must not replace a terminal RPC result.
+      const running = (value: UpdateInstallation) => value.phase === 'downloading' || value.phase === 'installing'
+      if (!running(current) && running(next)) return current
+      if (current.phase === 'installing' && next.phase === 'downloading') return current
+      return next
+    })
+  }, [snapshot.update, snapshot.updateInstallation])
   const runCheck = (force: boolean) => {
+    if (pending.current) return
+    pending.current = 'check'
+    const requestGeneration = generation.current
     setChecking(true)
     setMessage(null)
-    call<UpdateCheck>(ctx, 'update-check', { force }).then(setCheck, error => setMessage(errorText(t, error))).finally(() => setChecking(false))
+    call<UpdateCheck>(ctx, 'update-check', { force }).then(value => {
+      if (generation.current === requestGeneration) setCheck(value)
+    }, error => {
+      if (generation.current === requestGeneration) setMessage(errorText(t, error))
+    }).finally(() => {
+      if (generation.current === requestGeneration) { pending.current = null; setChecking(false) }
+    })
   }
   const install = () => {
+    if (pending.current) return
+    pending.current = 'install'
+    const requestGeneration = generation.current
     setChecking(true)
-    call<{ path: string }>(ctx, 'update-install').then(() => setMessage(t('compat.installed')), error => setMessage(errorText(t, error))).finally(() => setChecking(false))
+    setMessage(null)
+    call<UpdateInstallation>(ctx, 'update-install', { version: check?.latest?.version }).then(value => {
+      if (generation.current === requestGeneration) setInstallation(value)
+    }, error => {
+      // A lost RPC reply does not prove installation failed. Poll the Host state.
+      if (generation.current === requestGeneration) setMessage(error instanceof CallError ? errorText(t, error) : t('compat.resultUnknown'))
+    }).finally(() => {
+      if (generation.current === requestGeneration) { pending.current = null; setChecking(false) }
+    })
   }
   const latest = check?.latest
+  const installing = installation?.phase === 'downloading' || installation?.phase === 'installing'
+  const installed = installation?.version === latest?.version && (installation?.phase === 'applied' || installation?.phase === 'restart-required')
   return <div className="rmr-section">
     <div className="rmr-row">
       <div className="rmr-row-text">
@@ -94,7 +145,7 @@ export function CompatSection({ snapshot, t, ctx, busy }: Pick<SectionProps, 'sn
       <div className="rmr-row-text"><span>{t('compat.dataDir')}</span><span className="rmr-faint rmr-mono">{snapshot.dataDir}</span></div>
     </div>
     <div className="rmr-section-head" style={{ paddingTop: 16 }}>
-      <div className="rmr-title-row"><h3>{t('compat.update')}</h3><Button variant="outline" size="sm" disabled={checking || busy} onClick={() => runCheck(true)}>{t('compat.check')}</Button></div>
+      <div className="rmr-title-row"><h3>{t('compat.update')}</h3><Button variant="outline" size="sm" disabled={checking || busy || installing} onClick={() => runCheck(true)}>{t('compat.check')}</Button></div>
     </div>
     {check?.error ? <p className="rmr-error">{t('compat.checkFailed', { code: check.error })}</p> : null}
     {check && !check.error && !latest ? <p className="rmr-muted">{t('compat.noRelease')}</p> : null}
@@ -103,12 +154,15 @@ export function CompatSection({ snapshot, t, ctx, busy }: Pick<SectionProps, 'sn
       <p>{t('compat.newer', { version: latest.version })}</p>
       {latest.notes ? <><span className="rmr-faint">{t('compat.notes')}</span><div className="rmr-notes">{latest.notes}</div></> : null}
       {snapshot.canInstallUpdate && latest.tarball && latest.sums ? <div className="rmr-inline">
-        <Button variant="primary" size="sm" disabled={checking || !snapshot.local} title={snapshot.local ? undefined : t('err.local-only')} onClick={install}>{t('compat.install')}</Button>
+        <Button variant="primary" size="sm" disabled={checking || busy || installing || installed || !snapshot.local} title={snapshot.local ? undefined : t('err.local-only')} onClick={install}>{t('compat.install')}</Button>
         <span className="rmr-faint">{t('compat.installHint')}</span>
       </div> : null}
       <span className="rmr-faint">{t('compat.manual')}</span>
       <span className="rmr-mono">{latest.tarball?.url ?? latest.url}</span>
     </div> : null}
+    {installation ? <p className={['failed', 'overridden', 'cancelled'].includes(installation.phase) ? 'rmr-error' : 'rmr-muted'}>
+      {t(`compat.install.${installation.phase}`, { version: installation.installedVersion ?? installation.version, current: snapshot.version, code: installation.error ?? installation.phase, stage: installation.stage ?? 'download' })}
+    </p> : null}
     {message ? <p className="rmr-muted">{message}</p> : null}
   </div>
 }

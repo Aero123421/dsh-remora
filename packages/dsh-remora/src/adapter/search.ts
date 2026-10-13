@@ -63,7 +63,7 @@ export function createSearch(rt: Runtime) {
           partial = true
           break
         }
-        context.signal.throwIfAborted()
+        rt.assertAuthorized(context)
         scanned++
         const base = { sessionId: row.sessionId, title: redactLine(row.title || 'New session', 200), workspaceId: row.workspace?.id ?? null }
         const found: SearchHit[] = []
@@ -76,6 +76,8 @@ export function createSearch(rt: Runtime) {
         } catch {
           continue
         }
+        rt.assertAuthorized(context)
+        if (!rt.canAccess(row)) continue
         let turn: number | null = null
         for (const event of events) {
           if (found.length >= SEARCH_BUDGET.hitsPerSession) break
@@ -95,7 +97,9 @@ export function createSearch(rt: Runtime) {
         }
         hits.push(...found)
       }
-      return { hits: hits.slice(0, limit), scanned, partial, untrusted: true }
+      rt.assertAuthorized(context)
+      const visible = new Set(rows.filter(row => rt.canAccess(row)).map(row => row.sessionId))
+      return { hits: hits.filter(hit => visible.has(hit.sessionId)).slice(0, limit), scanned, partial, untrusted: true }
     },
   }
 }

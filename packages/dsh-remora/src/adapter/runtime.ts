@@ -51,6 +51,7 @@ export class Runtime {
   /** Sessions this adapter has seen exist, so a later miss can be reported as `gone`. */
   private readonly seen = new Set<string>()
   private readonly tombstones = new Map<string, number>()
+  private readonly parents = new Map<string, string>()
   /** Sessions whose Agent Remora itself woke; used by the `hasLiveClient` heuristic. */
   readonly wokenByRemora = new Set<string>()
   /** Latest auth-looking `api-session/error` per session (login-expired attention). */
@@ -149,6 +150,10 @@ export class Runtime {
     const archived = new Set(registry?.archivedSessionIds ?? [])
     const pinned = new Set(registry?.pinnedSessionIds ?? [])
     const byId = new Map(items.map(item => [item.sessionId, item]))
+    for (const item of items) {
+      if (item.origin === 'subagent' && item.parentSessionId) this.parents.set(item.sessionId, item.parentSessionId)
+      else this.parents.delete(item.sessionId)
+    }
     const workspaceOf = (item: DshSessionSummary, depth = 0): DshWorkspace | null => {
       const direct = owner.get(item.sessionId)
       if (direct) return direct
@@ -189,7 +194,49 @@ export class Runtime {
   }
 
   scopeInput(row: SessionRow): SessionScopeInput {
-    return { sessionId: row.sessionId, workspaceId: row.workspace?.id ?? null, workspacePath: row.workspacePath }
+    const current = this.currentRow(row)
+    return { sessionId: row.sessionId, workspaceId: current.workspace?.id ?? null, workspacePath: current.workspacePath }
+  }
+
+  /** Registry ownership can change while a native read or Agent lookup is pending. */
+  currentRow(row: SessionRow): SessionRow {
+    const registry = this.workspaces
+    if (!registry) return row
+    const workspaces = registry.list()
+    let id: string | undefined = row.sessionId
+    let workspace: DshWorkspace | null = null
+    let archived = false
+    for (let depth = 0; id && depth < 17; depth++) {
+      archived ||= registry.archivedSessionIds.includes(id)
+      workspace ??= workspaces.find(item => item.sessionIds.includes(id!)) ?? null
+      id = this.parents.get(id)
+    }
+    return { ...row, workspace, workspacePath: workspace?.path ?? row.summary.cwd ?? null, archived, pinned: registry.pinnedSessionIds.includes(row.sessionId) }
+  }
+
+  assertAuthorized(context: OperationContext): void {
+    if (context.signal.aborted) {
+      throw context.signal.reason instanceof OperationError ? context.signal.reason : unavailable('remote operation was cancelled')
+    }
+    context.assertAuthorized?.()
+  }
+
+  /** Check immediately before native side effects and before returning async reads. */
+  assertSession(row: SessionRow, context: OperationContext, drives = false): void {
+    this.assertAuthorized(context)
+    Object.assign(row, this.currentRow(row))
+    if (!this.canAccess(row)) throw denied(`session ${row.sessionId} is outside the workspaces Remora may reach`)
+    if (drives) {
+      if (row.archived) throw new OperationError('conflict', `session ${row.sessionId} is archived`)
+      this.assertCanDriveTurns(row.workspace?.id ?? null)
+    }
+  }
+
+  assertWorkspace(workspace: DshWorkspace, context: OperationContext, drives = false): void {
+    this.assertAuthorized(context)
+    const current = this.workspace(workspace.id)
+    if (current.path !== workspace.path) throw denied('the workspace folder changed while the operation was pending')
+    if (drives) this.assertCanDriveTurns(current.id)
   }
 
   canAccess(row: SessionRow): boolean {
@@ -298,7 +345,16 @@ export class Runtime {
     if (!this.deps.scope.canAccessWorkspace(workspace.id, workspace.path)) {
       throw denied(`workspace ${workspaceId} is outside the workspaces Remora may reach`)
     }
-    return workspace
+    // Native WorkspaceEntity exposes these through prototype getters; spreading
+    // it would discard its path and title instead of capturing their values.
+    return {
+      id: workspace.id,
+      path: workspace.path,
+      title: workspace.title,
+      createdAt: workspace.createdAt,
+      updatedAt: workspace.updatedAt,
+      sessionIds: [...workspace.sessionIds],
+    }
   }
 }
 

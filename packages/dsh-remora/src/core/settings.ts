@@ -209,6 +209,8 @@ export interface PendingCredentialChange {
 }
 
 export interface PairingState {
+  /** Changes on every pairing attempt or unpair, including null → null. */
+  generation?: string
   paired: PairedHub | null
   /** A different credential set announced by the hub; applied only after the DSH user confirms. */
   pendingCredentials: PendingCredentialChange | null
@@ -252,7 +254,8 @@ export function parsePairing(value: unknown): PairingState {
       receivedAt: optionalNumber(pending.receivedAt, 'pendingCredentials.receivedAt') ?? 0,
     }
   }
-  return { paired, pendingCredentials, revoked: raw.revoked === true }
+  const generation = optionalString(raw.generation, 'pairing.generation')
+  return { ...(generation !== null ? { generation } : {}), paired, pendingCredentials, revoked: raw.revoked === true }
 }
 
 export const pairingSpec: DocumentSpec<PairingState> = {

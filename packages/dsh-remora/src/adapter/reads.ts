@@ -117,24 +117,27 @@ export function sortSidebar(rows: SessionRow[], pinnedOrder: readonly string[], 
 }
 
 export function createReads(rt: Runtime) {
-  async function sessionRowAndEvents(sessionId: string, signal: AbortSignal): Promise<{ row: SessionRow; events: readonly DshSessionEvent[] }> {
-    const row = await rt.row(sessionId, signal)
-    return { row, events: await rt.events(sessionId, signal) }
+  async function sessionRowAndEvents(sessionId: string, context: OperationContext): Promise<{ row: SessionRow; events: readonly DshSessionEvent[] }> {
+    const row = await rt.row(sessionId, context.signal)
+    rt.assertSession(row, context)
+    const events = await rt.events(sessionId, context.signal)
+    rt.assertSession(row, context)
+    return { row, events }
   }
 
   /** Session and turn targeted by changes/patch: a task's turn or the whole session. */
-  async function changeTarget(params: { sessionId?: string; taskId?: string }, signal: AbortSignal): Promise<{ sessionId: string; events: readonly DshSessionEvent[]; turns?: number[] }> {
+  async function changeTarget(params: { sessionId?: string; taskId?: string }, context: OperationContext): Promise<{ row: SessionRow; sessionId: string; events: readonly DshSessionEvent[]; turns?: number[] }> {
     if (params.taskId !== undefined) {
       const record = rt.deps.tasks.get(params.taskId)
       if (!record || !record.sessionId) throw notFound(`task ${params.taskId} not found on this host`)
       if (params.sessionId !== undefined && params.sessionId !== record.sessionId) throw invalid('taskId and sessionId do not match')
-      const { events } = await sessionRowAndEvents(record.sessionId, signal)
+      const { row, events } = await sessionRowAndEvents(record.sessionId, context)
       const turns = findTaskTurn(events, record.requestId)?.turns ?? []
-      return { sessionId: record.sessionId, events: turns.length > 0 ? events : [], turns }
+      return { row, sessionId: record.sessionId, events: turns.length > 0 ? events : [], turns }
     }
     if (params.sessionId === undefined) throw invalid('give sessionId or taskId')
-    const { events } = await sessionRowAndEvents(params.sessionId, signal)
-    return { sessionId: params.sessionId, events }
+    const { row, events } = await sessionRowAndEvents(params.sessionId, context)
+    return { row, sessionId: params.sessionId, events }
   }
 
   async function changedFiles(sessionId: string, events: readonly DshSessionEvent[], turns: readonly number[] | undefined, signal: AbortSignal): Promise<{ file: ChangedFile; seq: number; index: number }[]> {
@@ -194,6 +197,7 @@ export function createReads(rt: Runtime) {
         (params.includeArchived === true || !row.archived)
         && (params.workspaceId === undefined || row.workspace?.id === params.workspaceId)
         && rt.canAccess(row))
+      rt.assertAuthorized(context)
       const registry = rt.workspaces
       const ordered = sortSidebar(rows, registry?.pinnedSessionIds ?? [], registry?.list() ?? [])
       const offset = decodeCursor(params.cursor) ?? 0
@@ -210,6 +214,7 @@ export function createReads(rt: Runtime) {
       const values = (await rt.projections(row.sessionId, context.signal)) ?? row.values
       // inspect() reads the log without waking the session.
       const events = await rt.events(row.sessionId, context.signal)
+      rt.assertSession(row, context)
       const attention = rt.attention(row.sessionId, events, values)
       const content = hasContent(context)
       const recentTurns: TurnPreview[] = turnPreviews(events, values).slice(-5).map(turn => ({
@@ -233,7 +238,8 @@ export function createReads(rt: Runtime) {
 
     async 'session.read'(params: Params<'session.read'>, context: OperationContext): Promise<Result<'session.read'>> {
       if (!hasContent(context)) throw new OperationError('denied', 'reading a transcript needs the dsh.content scope', { denial: { layer: 'token', reason: 'missing-scope' } })
-      const { row, events } = await sessionRowAndEvents(params.sessionId, context.signal)
+      const { row, events } = await sessionRowAndEvents(params.sessionId, context)
+      rt.assertSession(row, context)
       const limit = params.limit ?? DEFAULT_LIMIT
       if (params.depth === 'summary') {
         const reply = lastReply(events)
@@ -246,6 +252,7 @@ export function createReads(rt: Runtime) {
       }
       if (params.depth === 'turns') {
         const values = await rt.projections(row.sessionId, context.signal)
+        rt.assertSession(row, context)
         const turns = turnPreviews(events, values)
         const end = decodeCursor(params.cursor) ?? turns.length
         const start = Math.max(0, end - limit)
@@ -284,6 +291,8 @@ export function createReads(rt: Runtime) {
         } catch (error) {
           throw fromDsh(error, 'listing skills failed')
         }
+        rt.assertSession(row, context)
+        workspaceId = row.workspace?.id ?? null
       } else if (params.workspaceId !== undefined) {
         const workspace = rt.workspace(params.workspaceId)
         workspaceId = workspace.id
@@ -295,6 +304,7 @@ export function createReads(rt: Runtime) {
         } catch (error) {
           throw fromDsh(error, 'listing skills failed')
         }
+        rt.assertWorkspace(workspace, context)
       } else {
         throw invalid('give sessionId or workspaceId')
       }
@@ -308,19 +318,24 @@ export function createReads(rt: Runtime) {
     async 'attention.list'(params: Params<'attention.list'>, context: OperationContext): Promise<Result<'attention.list'>> {
       if (params.sessionId !== undefined) {
         const row = await rt.row(params.sessionId, context.signal)
-        return { items: forCaller(await sessionAttention(rt, row.sessionId, context.signal), context) }
+        const items = await sessionAttention(rt, row.sessionId, context.signal)
+        rt.assertSession(row, context)
+        return { items: forCaller(items, context) }
       }
       const rows = (await rt.catalog(context.signal)).filter(row => !row.archived && rt.canAccess(row))
       const items: AttentionItem[] = []
       for (const row of rows) {
         items.push(...await sessionAttention(rt, row.sessionId, context.signal, row.values).catch(() => []))
       }
-      return { items: forCaller(items, context) }
+      rt.assertAuthorized(context)
+      const visible = new Set(rows.filter(row => rt.canAccess(row)).map(row => row.sessionId))
+      return { items: forCaller(items.filter(item => visible.has(item.sessionId)), context) }
     },
 
     async 'session.usage'(params: Params<'session.usage'>, context: OperationContext): Promise<Result<'session.usage'>> {
       const row = await rt.row(params.sessionId, context.signal)
       const values = (await rt.projections(row.sessionId, context.signal)) ?? row.values
+      rt.assertSession(row, context)
       const usage = values.tokenUsage
       const input = usage ? usage.uncachedInputTokens + usage.cacheReadTokens + usage.cacheWriteTokens : null
       const breakdown = values.contextBreakdown
@@ -344,14 +359,15 @@ export function createReads(rt: Runtime) {
     },
 
     async 'changes.get'(params: Params<'changes.get'>, context: OperationContext): Promise<Result<'changes.get'>> {
-      const target = await changeTarget(params, context.signal)
+      const target = await changeTarget(params, context)
       const files = await changedFiles(target.sessionId, target.events, target.turns, context.signal)
+      rt.assertSession(target.row, context)
       return { files: files.map(entry => entry.file) }
     },
 
     async 'patch.get'(params: Params<'patch.get'>, context: OperationContext): Promise<Result<'patch.get'>> {
       if (!hasContent(context)) throw new OperationError('denied', 'reading a patch needs the dsh.content scope', { denial: { layer: 'token', reason: 'missing-scope' } })
-      const target = await changeTarget(params, context.signal)
+      const target = await changeTarget(params, context)
       const service = rt.get<DshWorkspaceChanges>(SERVICES.workspaceChanges)!
       const files = await changedFiles(target.sessionId, target.events, target.turns, context.signal)
       const maxBytes = params.maxBytes ?? 200_000
@@ -372,17 +388,20 @@ export function createReads(rt: Runtime) {
         patch = Buffer.from(patch).subarray(0, maxBytes).toString('utf8').replace(/�$/, '')
         truncated = true
       }
+      rt.assertSession(target.row, context)
       return { patch, truncated, untrusted: true }
     },
 
     async 'deliverable.read'(params: Params<'deliverable.read'>, context: OperationContext): Promise<Result<'deliverable.read'>> {
       if (!hasContent(context)) throw new OperationError('denied', 'reading a deliverable needs the dsh.content scope', { denial: { layer: 'token', reason: 'missing-scope' } })
-      const { row, events } = await sessionRowAndEvents(params.sessionId, context.signal)
+      const { row, events } = await sessionRowAndEvents(params.sessionId, context)
       const file = presentedFiles(events).find(item => item.deliverableId === params.deliverableId)
       if (!file) throw notFound(`deliverable ${params.deliverableId} not found in session ${params.sessionId}`)
       const base = row.workspacePath ?? row.summary.cwd
       if (!base) throw denied('the session has no working directory to read deliverables from')
-      return readDeliverable(file.path, base, params.maxBytes ?? 256_000, file.description)
+      const result = await readDeliverable(file.path, base, params.maxBytes ?? 256_000, file.description)
+      rt.assertSession(row, context)
+      return result
     },
   }
 }

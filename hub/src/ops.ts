@@ -62,7 +62,22 @@ export function finalParams(op: string, params: Record<string, unknown>, hostId:
 }
 
 export async function runOperation(env: Env, caller: Caller, op: string, rawParams: unknown, options: RunOptions = {}): Promise<ExecuteResult> {
-  const outcome = await runOperationInner(env, caller, op, rawParams, options)
+  const boundary: { hostId?: string; visibleHostIds?: string[] } = {}
+  const outcome = await runOperationInner(env, caller, op, rawParams, options, boundary)
+  if (outcome.ok && caller.kind === 'client') {
+    // A relay, task wait or export can outlive a revoke or grant change. Read
+    // current policy after assembling the result, without charging another call.
+    const current = await hubStub(env).callContext(caller.clientId)
+    if (!current.ok || boundary.visibleHostIds?.some(id => !current.grants[id])) {
+      return err('denied', 'This client or one of its hosts was disconnected while the request was running.', { denial: { layer: 'hub', reason: 'switched-off' }, fix: 'hub:/connections' })
+    }
+    if (boundary.hostId) {
+      const grant = current.grants[boundary.hostId]
+      if (!grant) return { ok: false, error: denied('hub', 'switched-off', op) }
+      const decision = decide({ operation: op, ceiling: { level: 'full' }, hubGrant: grant, tokenScopes: caller.scopes, now: Date.now() })
+      if (!decision.allowed) return { ok: false, error: denied(decision.layer, decision.reason, op) }
+    }
+  }
   return options.origin ? withAnswerLinks(outcome, options.origin) : outcome
 }
 
@@ -74,7 +89,7 @@ function withAnswerLinks(outcome: ExecuteResult, origin: string): ExecuteResult 
   return outcome.ok ? { ok: true, result: stampAnswerUrls(outcome.result, origin) } : outcome
 }
 
-async function runOperationInner(env: Env, caller: Caller, op: string, rawParams: unknown, options: RunOptions): Promise<ExecuteResult> {
+async function runOperationInner(env: Env, caller: Caller, op: string, rawParams: unknown, options: RunOptions, boundary: { hostId?: string; visibleHostIds?: string[] }): Promise<ExecuteResult> {
   if (caller.kind === 'client' && caller.clientId === OWNER_CLIENT_ID) return err('denied', 'This client id is reserved for the signed-in owner.')
   const spec = findOperation(op)
   if (!spec) return err('not_found', `Unknown operation: ${op}`)
@@ -107,6 +122,7 @@ async function runOperationInner(env: Env, caller: Caller, op: string, rawParams
   }
 
   if (HUB_OPERATIONS.has(op)) {
+    boundary.visibleHostIds = context.hosts.filter(host => context.grants[host.hostId] !== null).map(host => host.hostId)
     // Hub operations still honour the token scope.
     const decision = decide({ operation: op, ceiling: { level: 'full' }, hubGrant: { level: 'view' }, tokenScopes: caller.scopes, now: Date.now() })
     if (!decision.allowed) return { ok: false, error: denied(decision.layer, decision.reason, op) }
@@ -116,7 +132,10 @@ async function runOperationInner(env: Env, caller: Caller, op: string, rawParams
   }
 
   let hostId: string | null
-  if (TASK_LEDGER_OPERATIONS.has(op)) {
+  // Cancel/steer also accept an explicit host or (for steer) a session. When
+  // only a task id was supplied, it already identifies the owning host.
+  const taskIdTarget = (op === 'task.cancel' || op === 'task.steer') && typeof params.taskId === 'string' && params.hostId === undefined
+  if (TASK_LEDGER_OPERATIONS.has(op) || taskIdTarget) {
     hostId = typeof params.taskId === 'string' ? hostIdOfTask(params.taskId) : null
     if (!hostId || !context.hosts.some(host => host.hostId === hostId)) return err('not_found', 'No task with this id is known to the hub.')
   } else if (CONFIRMATION_LEDGER_OPERATIONS.has(op)) {
@@ -131,6 +150,7 @@ async function runOperationInner(env: Env, caller: Caller, op: string, rawParams
   const grant = context.grants[hostId]
   if (!grant) return { ok: false, error: { ...denied('hub', 'switched-off', op), message: `${op} was refused by the hub: this client is blocked on this host (Connections page).` } }
   const forwarded = finalParams(op, params, hostId)
+  boundary.hostId = hostId
   return hostStub(env, hostId).execute({
     op,
     params: forwarded,

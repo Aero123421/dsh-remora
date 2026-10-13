@@ -576,8 +576,12 @@ export class HubDO extends DurableObject<Env> {
   }
 
   async revokeClient(clientId: string): Promise<void> {
-    this.sql.exec('UPDATE clients SET revoked_at = ? WHERE client_id = ?', Date.now(), clientId)
+    const now = Date.now()
+    this.sql.exec('UPDATE clients SET revoked_at = ? WHERE client_id = ?', now, clientId)
     if (clientId.startsWith('pat:')) this.sql.exec('UPDATE pats SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', Date.now(), clientId.slice(4))
+    const approvals = this.sql.exec<{ id: string }>("SELECT id FROM approvals WHERE client_id = ? AND state IN ('pending', 'done')", clientId).toArray()
+    this.sql.exec("UPDATE approvals SET state = 'denied', decided_at = ?, updated_at = ? WHERE client_id = ? AND state IN ('pending', 'done')", now, now, clientId)
+    for (const { id } of approvals) this.wakeApproval(id)
     await this.audit({ actor: 'owner', actorName: 'オーナー', operation: 'client.revoke', hostId: null, outcome: 'ok', layer: null, reason: clientId })
   }
 
@@ -606,11 +610,11 @@ export class HubDO extends DurableObject<Env> {
    * client's status, the paired hosts and its grant on each, with the
    * per-client rate limit applied in the same round trip.
    */
-  async callContext(clientId: string, rate: { max: number; windowSeconds: number }): Promise<CallContext> {
+  async callContext(clientId: string, rate?: { max: number; windowSeconds: number }): Promise<CallContext> {
     const hosts = (await this.listHosts()).map(host => ({ hostId: host.hostId, name: host.name }))
     const client = this.sql.exec<{ revoked_at: number | null; last_used_at: number | null }>('SELECT revoked_at, last_used_at FROM clients WHERE client_id = ?', clientId).toArray()[0]
     if (client?.revoked_at) return { ok: false, error: 'revoked', hosts, grants: {} }
-    if (!this.hitSync(`api:${clientId}`, rate.max, rate.windowSeconds)) return { ok: false, error: 'rate_limited', hosts, grants: {} }
+    if (rate && !this.hitSync(`api:${clientId}`, rate.max, rate.windowSeconds)) return { ok: false, error: 'rate_limited', hosts, grants: {} }
     const now = Date.now()
     if (client && (client.last_used_at ?? 0) < now - 60_000) this.sql.exec('UPDATE clients SET last_used_at = ? WHERE client_id = ?', now, clientId)
     const settings = this.sql.exec<GrantRow>('SELECT * FROM grants WHERE client_id = ?', clientId).toArray().map(grantFromRow)
@@ -914,6 +918,7 @@ export class HubDO extends DurableObject<Env> {
 
   /** Count one delivery of an approved request's result. False once it is spent or too old. */
   async claimApprovalResult(id: string, clientId: string): Promise<boolean> {
+    if (this.sql.exec<{ revoked_at: number | null }>('SELECT revoked_at FROM clients WHERE client_id = ?', clientId).toArray()[0]?.revoked_at != null) return false
     const row = this.sql.exec<{ state: string; decided_at: number | null; fetches: number; client_id: string }>('SELECT state, decided_at, fetches, client_id FROM approvals WHERE id = ?', id).toArray()[0]
     if (!row || row.client_id !== clientId || row.state !== 'done' || row.decided_at === null) return false
     if (Date.now() - row.decided_at >= APPROVAL_RESULT_MS || row.fetches >= APPROVAL_RESULT_FETCHES) return false
@@ -931,6 +936,7 @@ export class HubDO extends DurableObject<Env> {
     this.settleApprovals()
     const row = this.approvalRow(id)
     if (!row || row.state !== 'pending') return false
+    if (approve && this.sql.exec<{ revoked_at: number | null }>('SELECT revoked_at FROM clients WHERE client_id = ?', row.clientId).toArray()[0]?.revoked_at != null) return false
     const now = Date.now()
     this.sql.exec('UPDATE approvals SET state = ?, decided_at = ?, updated_at = ? WHERE id = ?', approve ? 'done' : 'denied', now, now, id)
     await this.audit({ actor: 'owner', actorName: 'オーナー', operation: `${row.operation}.${approve ? 'approved' : 'refused'}`, hostId: null, outcome: approve ? 'ok' : 'denied', layer: null, reason: row.clientId })

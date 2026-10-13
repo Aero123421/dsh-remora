@@ -80,7 +80,9 @@ function sanitize(error: OperationError): RemoraError {
   return out
 }
 
-class DeadlineError extends Error {}
+class DeadlineError extends OperationError {
+  constructor() { super('unavailable', 'The operation did not finish before the deadline.') }
+}
 
 /** Full access for this caller: ceiling ∩ hub grant, both `full` and unexpired. */
 export function effectiveFullAccess(ceiling: Grant, grant: Grant | undefined, now: number): boolean {
@@ -101,7 +103,7 @@ export class Dispatcher {
 
   /** Abort every running handler (link lost, kill switch, unload). */
   abortAll(reason = 'aborted'): void {
-    for (const controller of this.inflight.values()) controller.abort(new Error(reason))
+    for (const controller of this.inflight.values()) controller.abort(new OperationError('unavailable', `Remote operation stopped: ${reason}`))
   }
 
   async handle(frame: RequestFrame): Promise<void> {
@@ -114,8 +116,9 @@ export class Dispatcher {
     const audit: AuditInput = { kind: 'request', action: frame.op, outcome: 'ok', clientId: String(actor.clientId), clientName: String(actor.clientName).slice(0, 200), requestId: frame.id }
     let response: ResponseFrame
     try {
-      const result = await this.run(frame, controller, now)
-      response = { t: 'response', id: frame.id, ok: true, result }
+      const completed = await this.run(frame, controller, now)
+      completed.assertAuthorized()
+      response = { t: 'response', id: frame.id, ok: true, result: completed.value }
     } catch (error) {
       const remora = this.toError(error, frame)
       response = { t: 'response', id: frame.id, ok: false, error: remora }
@@ -131,17 +134,35 @@ export class Dispatcher {
     this.deps.audit(audit)
   }
 
-  private async run(frame: RequestFrame, controller: AbortController, now: () => number): Promise<unknown> {
+  private async run(frame: RequestFrame, controller: AbortController, now: () => number): Promise<{ value: unknown; assertAuthorized: () => void }> {
     const spec = OPERATIONS.find(op => op.id === frame.op)
     const handler = spec && !HUB_ONLY.has(spec.id) ? (this.deps.handlers()[spec.id as HostOperationId] as OperationHandler<HostOperationId> | undefined) : undefined
     if (!spec || !handler) throw new OperationError('not_found', `operation ${String(frame.op).slice(0, 64)} is not available on this host`)
     const op = spec.id as HostOperationId
     const issues = validateParams(op as OperationId, frame.params)
     if (issues.length > 0) throw new OperationError('invalid_request', issues.slice(0, 5).map(issue => `${issue.path} ${issue.message}`).join('; '))
-    if (this.deps.killSwitch()) throw new Refusal(killSwitchError())
-    const decision = decide({ operation: op, ceiling: this.deps.ceiling(), hubGrant: frame.grant, tokenScopes: Array.isArray(frame.scopes) ? frame.scopes : [], now: now() })
-    if (!decision.allowed) throw new Refusal(denialError(decision.layer, decision.reason))
     const optional = CONFIRMATION_UNLESS_ALLOWED.has(op)
+    let confirmedWith: PairedHub | undefined
+    const refuse = (error: RemoraError): never => { throw new OperationError(error.code, error.message, error) }
+    const assertAuthorized = (): void => {
+      if (this.deps.killSwitch()) refuse(killSwitchError())
+      controller.signal.throwIfAborted()
+      if (now() >= frame.deadline - (this.deps.marginMs ?? 1_000)) throw new DeadlineError()
+      const decision = decide({ operation: op, ceiling: this.deps.ceiling(), hubGrant: frame.grant, tokenScopes: Array.isArray(frame.scopes) ? frame.scopes : [], now: now() })
+      if (!decision.allowed) refuse(denialError(decision.layer, decision.reason))
+      if (optional && this.deps.allowsWithoutConfirmation?.(op) !== true && frame.confirmation === undefined) refuse(passkeyRequiredError())
+      if (confirmedWith) {
+        const current = this.deps.pinned()
+        const id = frame.confirmation?.assertion.credentialId
+        const before = confirmedWith.owner.find(item => item.credentialId === id)
+        const after = current?.owner.find(item => item.credentialId === id)
+        if (!current || current.hostId !== confirmedWith.hostId || current.hubOrigin !== confirmedWith.hubOrigin || current.rpId !== confirmedWith.rpId
+          || !before || !after || before.publicKey !== after.publicKey || before.algorithm !== after.algorithm) {
+          refuse({ code: 'denied', message: 'The passkey confirmation is no longer trusted on this DSH host.', denial: { layer: 'dsh', reason: 'confirmation-failed' }, fix: 'hub:/' })
+        }
+      }
+    }
+    assertAuthorized()
     const required = REQUIRES_CONFIRMATION.has(op) || (optional && this.deps.allowsWithoutConfirmation?.(op as OperationId) !== true)
     if (optional && required && frame.confirmation === undefined) throw new Refusal(passkeyRequiredError())
     // A confirmation sent along anyway (the hub page always asks for the passkey) is still checked.
@@ -158,16 +179,20 @@ export class Dispatcher {
         isUsed: id => this.deps.confirmations.isUsed(id),
       })
       if (!verdict.ok) throw new ConfirmationDenied(verdict.failure)
+      confirmedWith = pinned
       await this.deps.confirmations.markUsed(frame.id, (frame.confirmation?.issuedAt ?? now()) + 2 * CONFIRMATION_TTL_MS)
     }
+    assertAuthorized()
     const budget = frame.deadline - now() - (this.deps.marginMs ?? 1_000)
     if (budget <= 0) throw new DeadlineError()
+    const ceiling = () => this.deps.ceiling()
     const context: OperationContext = {
       actor: { clientId: String(frame.actor?.clientId ?? 'unknown'), clientName: String(frame.actor?.clientName ?? 'unknown') },
       requestId: frame.id,
       scopes: Array.isArray(frame.scopes) ? [...frame.scopes] : [],
-      fullAccess: effectiveFullAccess(this.deps.ceiling(), frame.grant, now()),
+      get fullAccess() { return effectiveFullAccess(ceiling(), frame.grant, now()) },
       signal: controller.signal,
+      assertAuthorized,
     }
     if (typeof frame.taskId === 'string') context.taskId = frame.taskId
     if (typeof frame.idempotencyKey === 'string') context.idempotencyKey = frame.idempotencyKey
@@ -175,14 +200,22 @@ export class Dispatcher {
     const deadline = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         reject(new DeadlineError())
-        controller.abort(new Error('deadline'))
+        controller.abort(new DeadlineError())
       }, budget)
       timer.unref?.()
     })
+    let onAbort!: () => void
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(controller.signal.reason)
+      controller.signal.addEventListener('abort', onAbort, { once: true })
+    })
     try {
-      return await Promise.race([handler(frame.params as never, context), deadline])
+      assertAuthorized()
+      const value = await Promise.race([handler(frame.params as never, context), deadline, aborted])
+      return { value, assertAuthorized }
     } finally {
       clearTimeout(timer)
+      controller.signal.removeEventListener('abort', onAbort)
     }
   }
 

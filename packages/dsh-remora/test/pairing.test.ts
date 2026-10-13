@@ -84,6 +84,50 @@ test('cancelling stops polling', async () => {
   assert.equal(pairing.view.phase, 'cancelled')
 })
 
+test('a successful old start response cannot replace cancellation or a newer attempt', async () => {
+  for (const newer of [false, true]) {
+    let release!: (response: Response) => void
+    const firstResponse = new Promise<Response>(resolve => { release = resolve })
+    let starts = 0
+    const response = (id: string) => Response.json({ pairingId: id, userCode: 'WXYZ2345', verifyUrl: `${origin}/pair?id=${id}`, expiresAt: Date.now() + 60_000 })
+    const pairing = new PairingClient({
+      fetch: async () => ++starts === 1 ? firstResponse : response('new'),
+      sleep: (_ms, signal) => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })),
+      onApproved: async () => {},
+    })
+    try {
+      const old = pairing.start(origin, 'pc', '1')
+      if (newer) await pairing.start(origin, 'pc', '1')
+      else pairing.cancel()
+      release(response('old'))
+      await old
+      assert.equal(pairing.view.phase, newer ? 'waiting' : 'cancelled')
+      assert.equal(pairing.view.verifyUrl, newer ? `${origin}/pair?id=new` : undefined)
+    } finally { pairing.cancel() }
+  }
+})
+
+test('cancellation during approval persistence keeps the cancelled view and aborts the commit signal', async () => {
+  const owner = [makePasskey('ed25519').credential]
+  const hub = hubFetch(() => ({ status: 'approved', hostId: 'h1', hubOrigin: origin, rpId: 'hub.example.com', owner }))
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let signal: AbortSignal | undefined
+  let finished = false
+  const pairing = new PairingClient({
+    fetch: hub.fetch,
+    sleep: async () => {},
+    onApproved: async (_approved, _key, current) => { signal = current; await gate; finished = true },
+  })
+  await pairing.start(origin, 'pc', '1')
+  await until(() => signal !== undefined)
+  pairing.cancel()
+  assert.equal(signal?.aborted, true)
+  release()
+  await until(() => finished)
+  assert.equal(pairing.view.phase, 'cancelled')
+})
+
 test('host keys are stored in DSH credentials when available, else in a 0600 file', async () => {
   const records = new Map<string, unknown>()
   const credentials: CredentialsLike = {

@@ -156,7 +156,7 @@ export function createSchedules(rt: Runtime) {
     if (row.subagent) throw invalid(`session ${row.sessionId} is a subagent session`)
     if (row.archived) throw new OperationError('conflict', `session ${row.sessionId} is archived`)
     // A schedule starts turns later, so it obeys the same rule as a prompt now.
-    rt.assertCanDriveTurns(row.workspace?.id ?? null)
+    rt.assertSession(row, context, true)
     const now = Date.now()
     const request = createRequest(params.title.trim(), params.prompt, params.when)
     const requestHash = createHash('sha256').update(JSON.stringify({ sessionId: row.sessionId, request })).digest('hex')
@@ -165,6 +165,7 @@ export function createSchedules(rt: Runtime) {
     if (earlier) {
       if (earlier.requestHash !== requestHash) throw new OperationError('conflict', 'this idempotencyKey was already used for a different scheduled prompt')
       const existing = (await catalog()).find(entry => entry.id === earlier.scheduleId)
+      rt.assertSession(row, context, true)
       if (existing) return { schedule: scheduleInfo(existing, hasContent(context), createdBy(existing.id)) }
       throw unavailable('the tracked automation task is missing from this DSH process; restart DSH before retrying')
     }
@@ -176,7 +177,7 @@ export function createSchedules(rt: Runtime) {
     if (remote.list().filter(record => live.has(record.scheduleId)).length >= REMOTE_SCHEDULES_MAX) {
       throw new OperationError('conflict', `${REMOTE_SCHEDULES_MAX} scheduled prompts created through Remora are already active on this host; delete some first`)
     }
-    if (context.signal.aborted) throw unavailable('creating the automation task was cancelled')
+    rt.assertSession(row, context, true)
     let record
     try {
       record = await service().create(row.sessionId, request, context.signal)
@@ -195,6 +196,7 @@ export function createSchedules(rt: Runtime) {
       })
       throw error
     }
+    rt.assertSession(row, context)
     return { schedule: scheduleInfo({ ...record, sessionId: row.sessionId, status: 'active' }, hasContent(context), context.actor.clientName) }
   }
 
@@ -208,8 +210,11 @@ export function createSchedules(rt: Runtime) {
     },
     async 'schedules.list'(params: Params<'schedules.list'>, context: OperationContext): Promise<Result<'schedules.list'>> {
       if (params.sessionId !== undefined) await rt.row(params.sessionId, context.signal)
-      const reachable = new Set((await rt.catalog(context.signal)).filter(row => rt.canAccess(row)).map(row => row.sessionId))
-      const schedules = (await catalog())
+      const rows = await rt.catalog(context.signal)
+      const entries = await catalog()
+      rt.assertAuthorized(context)
+      const reachable = new Set(rows.filter(row => rt.canAccess(row)).map(row => row.sessionId))
+      const schedules = entries
         .filter(entry => reachable.has(entry.sessionId) && (params.sessionId === undefined || entry.sessionId === params.sessionId))
         .map(entry => scheduleInfo(entry, hasContent(context), createdBy(entry.id)))
         .sort((a, b) => (a.status === b.status ? (a.nextAt ?? Infinity) - (b.nextAt ?? Infinity) : a.status === 'active' ? -1 : 1))
@@ -223,6 +228,7 @@ export function createSchedules(rt: Runtime) {
     'schedule.delete'(params: Params<'schedule.delete'>, context: OperationContext): Promise<Result<'schedule.delete'>> {
       return mutate(async () => {
         const row = await rt.row(params.sessionId, context.signal)
+        rt.assertSession(row, context)
         let outcome
         try {
           outcome = await service().delete({ sessionId: row.sessionId, id: params.scheduleId }, context.signal)
