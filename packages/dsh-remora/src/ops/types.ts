@@ -85,6 +85,8 @@ export interface OperationContext {
    */
   fullAccess: boolean
   signal: AbortSignal
+  /** Recheck this request's current permission and cancellation before a new effect or disclosure. */
+  assertAuthorized?: () => void
 }
 
 export type OperationHandler<Op extends HostOperationId> =

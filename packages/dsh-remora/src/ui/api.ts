@@ -1,7 +1,8 @@
 /** Settings-tab plumbing: the DSH client context, RPC calls and localized copy. */
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useEffect, useSyncExternalStore } from 'react'
 import { NS, ja, type CopyKey } from '../locales.ts'
 import type { RemoraSnapshot } from '../state.ts'
+import { SnapshotStore } from './snapshot-store.ts'
 
 export type Translate = (key: CopyKey, params?: Record<string, unknown>) => string
 
@@ -30,10 +31,14 @@ export class CallError extends Error {
   }
 }
 
-export async function call<T>(ctx: ClientContext, method: string, payload: unknown = {}): Promise<T> {
-  const result = await ctx.connection.rpc.call('/api', `remora/${method}`, payload)
+async function rpcCall<T>(rpc: ClientContext['connection']['rpc'], method: string, payload: unknown, signal?: AbortSignal): Promise<T> {
+  const result = await rpc.call('/api', `remora/${method}`, payload, signal)
   if (!result.ok) throw new CallError(result.error.code.replace(/^remora\//, ''))
   return result.value as T
+}
+
+export function call<T>(ctx: ClientContext, method: string, payload: unknown = {}, signal?: AbortSignal): Promise<T> {
+  return rpcCall<T>(ctx.connection.rpc, method, payload, signal)
 }
 
 export function useCopy(locale: Locale): Translate {
@@ -47,42 +52,38 @@ export function errorText(t: Translate, error: unknown): string {
   return key in ja ? t(key as CopyKey) : t('err.generic', { code })
 }
 
+const stores = new WeakMap<ClientContext['connection']['rpc'], SnapshotStore<RemoraSnapshot>>()
+
+/** Share the same state and request ordering between the settings page and chip. */
+function snapshotStore(ctx: ClientContext): SnapshotStore<RemoraSnapshot> {
+  const rpc = ctx.connection.rpc
+  let store = stores.get(rpc)
+  if (!store) {
+    store = new SnapshotStore<RemoraSnapshot>(
+      (method, payload, signal) => rpcCall(rpc, method, payload, signal),
+      (value): value is RemoraSnapshot => !!value && typeof value === 'object' && 'settings' in value,
+    )
+    stores.set(rpc, store)
+  }
+  return store
+}
+
 /** The snapshot, refreshed every `intervalMs` while the page is visible. */
 export function useSnapshot(ctx: ClientContext, intervalMs: number) {
-  const [snapshot, setSnapshot] = useState<RemoraSnapshot>()
-  const [failed, setFailed] = useState(false)
-  const alive = useRef(true)
-  const load = useCallback(() => {
-    call<RemoraSnapshot>(ctx, 'state').then(value => { if (alive.current) { setSnapshot(value); setFailed(false) } }, () => { if (alive.current) setFailed(true) })
-  }, [ctx])
+  const store = snapshotStore(ctx)
+  const { snapshot, failed } = useSyncExternalStore(store.subscribe, store.getSnapshot)
   useEffect(() => {
-    alive.current = true
-    load()
-    const timer = setInterval(() => { if (document.visibilityState === 'visible') load() }, intervalMs)
-    return () => { alive.current = false; clearInterval(timer) }
-  }, [load, intervalMs])
-  return { snapshot, setSnapshot, failed, reload: load }
+    const release = store.retain()
+    const timer = setInterval(() => { if (document.visibilityState === 'visible') void store.reload() }, intervalMs)
+    return () => { clearInterval(timer); release() }
+  }, [store, intervalMs])
+  return { snapshot, store, failed, reload: store.reload }
 }
 
 /** Run a settings action; the returned snapshot replaces the current one. */
-export function useAction(ctx: ClientContext, t: Translate, apply: (snapshot: RemoraSnapshot) => void) {
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const run = useCallback(async (method: string, payload: unknown = {}): Promise<boolean> => {
-    setBusy(true)
-    setError(null)
-    try {
-      const value = await call<RemoraSnapshot>(ctx, method, payload)
-      if (value && typeof value === 'object' && 'settings' in value) apply(value)
-      return true
-    } catch (caught) {
-      setError(errorText(t, caught))
-      return false
-    } finally {
-      setBusy(false)
-    }
-  }, [ctx, t, apply])
-  return { run, busy, error, setError }
+export function useAction(t: Translate, store: SnapshotStore<RemoraSnapshot>) {
+  const { busy, actionError } = useSyncExternalStore(store.subscribe, store.getSnapshot)
+  return { run: store.run, busy, error: actionError === null ? null : errorText(t, actionError) }
 }
 
 export function formatRemaining(ms: number): string {

@@ -10,7 +10,7 @@ import { dropPartialHead, redactLine, redactTruncate } from '../redact.ts'
 import type { DshJobs, DshJobView } from './dsh-types.ts'
 import { SERVICES } from './dsh-types.ts'
 import { denied, fromDsh, notFound, unavailable } from './errors.ts'
-import { hasContent, type Runtime } from './runtime.ts'
+import { hasContent, type Runtime, type SessionRow } from './runtime.ts'
 
 type Params<Op extends keyof OperationParams> = OperationParams[Op]
 type Result<Op extends keyof OperationResults> = OperationResults[Op]
@@ -37,7 +37,7 @@ export function createJobs(rt: Runtime) {
   }
 
   /** The job and the session that owns it, when the caller may reach that session. */
-  async function locate(jobId: string, signal: AbortSignal): Promise<{ jobs: DshJobs; view: DshJobView; owner: string | undefined }> {
+  async function locate(jobId: string, signal: AbortSignal): Promise<{ jobs: DshJobs; view: DshJobView; owner: string | undefined; row: SessionRow }> {
     const jobs = service()
     const rows = await rt.catalog(signal)
     let owner: string | undefined
@@ -55,13 +55,14 @@ export function createJobs(rt: Runtime) {
     // Only jobs of a session in scope: a job no session owns is outside any workspace scope.
     const row = view.owner === undefined ? undefined : rows.find(item => item.sessionId === view!.owner)
     if (!row || !rt.canAccess(row)) throw denied(`job ${jobId} does not belong to a session Remora may reach`)
-    return { jobs, view, owner }
+    return { jobs, view, owner, row }
   }
 
   return {
     async 'job.output'(params: Params<'job.output'>, context: OperationContext): Promise<Result<'job.output'>> {
       if (!hasContent(context)) throw new OperationError('denied', 'reading job output needs the dsh.content scope', { denial: { layer: 'token', reason: 'missing-scope' } })
-      const { jobs, view, owner } = await locate(params.jobId, context.signal)
+      const { jobs, view, owner, row } = await locate(params.jobId, context.signal)
+      rt.assertSession(row, context)
       const tail = params.tailBytes ?? 64_000
       const from = Math.max(view.output.earliest, view.output.total - tail)
       const read = jobs.readAt(params.jobId, from, owner)
@@ -77,7 +78,8 @@ export function createJobs(rt: Runtime) {
     },
 
     async 'job.stop'(params: Params<'job.stop'>, context: OperationContext): Promise<Result<'job.stop'>> {
-      const { jobs, owner } = await locate(params.jobId, context.signal)
+      const { jobs, owner, row } = await locate(params.jobId, context.signal)
+      rt.assertSession(row, context)
       let outcome: 'requested' | 'already-finished'
       try {
         outcome = jobs.kill(params.jobId, owner, `stopped from outside through Remora by ${context.actor.clientName}`.slice(0, 200))

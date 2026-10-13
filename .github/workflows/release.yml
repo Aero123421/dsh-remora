@@ -285,7 +285,11 @@ jobs:
             echo
             echo "## Changes"
             echo
-            git log --no-merges --format='- %s (%h)' "$range"
+            if [ -f "docs/releases/${tag}.md" ]; then
+              cat "docs/releases/${tag}.md"
+            else
+              git log --no-merges --format='- %s (%h)' "$range"
+            fi
           } > notes.md
           cat notes.md
       - name: Publish

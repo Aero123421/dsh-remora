@@ -247,6 +247,7 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
   }
 
   async function create(params: Params<'workspace.create'>, context: OperationContext): Promise<Result<'workspace.create'>> {
+    rt.assertAuthorized(context)
     const registry = rt.workspaces
     if (!registry) throw unavailable('DSH workspace registry is not available')
     const key = `${context.actor.clientId}\u0000${params.idempotencyKey}`
@@ -261,6 +262,13 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
     const placement = rt.deps.scope.placements().find(item => item.placementId === params.placementId)
     if (!placement) throw notFound(`placement ${params.placementId} is not configured on DSH`)
     const url = params.gitUrl === undefined ? undefined : checkGitUrl(params.gitUrl, rt.deps.scope.gitHosts())
+    const assertCreationAllowed = (): void => {
+      rt.assertAuthorized(context)
+      if (!rt.deps.scope.placements().some(item => item.placementId === placement.placementId && item.path === placement.path)) {
+        throw denied('the placement is no longer allowed; check it on the DSH settings tab')
+      }
+      if (url) checkGitUrl(url, rt.deps.scope.gitHosts())
+    }
     let root: string
     try {
       root = rt.deps.scope.resolvePlacement
@@ -271,7 +279,7 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
       throw unavailable('the placement folder is not available')
     }
     if (root !== placement.path) throw denied('the placement folder now resolves to a different folder; register its new location on the DSH settings tab')
-    if (context.signal.aborted) throw unavailable('creating the workspace was cancelled')
+    assertCreationAllowed()
     const target = join(root, params.name)
     if (!isInside(target, root)) throw denied('the folder would be outside the placement')
     try {
@@ -294,7 +302,15 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
       if (await realpath(placement.path) !== root) throw denied('the placement folder changed while creating the workspace')
       if (!isInside(real, root)) throw denied('the folder resolved outside the placement')
       try {
-        workspace = (await registry.resolveByPath(real)) ?? await registry.create(real)
+        const existing = await registry.resolveByPath(real)
+        // Registry lookup can wait on native state. Do not register against an
+        // old placement or start a new native mutation after cancellation.
+        if (rt.deps.scope.resolvePlacement) {
+          if ((await rt.deps.scope.resolvePlacement(placement.placementId)).path !== root) throw denied('the placement folder changed')
+        }
+        if (await realpath(placement.path) !== root || await realpath(target) !== real) throw denied('the placement folder changed')
+        assertCreationAllowed()
+        workspace = existing ?? await registry.create(real)
       } catch (error) {
         throw fromDsh(error, 'registering the workspace with DSH failed')
       }
@@ -313,9 +329,13 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
     }
     await rt.creations.put(record)
     if (url) {
-      if (context.signal.aborted) {
-        await cleanUp(record, 'creating the workspace was cancelled')
-        throw unavailable('creating the workspace was cancelled')
+      try {
+        assertCreationAllowed()
+      } catch (error) {
+        // The registration already succeeded; retain its ledger and perform
+        // owned cleanup even though the remote request is no longer allowed.
+        await cleanUp(record, 'creating the workspace was cancelled or its permission changed')
+        throw error
       }
       startClone(record, url)
     }
@@ -324,13 +344,18 @@ export function createWorkspaceCreate(rt: Runtime, limits: CloneLimits = DEFAULT
 
   return {
     handlers: {
-      'workspace.create'(params: Params<'workspace.create'>, context: OperationContext): Promise<Result<'workspace.create'>> {
+      async 'workspace.create'(params: Params<'workspace.create'>, context: OperationContext): Promise<Result<'workspace.create'>> {
+        rt.assertAuthorized(context)
         const key = `${context.actor.clientId}\u0000${params.idempotencyKey}`
         const inFlight = running.get(key)
-        if (inFlight) return inFlight
-        const promise = create(params, context).finally(() => running.delete(key))
-        running.set(key, promise)
-        return promise
+        const promise = inFlight ?? create(params, context).finally(() => running.delete(key))
+        if (!inFlight) running.set(key, promise)
+        const result = await promise
+        rt.assertAuthorized(context)
+        if (!rt.deps.scope.canAccessWorkspace(result.workspace.workspaceId, result.workspace.path)) {
+          throw denied('the created workspace is no longer in the scope Remora may reach')
+        }
+        return result
       },
     },
     /** A clone that was running when DSH stopped cannot resume: clean it up. */

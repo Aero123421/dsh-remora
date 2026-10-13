@@ -104,12 +104,13 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
   async function sessionFor(sessionId: string, context: OperationContext, drives: boolean): Promise<SessionRow> {
     const row = await rt.row(sessionId, context.signal)
     promptable(row)
-    if (drives) rt.assertCanDriveTurns(row.workspace?.id ?? null)
+    rt.assertSession(row, context, drives)
     return row
   }
 
-  async function goalState(sessionId: string, context: OperationContext): Promise<Result<'goal.manage'>> {
-    const values = await rt.projections(sessionId, context.signal)
+  async function goalState(row: SessionRow, context: OperationContext): Promise<Result<'goal.manage'>> {
+    const values = await rt.projections(row.sessionId, context.signal)
+    rt.assertSession(row, context)
     const goal = values?.goal
     return { goal: goal ? { text: hasContent(context) ? redactTruncate(goal.goal.objective, 4000).text : '', state: goal.goal.phase } : null }
   }
@@ -117,10 +118,12 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
   async function manageGoal(params: Params<'goal.manage'>, context: OperationContext): Promise<Result<'goal.manage'>> {
     // set / resume start goal rounds (agent turns); pause / clear only stop them.
     const row = params.action === 'get' ? await rt.row(params.sessionId, context.signal) : await sessionFor(params.sessionId, context, params.action === 'set' || params.action === 'resume')
-    if (params.action === 'get') return goalState(row.sessionId, context)
+    if (params.action === 'get') return goalState(row, context)
     const goals = rt.get<DshGoals>(SERVICES.goals)
     if (!goals) throw unavailable('DSH goals are not available')
+    rt.assertSession(row, context, params.action === 'set' || params.action === 'resume')
     const agent = await rt.agent(row.sessionId)
+    rt.assertSession(row, context, params.action === 'set' || params.action === 'resume')
     try {
       const current = goals.get(agent)
       const ref = current ? { id: current.id, revision: current.revision } : null
@@ -148,7 +151,7 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
     } catch (error) {
       throw fromDsh(error, 'the goal could not be changed')
     }
-    return goalState(row.sessionId, context)
+    return goalState(row, context)
   }
 
   return {
@@ -158,8 +161,9 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
       const row = await rt.row(params.sessionId, context.signal)
       // An answer (or a goal resume) continues the agent's turn, so it is refused in
       // untrusted or cloning workspaces like a prompt; the owner answers on DSH Web.
-      rt.assertCanDriveTurns(row.workspace?.id ?? null)
+      rt.assertSession(row, context, true)
       const [events, values] = await Promise.all([rt.events(row.sessionId, context.signal), rt.projections(row.sessionId, context.signal)])
+      rt.assertSession(row, context, true)
       const item = rt.attention(row.sessionId, events, values).find(candidate => candidate.attentionId === params.attentionId)
       // Answered on DSH Web first (or never existed): refuse instead of answering twice.
       if (!item) throw new OperationError('conflict', 'this item was already answered or is no longer waiting')
@@ -192,7 +196,9 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
           const batch = questionAnswer(pending.questions, answer)
           const service = rt.get<DshUserQuestions>(SERVICES.userQuestions)
           if (!service) throw unavailable('DSH user questions are not available')
+          rt.assertSession(row, context, true)
           const agent = await rt.agent(row.sessionId)
+          rt.assertSession(row, context, true)
           let accepted: boolean
           try {
             accepted = service.answer(agent, params.attentionId, batch)
@@ -207,12 +213,13 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
 
     async 'approval.respond'(params: Params<'approval.respond'>, context: OperationContext): Promise<Result<'approval.respond'>> {
       const row = await rt.row(params.sessionId, context.signal)
-      rt.assertCanDriveTurns(row.workspace?.id ?? null)
+      rt.assertSession(row, context, true)
       // The core already required the owner's passkey unless approvals from MCP and CLI are allowed.
       const outcome = approvalOutcome(params.answer)
       const held = answerer?.find(row.sessionId, params.attentionId)
       if (held?.kind === 'approval') return deliver(held, outcome)
       const events = await rt.events(row.sessionId, context.signal)
+      rt.assertSession(row, context, true)
       const item = rt.attention(row.sessionId, events, null).find(candidate => candidate.attentionId === params.attentionId)
       if (!item) throw new OperationError('conflict', 'this approval was already decided or is no longer waiting')
       if (item.kind !== 'approval') throw invalid(`this item is a ${item.kind}; answer it with attention.respond`)
@@ -232,6 +239,7 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
         if (!end) throw invalid(`turn ${params.atTurn} has not finished in session ${source.sessionId}`)
         atSeq = end.seq
       }
+      rt.assertSession(source, context)
       let forked: { sessionId: string }
       try {
         forked = await controller.fork({ sessionId: source.sessionId, ...(atSeq !== undefined ? { atSeq } : {}), allowMigration: false })
@@ -242,6 +250,7 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
       rt.noteWake(forked.sessionId, false)
       const title = params.title?.trim()
       if (title) {
+        rt.assertSession(await rt.row(forked.sessionId, context.signal), context)
         try {
           await controller.rename({ sessionId: forked.sessionId, title })
         } catch (error) {
@@ -249,6 +258,7 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
         }
       }
       const row = await rt.row(forked.sessionId, context.signal)
+      rt.assertSession(row, context)
       return { session: rt.summaryOf(row), forkedFrom: source.sessionId }
     },
 
@@ -261,6 +271,8 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
       } catch (error) {
         throw fromDsh(error, 'reading the model catalog failed')
       }
+      rt.assertSession(row, context)
+      promptable(row)
       const match = matchModel(catalog, params)
       if (!match) {
         // No match: report the choices DSH offers instead of failing.
@@ -270,6 +282,7 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
       try {
         const { selected } = await rt.sessions.selectModel({ sessionId: row.sessionId, provider: match.provider, model: match.model, ...(match.effort !== undefined ? { reasoningEffort: match.effort } : {}) })
         rt.noteWake(row.sessionId, wasLive)
+        rt.assertSession(row, context)
         // DSH saves a successful selection as the default for new sessions (in the background).
         return { model: { provider: selected.provider, model: selected.model, effort: selected.reasoningEffort ?? null }, savedAsDefault: true }
       } catch (error) {
@@ -286,7 +299,10 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
       const row = await sessionFor(params.sessionId, context, true)
       const commands = rt.get<DshCommands>(SERVICES.commands)
       if (!commands) throw unavailable('DSH commands are not available')
+      rt.assertSession(row, context, true)
       const agent = await rt.agent(row.sessionId)
+      rt.assertSession(row, context, true)
+      if (!rt.deps.scope.isAllowedCommand(command)) throw denied(`${command} is not allowed for remote use`)
       const line = params.args !== undefined && params.args.trim() !== '' ? `${command} ${params.args}` : command
       let execution: Awaited<ReturnType<DshCommands['execute']>>
       try {
@@ -294,6 +310,7 @@ export function createActions(rt: Runtime, answerer?: Answerer) {
       } catch (error) {
         throw fromDsh(error, `${command} failed`)
       }
+      rt.assertSession(row, context)
       if (execution === undefined) throw new OperationError('not_found', `${command} is not a command in this session`)
       const text = execution.result.text ?? null
       return {

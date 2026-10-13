@@ -135,8 +135,8 @@ export function createMethods(core: RemoraCore): Record<string, Method> {
       await core.startPairing(hubUrl, local)
       return core.snapshot(local)
     },
-    'pairing-cancel': (_, { local }) => {
-      core.cancelPairing()
+    'pairing-cancel': async (_, { local }) => {
+      await core.cancelPairing()
       return core.snapshot(local)
     },
     unpair: async (_, { local }) => {
@@ -156,7 +156,7 @@ export function createMethods(core: RemoraCore): Record<string, Method> {
       return core.snapshot(local)
     },
     'update-check': async payload => core.checkUpdate(field(payload, 'force') === true),
-    'update-install': async (_, { local }) => core.installUpdate(local),
+    'update-install': async (payload, { local }) => core.installUpdate(local, field(payload, 'version')),
   }
   return Object.fromEntries(Object.entries(methods).map(([name, method]) => [name, withReady(method)]))
 }

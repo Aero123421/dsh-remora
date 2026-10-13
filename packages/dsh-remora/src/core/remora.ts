@@ -4,6 +4,7 @@
  * creates one per plugin load and disposes it on unload.
  */
 import { homedir, hostname } from 'node:os'
+import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFileSync, watch, type FSWatcher } from 'node:fs'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -31,7 +32,7 @@ import { HubLink, type LinkStatus, type SocketLike } from './connection.ts'
 import { Dispatcher } from './dispatch.ts'
 import { EventQueue, systemClock, type Clock } from './events.ts'
 import { HostKey, HostKeyStore, type CredentialsLike } from './hostkey.ts'
-import { InstanceLock } from './lock.ts'
+import { InstanceLock, withFileLock } from './lock.ts'
 import { PairingClient, type ApprovedPairing, type FetchLike, type PairingView } from './pairing.ts'
 import { ceilingAllows, fullAccessActive, wideningReasons } from './permissions.ts'
 import { RpcError } from './rpc-error.ts'
@@ -45,7 +46,7 @@ import { FileWorkspaceCreationStore, workspaceCreationsSpec } from './workspace-
 import { FileRemoteScheduleStore, remoteSchedulesSpec } from './remote-schedules.ts'
 import { FileTaskStore } from './tasks.ts'
 import { readQuestionModes, switchToTimed, type QuestionModeReport } from './question-mode.ts'
-import { checkForUpdate, downloadVerified, type UpdateCheck } from './updates.ts'
+import { checkForUpdate, downloadVerified, installationResult, UpdateError, type UpdateCheck, type UpdateInstallation, type UpdatePluginManager } from './updates.ts'
 
 type GetFetch = (input: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => Promise<Response>
 
@@ -118,6 +119,9 @@ export interface RemoraSnapshot {
   proxy: { configured: boolean; envProxy: boolean }
   auditIntact: boolean
   update: UpdateCheck | null
+  /** Scopes transient update attempts to this Host load, including same-version reloads. */
+  updateHostInstance: string
+  updateInstallation: UpdateInstallation | null
   canInstallUpdate: boolean
   /** `ask_user_question` mode per agent preset: only `timed` questions can be answered remotely. */
   questionModes: QuestionModeReport
@@ -168,6 +172,8 @@ export class RemoraCore {
   private dispatcher!: Dispatcher
   private link!: HubLink
   private pairing!: PairingClient
+  private pairingAttempt = 0
+  private pairingGeneration = ''
   private lock!: InstanceLock
   private adapter: Adapter | null = null
   private adapterStarted = false
@@ -175,6 +181,10 @@ export class RemoraCore {
   private nativeCacheStale = false
   private expiryTimer: unknown = null
   private updateCheck: UpdateCheck | null = null
+  private readonly updateHostInstance = randomUUID()
+  private updateChecking: Promise<UpdateCheck> | null = null
+  private updateInstallation: UpdateInstallation | null = null
+  private updateInstalling: Promise<UpdateInstallation> | null = null
   private lastUnpair: { at: number; hub: 'removed' | 'refused' | 'unreachable' | 'not-paired' } | null = null
   private fatal: string | null = null
   private disposed = false
@@ -287,7 +297,7 @@ export class RemoraCore {
     this.pairing = new PairingClient({
       ...(this.options.fetch ? { fetch: this.options.fetch } : {}),
       now: () => this.clock.now(),
-      onApproved: (approved, key) => this.onPaired(approved, key),
+      onApproved: (approved, key, signal) => this.onPaired(approved, key, signal, this.pairingGeneration),
     })
     this.lock = new InstanceLock(dir)
     this.adapter = this.options.createAdapter(this.ctx, {
@@ -325,6 +335,8 @@ export class RemoraCore {
 
   private async close(): Promise<void> {
     this.disposed = true
+    this.pairingAttempt++
+    this.pairing?.cancel('idle')
     this.stateWatcher?.close()
     await this.ready
     if (this.fatal !== null && !this.link) return
@@ -579,52 +591,166 @@ export class RemoraCore {
 
   // --- pairing ------------------------------------------------------------------
 
-  private async onPaired(approved: ApprovedPairing, key: HostKey): Promise<void> {
-    await this.stopLink('idle', null)
-    this.lastUnpair = null
-    await this.keyStore.save(key)
-    await this.keyStore.delete('previous')
-    this.hostKey = key
-    this.previousKey = null
-    this.pendingRotation = null
-    await this.pairingDoc.update(() => ({
-      paired: { ...approved, publicKey: key.publicKey, pairedAt: this.clock.now() },
-      pendingCredentials: null,
-      revoked: false,
-    }))
-    await this.settingsDoc.update(current => ({ ...current, hubUrl: approved.hubOrigin }))
-    this.audit({ kind: 'settings', action: 'paired', outcome: 'ok', local: true })
-    await this.startLink()
+  private onPaired(approved: ApprovedPairing, key: HostKey, signal: AbortSignal, generation: string): Promise<void> {
+    // Approval can overlap cancellation, another attempt, or unpairing while
+    // the credential store is writing. Keep commit and rollback inside the
+    // state queue so unpair/dispose finish after all of those writes.
+    return this.updateState(async () => {
+      const check = (): void => {
+        if (this.disposed || signal.aborted) throw new Error('pairing cancelled')
+      }
+      check()
+      // Release native ownership before waiting for the pairing lock: another
+      // process may be unpairing and waiting for this owner to stop.
+      await this.stopLink('idle', null)
+      let restore: (() => Promise<void>) | undefined
+      let restored = false
+      try {
+        await withFileLock(this.dataDir, 'pairing-mutation.lock', async () => {
+          check()
+          const previousPairing = await this.pairingDoc.refresh()
+          if (previousPairing.generation !== generation) {
+            // refresh() already adopted the newer document, so syncState cannot
+            // detect this key change later by comparing its cached document.
+            this.hostKey = previousPairing.paired ? await this.keyStore.load() : null
+            this.previousKey = previousPairing.paired ? await this.keyStore.load('previous') : null
+            this.pendingRotation = null
+            throw new Error('pairing superseded')
+          }
+          const previousHubUrl = this.settingsDoc.value.hubUrl
+          const storedKey = await this.keyStore.load()
+          const storedPreviousKey = await this.keyStore.load('previous')
+          let keysChanged = false
+          let pairingChanged = false
+          let hubUrlChanged = false
+          // Called only under the mutation lock. A stop/new attempt in another
+          // process owns a different generation and must never be rolled back.
+          restore = async () => {
+            const current = await this.pairingDoc.refresh()
+            if (current.generation === generation) {
+              if (keysChanged) {
+                if (storedKey) await this.keyStore.save(storedKey)
+                else await this.keyStore.delete('current')
+                if (storedPreviousKey) await this.keyStore.save(storedPreviousKey, 'previous')
+                else await this.keyStore.delete('previous')
+              }
+              if (pairingChanged) await this.pairingDoc.update(latest => latest.paired?.publicKey === key.publicKey ? previousPairing : latest)
+              if (hubUrlChanged) await this.settingsDoc.update(latest => latest.hubUrl === approved.hubOrigin ? { ...latest, hubUrl: previousHubUrl } : latest)
+            }
+            // Reload the actual slots rather than restoring another process's
+            // potentially stale in-memory key snapshot.
+            this.hostKey = this.pairingDoc.value.paired ? await this.keyStore.load() : null
+            this.previousKey = this.pairingDoc.value.paired ? await this.keyStore.load('previous') : null
+            restored = true
+          }
+          try {
+            check()
+            keysChanged = true
+            await this.keyStore.save(key)
+            check()
+            await this.keyStore.delete('previous')
+            check()
+            pairingChanged = true
+            await this.pairingDoc.update(current => {
+              check()
+              if (current.generation !== generation) throw new Error('pairing superseded')
+              return {
+                generation,
+                paired: { ...approved, publicKey: key.publicKey, pairedAt: this.clock.now() },
+                pendingCredentials: null,
+                revoked: false,
+              }
+            })
+            check()
+            hubUrlChanged = true
+            await this.settingsDoc.update(current => {
+              check()
+              return { ...current, hubUrl: approved.hubOrigin }
+            })
+            check()
+            this.hostKey = key
+            this.previousKey = null
+            this.pendingRotation = null
+          } catch (error) {
+            await restore()
+            throw error
+          }
+        })
+        check()
+        await this.startLink()
+        check()
+        if (this.pairingDoc.value.generation !== generation || this.pairingDoc.value.paired?.publicKey !== key.publicKey) throw new Error('pairing superseded')
+        this.lastUnpair = null
+        this.audit({ kind: 'settings', action: 'paired', outcome: 'ok', local: true })
+      } catch (error) {
+        this.link.stop('idle')
+        if (restore && !restored) await withFileLock(this.dataDir, 'pairing-mutation.lock', restore)
+        // A cancelled re-pair must leave the established pairing usable.
+        // Unpair/dispose use idle and are about to remove or stop that pairing.
+        if (!this.disposed && this.pairing.view.phase !== 'idle') await this.startLink()
+        else { await this.lock.release(); this.lockState = 'none' }
+        throw error
+      }
+    })
   }
 
   async startPairing(hubUrl: string, local: boolean): Promise<PairingView> {
     this.requireLocal(local, ['pairing'])
+    if (this.disposed) throw new RpcError('unavailable')
     if (this.nativeCacheStale) throw new RpcError('restart-required')
+    const attempt = ++this.pairingAttempt
+    this.pairing.cancel('cancelled')
+    await this.updateState(() => withFileLock(this.dataDir, 'pairing-mutation.lock', async () => {
+      if (this.disposed || attempt !== this.pairingAttempt) return
+      const generation = randomUUID()
+      await this.pairingDoc.update(current => ({ ...current, generation }))
+      this.pairingGeneration = generation
+    }))
+    if (this.disposed || attempt !== this.pairingAttempt) return this.pairing.view
     const name = this.settingsDoc.value.hostName
     const view = await this.pairing.start(hubUrl, name, PLUGIN_VERSION)
-    if (view.hubOrigin) await this.settingsDoc.update(current => ({ ...current, hubUrl: view.hubOrigin ?? current.hubUrl }))
-    return view
+    await this.updateState(async () => {
+      if (this.disposed || attempt !== this.pairingAttempt || view !== this.pairing.view || !view.hubOrigin) return
+      await this.settingsDoc.update(current => this.disposed || attempt !== this.pairingAttempt
+        ? current : { ...current, hubUrl: view.hubOrigin ?? current.hubUrl })
+    })
+    return this.pairing.view
   }
 
-  cancelPairing(): void {
+  async cancelPairing(): Promise<void> {
+    this.pairingAttempt++
     this.pairing.cancel('cancelled')
+    await this.stateUpdates
   }
 
   /** Forget the pairing and the key. The host should also be removed on the hub. */
   async unpair(local: boolean): Promise<void> {
+    this.pairingAttempt++
     this.pairing.reset()
-    this.lastUnpair = { at: this.clock.now(), hub: await this.unpairAtHub() }
-    // Publish the stop before waiting for the process that owns native DSH data.
-    await this.pairingDoc.reset()
-    await this.stopLink('idle', null, 'unpaired')
-    await this.waitForOwnerStop()
-    await this.cleanStoppedSchedules('unpaired')
-    await this.keyStore.delete()
-    this.hostKey = null
-    this.previousKey = null
-    this.pendingRotation = null
-    this.adapterStarted = false
-    this.audit({ kind: 'settings', action: 'unpaired', outcome: this.lastUnpair.hub === 'removed' ? 'ok' : 'error', reason: `hub:${this.lastUnpair.hub}`, local })
+    await this.updateState(async () => {
+      const generation = randomUUID()
+      await withFileLock(this.dataDir, 'pairing-mutation.lock', async () => {
+        const latest = await this.pairingDoc.refresh()
+        this.lastUnpair = { at: this.clock.now(), hub: await this.unpairAtHub(latest.paired, await this.keyStore.load()) }
+        // Keep a durable generation even when already unpaired. It invalidates
+        // approvals that began before this stop but have not committed yet.
+        await this.pairingDoc.update(() => ({ ...pairingSpec.initial(), generation }))
+      })
+      await this.stopLink('idle', null, 'unpaired')
+      await this.waitForOwnerStop()
+      await this.cleanStoppedSchedules('unpaired')
+      await withFileLock(this.dataDir, 'pairing-mutation.lock', async () => {
+        // A newly authorized attempt in another process may already be using
+        // these slots; do not erase its key after finishing native cleanup.
+        if ((await this.pairingDoc.refresh()).generation !== generation) return
+        await this.keyStore.delete()
+        this.hostKey = null
+        this.previousKey = null
+        this.pendingRotation = null
+      })
+      this.adapterStarted = false
+      this.audit({ kind: 'settings', action: 'unpaired', outcome: this.lastUnpair!.hub === 'removed' ? 'ok' : 'error', reason: `hub:${this.lastUnpair!.hub}`, local })
+    })
   }
 
   /**
@@ -632,9 +758,7 @@ export class RemoraCore {
    * host key). Local state is cleared whatever the answer; a failure only
    * means the user must also remove the host on the hub.
    */
-  private async unpairAtHub(): Promise<'removed' | 'refused' | 'unreachable' | 'not-paired'> {
-    const paired = this.pairingDoc.value.paired
-    const key = this.hostKey
+  private async unpairAtHub(paired = this.pairingDoc.value.paired, key = this.hostKey): Promise<'removed' | 'refused' | 'unreachable' | 'not-paired'> {
     if (!paired || !key) return 'not-paired'
     const issuedAt = this.clock.now()
     const body: UnpairRequest = { hostId: paired.hostId, issuedAt, signature: key.sign(unpairMessage(paired.hubOrigin, paired.hostId, issuedAt)) }
@@ -968,10 +1092,17 @@ export class RemoraCore {
   }
 
   async checkUpdate(force: boolean): Promise<UpdateCheck> {
+    if (this.disposed) throw new RpcError('unloading')
     const now = this.clock.now()
+    if (this.updateChecking) return this.updateChecking
     if (!force && this.updateCheck && now - this.updateCheck.checkedAt < 60 * 60_000) return this.updateCheck
-    this.updateCheck = await checkForUpdate(PLUGIN_VERSION, this.httpFetch(), now)
-    return this.updateCheck
+    const pending = checkForUpdate(PLUGIN_VERSION, this.httpFetch(), now).then(check => {
+      if (this.disposed) throw new RpcError('unloading')
+      this.updateCheck = check
+      return check
+    })
+    this.updateChecking = pending
+    try { return await pending } finally { this.updateChecking = null }
   }
 
   /** The fetch used for GitHub requests (tests inject one). */
@@ -979,22 +1110,56 @@ export class RemoraCore {
     return this.options.githubFetch ?? ((input, init) => fetch(input, init))
   }
 
-  private pluginManager(): { installBundle(spec: string): Promise<unknown> } | null {
-    const manager = this.ctx.get('pluginManager') as { installBundle?: unknown } | undefined
-    return manager && typeof manager.installBundle === 'function' ? manager as { installBundle(spec: string): Promise<unknown> } : null
+  private pluginManager(): UpdatePluginManager | null {
+    const manager = this.ctx.get('pluginManager') as Partial<UpdatePluginManager> | undefined
+    return manager && typeof manager.installBundle === 'function' && typeof manager.listBundles === 'function' ? manager as UpdatePluginManager : null
   }
 
-  async installUpdate(local: boolean): Promise<{ path: string }> {
+  async installUpdate(local: boolean, expectedVersion: unknown): Promise<UpdateInstallation> {
     this.requireLocal(local, ['plugin-update'])
+    if (this.disposed) throw new RpcError('unloading')
     const check = this.updateCheck
     if (!check?.latest || !check.newer) throw new RpcError('no-update')
+    if (expectedVersion !== check.latest.version) throw new RpcError('update-candidate-changed')
+    if (this.updateInstalling) {
+      if (this.updateInstallation?.version !== expectedVersion) throw new RpcError('update-in-progress')
+      return this.updateInstalling
+    }
+    if (this.updateInstallation?.version === check.latest.version && ['applied', 'restart-required'].includes(this.updateInstallation.phase)) {
+      return this.updateInstallation
+    }
     const manager = this.pluginManager()
     if (!manager) throw new RpcError('install-unavailable')
-    const path = await downloadVerified(check.latest, this.dataDir, this.httpFetch())
-    this.audit({ kind: 'settings', action: `update:${check.latest.version}`, outcome: 'ok', local })
-    // DSH reloads the plugin after installing; this instance is disposed during or after the call.
-    void manager.installBundle(path).catch(error => this.ctx.logger.warn('Remora: plugin update failed', error))
-    return { path }
+    const release = check.latest
+    this.updateInstallation = { attempt: (this.updateInstallation?.attempt ?? 0) + 1, version: release.version, phase: 'downloading' }
+    const pending = (async (): Promise<UpdateInstallation> => {
+      try {
+        const path = await downloadVerified(release, this.dataDir, this.httpFetch())
+        if (this.disposed) throw new RpcError('unloading')
+        // Read the current selection immediately before installation, not at check time.
+        const bundle = (await manager.listBundles()).find(item => item.name === 'dsh-remora')
+        if (this.disposed) throw new RpcError('unloading')
+        if (!bundle || typeof bundle.enabled !== 'boolean') throw new UpdateError('unknown-bundle', 'cannot read the current bundle selection')
+        this.updateInstallation = { ...this.updateInstallation!, phase: 'installing' }
+        const result = await manager.installBundle(path, { enabled: bundle.enabled })
+        this.updateInstallation = installationResult(result, this.updateInstallation)
+      } catch (error) {
+        this.updateInstallation = {
+          ...this.updateInstallation!, phase: 'failed',
+          error: error instanceof UpdateError || error instanceof RpcError ? error.code : 'install-failed',
+        }
+        this.ctx.logger.warn('Remora: plugin update failed', error)
+      }
+      const result = this.updateInstallation!
+      await this.audit({
+        kind: 'settings', action: `update:${release.version}`,
+        outcome: result.phase === 'applied' || result.phase === 'restart-required' ? 'ok' : 'error',
+        reason: [result.phase, result.stage, result.error].filter(Boolean).join(':'), local,
+      })
+      return result
+    })()
+    this.updateInstalling = pending
+    try { return await pending } finally { this.updateInstalling = null }
   }
 
   snapshot(local: boolean): RemoraSnapshot {
@@ -1051,6 +1216,8 @@ export class RemoraCore {
       proxy,
       auditIntact: this.auditLog.intact,
       update: this.updateCheck,
+      updateHostInstance: this.updateHostInstance,
+      updateInstallation: this.updateInstallation,
       canInstallUpdate: this.pluginManager() !== null,
       questionModes: readQuestionModes(service => this.ctx.get(service)),
     }

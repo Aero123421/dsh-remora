@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { FORBIDDEN_COMMANDS } from '@dsh-remora/protocol'
 import { Button, Input, SegmentedControl, Switch, Tag } from 'remora-official-primitives'
 import type { CopyKey } from '../locales.ts'
@@ -12,18 +12,27 @@ function Head({ title, hint }: { title: string; hint?: string }) {
   return <div className="rmr-section-head" style={{ paddingTop: 16 }}><h3>{title}</h3>{hint ? <span className="rmr-muted">{hint}</span> : null}</div>
 }
 
-function AddRow({ placeholder, label, busy, onAdd, normalize = value => value.trim() }: { placeholder: string; label: string; busy: boolean; onAdd: (value: string) => void; normalize?: (value: string) => string }) {
+function AddRow({ placeholder, label, busy, onAdd, normalize = value => value.trim() }: { placeholder: string; label: string; busy: boolean; onAdd: (value: string) => Promise<boolean>; normalize?: (value: string) => string }) {
   const [value, setValue] = useState('')
-  const submit = () => { const v = normalize(value); if (v !== '') { onAdd(v); setValue('') } }
+  const [submitting, setSubmitting] = useState(false)
+  const pending = useRef(false)
+  const submit = async () => {
+    const v = normalize(value)
+    if (busy || pending.current || v === '') return
+    pending.current = true
+    setSubmitting(true)
+    try { if (await onAdd(v)) setValue('') }
+    finally { pending.current = false; setSubmitting(false) }
+  }
   return <div className="rmr-inline">
-    <Input className="rmr-grow" value={value} placeholder={placeholder} aria-label={placeholder} onChange={event => setValue(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') submit() }} />
-    <Button variant="outline" size="sm" disabled={busy || normalize(value) === ''} onClick={submit}>{label}</Button>
+    <Input className="rmr-grow" value={value} placeholder={placeholder} aria-label={placeholder} disabled={busy || submitting} onChange={event => setValue(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); void submit() } }} />
+    <Button variant="outline" size="sm" disabled={busy || submitting || normalize(value) === ''} onClick={() => { void submit() }}>{label}</Button>
   </div>
 }
 
 /** Catalog entries with a switch each, plus configured names DSH did not list. */
 function AllowList({ items, allowed, busy, t, onChange, manualPlaceholder, normalize }: {
-  items: CatalogItem[]; allowed: string[]; busy: boolean; t: SectionProps['t']; onChange: (next: string[]) => void; manualPlaceholder: string; normalize?: (value: string) => string
+  items: CatalogItem[]; allowed: string[]; busy: boolean; t: SectionProps['t']; onChange: (next: string[]) => Promise<boolean>; manualPlaceholder: string; normalize?: (value: string) => string
 }) {
   const known = new Set(items.map(item => item.id))
   const extra = allowed.filter(id => !known.has(id))
@@ -51,9 +60,18 @@ export function ScopeSection({ snapshot, t, run, busy, ctx }: SectionProps & { c
   const [exceptionId, setExceptionId] = useState('')
   const [alias, setAlias] = useState('')
   const [aliasTarget, setAliasTarget] = useState('')
-  useEffect(() => { call<Catalog>(ctx, 'catalog').then(setCatalog, () => setCatalog({ workspaces: [], agentPresets: [], skills: [], commands: [], unavailable: ['workspaces', 'agentPresets', 'skills', 'commands'] })) }, [ctx])
+  const rpc = ctx.connection.rpc
+  useEffect(() => {
+    const controller = new AbortController()
+    setCatalog(null)
+    call<Catalog>(ctx, 'catalog', {}, controller.signal).then(
+      value => { if (!controller.signal.aborted) setCatalog(value) },
+      () => { if (!controller.signal.aborted) setCatalog({ workspaces: [], agentPresets: [], skills: [], commands: [], unavailable: ['workspaces', 'agentPresets', 'skills', 'commands'] }) },
+    )
+    return () => controller.abort()
+  }, [ctx, rpc])
   const save = (patch: Partial<ScopeSettings>) => run('settings', { scope: patch })
-  const setList = (key: ListKey, next: string[]) => { void save({ [key]: next }) }
+  const setList = (key: ListKey, next: string[]) => save({ [key]: next })
   const unavailable = (name: string) => catalog?.unavailable.includes(name) ? <p className="rmr-faint">{t('scope.catalogUnavailable', { name })}</p> : null
 
   return <div className="rmr-section">
@@ -76,7 +94,7 @@ export function ScopeSection({ snapshot, t, run, busy, ctx }: SectionProps & { c
         </div>
         <Button variant="ghost" size="sm" disabled={busy} onClick={() => { void run('placement-remove', { placementId: placement.placementId }) }}>{t('remove')}</Button>
       </div>)}
-      <div style={{ paddingTop: 8 }}><AddRow placeholder={t('scope.placementPath')} label={t('add')} busy={busy} onAdd={path => { void run('placement-add', { path }) }} /></div>
+      <div style={{ paddingTop: 8 }}><AddRow placeholder={t('scope.placementPath')} label={t('add')} busy={busy} onAdd={path => run('placement-add', { path })} /></div>
     </div>
 
     <Head title={t('scope.exceptions')} hint={t('scope.exceptionsHint')} />
@@ -87,7 +105,7 @@ export function ScopeSection({ snapshot, t, run, busy, ctx }: SectionProps & { c
       </div>)}
       <div className="rmr-inline" style={{ paddingTop: 8 }}>
         <SegmentedControl id="rmr-exception-mode" value={exceptionMode} label={t('scope.exceptions')} options={[{ value: 'allow', label: t('scope.allow') }, { value: 'deny', label: t('scope.deny') }]} onChange={setExceptionMode} />
-        <Input className="rmr-grow" value={exceptionId} placeholder={t('scope.sessionId')} aria-label={t('scope.sessionId')} onChange={event => setExceptionId(event.target.value)} />
+        <Input className="rmr-grow" value={exceptionId} disabled={busy} placeholder={t('scope.sessionId')} aria-label={t('scope.sessionId')} onChange={event => setExceptionId(event.target.value)} />
         <Button variant="outline" size="sm" disabled={busy || exceptionId.trim() === ''} onClick={() => {
           const sessionId = exceptionId.trim()
           void save({ exceptions: [...scope.exceptions.filter(e => e.sessionId !== sessionId), { sessionId, allow: exceptionMode === 'allow' }] }).then(ok => { if (ok) setExceptionId('') })
@@ -102,8 +120,8 @@ export function ScopeSection({ snapshot, t, run, busy, ctx }: SectionProps & { c
         <Button variant="ghost" size="sm" disabled={busy} onClick={() => { const next = { ...scope.aliases }; delete next[name]; void save({ aliases: next }) }}>{t('remove')}</Button>
       </div>)}
       <div className="rmr-inline" style={{ paddingTop: 8 }}>
-        <Input value={alias} placeholder={t('scope.alias')} aria-label={t('scope.alias')} onChange={event => setAlias(event.target.value)} />
-        <Input className="rmr-grow" value={aliasTarget} placeholder={t('scope.sessionId')} aria-label={t('scope.sessionId')} onChange={event => setAliasTarget(event.target.value)} />
+        <Input value={alias} disabled={busy} placeholder={t('scope.alias')} aria-label={t('scope.alias')} onChange={event => setAlias(event.target.value)} />
+        <Input className="rmr-grow" value={aliasTarget} disabled={busy} placeholder={t('scope.sessionId')} aria-label={t('scope.sessionId')} onChange={event => setAliasTarget(event.target.value)} />
         <Button variant="outline" size="sm" disabled={busy || alias.trim() === '' || aliasTarget.trim() === ''} onClick={() => {
           void save({ aliases: { ...scope.aliases, [alias.trim()]: aliasTarget.trim() } }).then(ok => { if (ok) { setAlias(''); setAliasTarget('') } })
         }}>{t('add')}</Button>

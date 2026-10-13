@@ -51,6 +51,10 @@ export function createTerminal(rt: Runtime) {
       let stderr = { text: '', lossy: false }
       try {
         const argv = await shellArgv(subprocess, params.command, signal)
+        rt.assertWorkspace(workspace, context)
+        if (timeout.aborted) throw unavailable('the command timed out before it could start')
+        const currentState = rt.workspaceState(workspace.id)
+        if (currentState === 'cloning' || currentState === 'clone-failed') throw new OperationError('conflict', `workspace ${workspace.id} is not ready (${currentState})`)
         const handle = subprocess.spawn({
           argv,
           cwd,
@@ -65,6 +69,7 @@ export function createTerminal(rt: Runtime) {
         if (context.signal.aborted) throw error
         throw fromDsh(error, 'the command could not be run')
       }
+      rt.assertWorkspace(workspace, context)
       // A stream longer than the buffer keeps its tail, which may start inside a secret.
       const out = redactTruncate(stdout.lossy ? dropPartialHead(stdout.text) : stdout.text, OUTPUT_MAX_BYTES)
       const errText = redactTruncate(stderr.lossy ? dropPartialHead(stderr.text) : stderr.text, OUTPUT_MAX_BYTES)

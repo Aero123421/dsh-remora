@@ -66,6 +66,8 @@ export interface ExecuteCall {
 
 export type ExecuteResult = { ok: true; result: unknown } | { ok: false; error: RemoraError }
 type TaskQueryResult = { ok: true; result: TaskInfo } | { ok: false; error: RemoraError }
+/** Explicit false means never sent; absent on older records means unknown. */
+type ParkedCall = ExecuteCall & { deliveryStarted?: boolean }
 
 export interface HostLive {
   hostId: string
@@ -554,7 +556,12 @@ export class HostDO extends DurableObject<Env> {
   }
 
   /** Record the host's answer to a task delivery. Returns false when the task was forgotten. */
-  private applyDelivery(row: TaskRow, frame: ResponseFrame): boolean {
+  private applyDelivery(previous: TaskRow, frame: ResponseFrame): boolean {
+    const row = this.taskRow(previous.task_id)
+    if (!row) return false
+    // An event or a local cancellation may have settled it before the start
+    // response arrived. Neither a stale acceptance nor error may reopen it.
+    if (TERMINAL_TASK_STATES.has(row.state as TaskState)) return true
     const now = Date.now()
     if (frame.ok) {
       const info = (frame.result ?? {}) as Partial<TaskInfo>
@@ -582,7 +589,16 @@ export class HostDO extends DurableObject<Env> {
 
   // --- relaying -------------------------------------------------------------------------------
 
-  private sendRequest(ws: WebSocket, id: string, call: ExecuteCall, timeoutMs: number, taskId?: string, idempotencyKey?: string): void {
+  private sendRequest(ws: WebSocket, id: string, call: ExecuteCall, timeoutMs: number, taskId?: string, idempotencyKey?: string): boolean {
+    if (taskId && TASK_CREATING.has(call.op)) {
+      // Revalidation awaited another object. Cancellation or a task event can
+      // settle the row before its caller resumes; claim delivery synchronously
+      // with this final durable-state check so cancellation cannot slip between.
+      const row = this.taskRow(taskId)
+      const parked = parseJson<ParkedCall | null>(row?.frame, null)
+      if (!row || row.state !== 'parked' || row.delivered !== 0 || row.params === null || !parked) return false
+      this.sql.exec('UPDATE tasks SET frame = ? WHERE task_id = ?', JSON.stringify({ ...parked, deliveryStarted: true }), taskId)
+    }
     send(ws, {
       t: 'request',
       id,
@@ -596,6 +612,7 @@ export class HostDO extends DurableObject<Env> {
       ...(call.confirmation ? { confirmation: call.confirmation } : {}),
       deadline: Date.now() + timeoutMs,
     })
+    return true
   }
 
   /** Send a request and wait for its response. Null on timeout. */
@@ -609,7 +626,16 @@ export class HostDO extends DurableObject<Env> {
         clearTimeout(timer)
         resolve(frame)
       })
-      this.sendRequest(ws, id, call, timeoutMs, taskId, idempotencyKey)
+      if (!this.sendRequest(ws, id, call, timeoutMs, taskId, idempotencyKey)) {
+        clearTimeout(timer)
+        this.pending.delete(id)
+        const row = taskId ? this.taskRow(taskId) : undefined
+        // A local settlement wins over the queued relay. Resolve its original
+        // caller immediately rather than leaving it waiting for an unsent frame.
+        resolve(row && row.state !== 'parked'
+          ? { t: 'response', id, ok: true, result: this.taskFromRow(row) }
+          : { t: 'response', id, ok: false, error: row ? err('unavailable', 'The queued task no longer has a deliverable request.') : err('gone', 'The task was removed before delivery.') })
+      }
     })
   }
 
@@ -623,8 +649,11 @@ export class HostDO extends DurableObject<Env> {
       setTimeout(() => this.inFlight.delete(row.delivery_id), RELAY_TIMEOUT_MS)
       // The grant may have changed while the task was parked: use the current one.
       const call = await this.revalidate(row)
-      if (!call || this.pending.has(row.delivery_id)) continue
-      this.sendRequest(ws, row.delivery_id, { ...call, params: parseJson(row.params, {}) }, RELAY_TIMEOUT_MS, row.task_id, row.idempotency_key)
+      if (!call || this.pending.has(row.delivery_id)) {
+        this.inFlight.delete(row.delivery_id)
+        continue
+      }
+      if (!this.sendRequest(ws, row.delivery_id, { ...call, params: parseJson(row.params, {}) }, RELAY_TIMEOUT_MS, row.task_id, row.idempotency_key)) this.inFlight.delete(row.delivery_id)
     }
   }
 
@@ -653,13 +682,17 @@ export class HostDO extends DurableObject<Env> {
     }
     const current = this.taskRow(row.task_id)
     if (!current || current.state !== 'parked' || current.delivered !== 0) return null
+    const latest = parseJson<ParkedCall | null>(current.frame, null)
+    if (!latest) return null
     if (refusal) {
       this.sql.exec("UPDATE tasks SET state = 'failed', params = NULL, frame = NULL, expires_at = NULL, updated_at = ?, error = ? WHERE task_id = ?", Date.now(), JSON.stringify(refusal), row.task_id)
       this.notify(row.task_id)
       await this.audit(stored.actor, `${row.op}.deliver`, 'denied', { layer: refusal.denial?.layer, reason: refusal.denial?.reason ?? null })
       return null
     }
-    const fresh: ExecuteCall = { ...stored, grant: grant as Grant }
+    // In particular, preserve deliveryStarted if another delivery ran while
+    // clientStanding was pending. A sent task must never look unsent again.
+    const fresh: ParkedCall = { ...latest, grant: grant as Grant }
     this.sql.exec('UPDATE tasks SET frame = ? WHERE task_id = ?', JSON.stringify(fresh), row.task_id)
     return fresh
   }
@@ -670,6 +703,17 @@ export class HostDO extends DurableObject<Env> {
     const rows = this.sql.exec<TaskRow>("SELECT * FROM tasks WHERE client_id = ? AND delivered = 0 AND state = 'parked'", clientId).toArray()
     let failed = 0
     for (const row of rows) if (!(await this.revalidate(row))) failed++
+    const standing = clientId === OWNER_CLIENT_ID ? null : await this.hub().clientStanding(clientId, this.hostId ?? '')
+    if (standing) {
+      const confirmations = this.sql.exec<ConfirmationRow>("SELECT * FROM confirmations WHERE client_id = ? AND state = 'pending'", clientId).toArray()
+      for (const row of confirmations) {
+        const decision = standing.grant && !standing.revoked ? decide({ operation: row.op, ceiling: this.ceiling() ?? { level: 'view' }, hubGrant: standing.grant, tokenScopes: parseJson<string[]>(row.scopes, []), now: Date.now() }) : null
+        if (decision?.allowed) continue
+        const error = decision && !decision.allowed ? denied(decision.layer, decision.reason, row.op) : denied('hub', 'switched-off', row.op)
+        this.sql.exec("UPDATE confirmations SET state = 'denied', params = '{}', error = ?, updated_at = ? WHERE id = ?", JSON.stringify(error), Date.now(), row.id)
+        this.notify(`c:${row.id}`)
+      }
+    }
     return failed
   }
 
@@ -688,6 +732,13 @@ export class HostDO extends DurableObject<Env> {
       layer: denial?.layer,
       reason: result.ok ? null : denial?.reason ?? result.error.code,
     })
+    if (!result.ok) return result
+    // The host may lower its ceiling, stop access or unpair while a relay or
+    // ledger wait is outstanding. Check again after the final audit await.
+    if (this.info('revoked') === '1') return { ok: false, error: err('gone', 'This host is no longer paired with the hub.') }
+    const current = decide({ operation: call.op, ceiling: this.ceiling() ?? { level: 'view' }, hubGrant: call.grant, tokenScopes: call.scopes, now: Date.now() })
+    if (!current.allowed) return { ok: false, error: denied(current.layer, current.reason, call.op) }
+    if (call.op !== 'confirmation.get' && this.info('kill_switch') === '1') return { ok: false, error: denied('dsh', 'kill-switch', call.op) }
     return result
   }
 
@@ -707,6 +758,16 @@ export class HostDO extends DurableObject<Env> {
       if (!owned || owned.client_id !== call.actor.clientId) return { ok: false, error: err('not_found', 'No task with this id is known to the hub for this client.') }
     }
     if (call.op === 'task.get' || call.op === 'task.wait') return this.taskQuery(call)
+    if (call.op === 'task.cancel') {
+      const row = this.taskRow(String(call.params.taskId ?? ''))
+      if (row && TERMINAL_TASK_STATES.has(row.state as TaskState)) return { ok: true, result: { cancelled: false, how: 'already-finished' } }
+      const parked = parseJson<ParkedCall | null>(row?.frame, null)
+      if (row?.state === 'parked' && row.delivered === 0 && parked?.deliveryStarted === false) {
+        this.sql.exec("UPDATE tasks SET state = 'cancelled', params = NULL, frame = NULL, expires_at = NULL, updated_at = ? WHERE task_id = ?", Date.now(), row.task_id)
+        this.notify(row.task_id)
+        return { ok: true, result: { cancelled: true, how: 'removed-from-queue' } }
+      }
+    }
     if (call.op === 'attention.respond') {
       const sessionId = String(call.params.sessionId ?? '')
       const attentionId = String(call.params.attentionId ?? '')
@@ -1020,7 +1081,7 @@ export class HostDO extends DurableObject<Env> {
     const now = Date.now()
     const taskId = newTaskId(hostId)
     const deliveryId = call.requestId ?? `d_${randomToken(12)}`
-    const stored: ExecuteCall = { op: call.op, params: {}, actor: call.actor, scopes: call.scopes, grant: call.grant }
+    const stored: ParkedCall = { op: call.op, params: {}, actor: call.actor, scopes: call.scopes, grant: call.grant, deliveryStarted: false }
     this.sql.exec(
       "INSERT INTO tasks (task_id, client_id, idempotency_key, op, state, params, frame, delivered, delivery_id, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, 'parked', ?, ?, 0, ?, ?, ?, ?)",
       taskId, call.actor.clientId, idempotencyKey, call.op, JSON.stringify(call.params), JSON.stringify(stored), deliveryId, now, now, ws ? null : now + PARKED_TASK_TTL_MS,

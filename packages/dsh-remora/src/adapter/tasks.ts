@@ -74,16 +74,24 @@ export class Tasks {
     return record
   }
 
-  private async checkScope(record: TaskRecord, signal: AbortSignal): Promise<boolean> {
+  private async checkScope(record: TaskRecord, context: OperationContext): Promise<boolean> {
     if (record.sessionId === null) return true
     try {
-      await this.rt.row(record.sessionId, signal)
+      const row = await this.rt.row(record.sessionId, context.signal)
+      this.rt.assertSession(row, context)
       return true
     } catch (error) {
       if (!(error instanceof OperationError) || error.code !== 'gone') throw error
       if (!TERMINAL_TASK_STATES.has(record.state)) await this.save(record, 'failed', { code: 'gone', message: error.message })
       return false
     }
+  }
+
+  private async checkRequestScope(record: TaskRecord, context: OperationContext): Promise<boolean> {
+    this.rt.assertAuthorized(context)
+    const reachable = await this.checkScope(record, context)
+    this.rt.assertAuthorized(context)
+    return reachable
   }
 
   /** A disappeared session settles its active tasks without inspecting any log. */
@@ -212,7 +220,7 @@ export class Tasks {
   }
 
   async info(record: TaskRecord, context: OperationContext, evaluation?: Evaluation): Promise<TaskInfo> {
-    if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
+    if (!await this.checkRequestScope(record, context)) return this.missingInfo(record)
     const info = this.summary(record)
     if (record.sessionId === null) return info
     info.hasLiveClient = this.rt.hasLiveClient(record.sessionId)
@@ -242,7 +250,7 @@ export class Tasks {
       }
     }
     // A long wait or content read must not return data after its session left scope.
-    if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
+    if (!await this.checkRequestScope(record, context)) return this.missingInfo(record)
     return info
   }
 
@@ -337,6 +345,16 @@ export class Tasks {
 
   private async deliver(record: TaskRecord, text: string, mode: 'queue' | 'steer', context: OperationContext): Promise<TaskRecord> {
     const sessionId = record.sessionId!
+    const row = await this.rt.row(sessionId, context.signal)
+    this.rt.assertSession(row, context, true)
+    this.ensurePromptable(row)
+    const gestures = skillGestures(text)
+    const known = gestures.length ? await this.knownSkills(sessionId, row.workspacePath, context.signal) : null
+    this.rt.assertSession(row, context, true)
+    for (const name of gestures) {
+      if (known && !known.has(name)) continue
+      if (!this.rt.deps.scope.isAllowedSkill(name, row.workspace?.id ?? null)) throw denied(`skill "/${name}" is not allowed for remote use`)
+    }
     const wasLive = this.rt.liveAgent(sessionId) !== undefined
     this.inflight.add(record.taskId)
     try {
@@ -365,7 +383,7 @@ export class Tasks {
   }
 
   private async finish(record: TaskRecord, context: OperationContext): Promise<TaskInfo> {
-    if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
+    if (!await this.checkRequestScope(record, context)) return this.missingInfo(record)
     const { record: next, evaluation } = await this.refresh(record, context.signal).catch(() => ({ record, evaluation: undefined }))
     return this.info(next, context, evaluation)
   }
@@ -402,6 +420,8 @@ export class Tasks {
 
     if (record.sessionId === null && create) {
       const sessionId = sessionIdFor(record.requestId)
+      this.rt.assertWorkspace(create.workspace, context, true)
+      if (create.agentPreset !== undefined && !this.rt.deps.scope.isAllowedAgentPreset(create.agentPreset)) throw denied(`agent preset "${create.agentPreset}" is not allowed for remote use`)
       try {
         await this.rt.sessions.create({ workspaceId: create.workspace.id, sessionId, ...(create.agentPreset !== undefined ? { agentPreset: create.agentPreset } : {}) })
       } catch (error) {
@@ -414,6 +434,7 @@ export class Tasks {
       record = { ...record, sessionId, updatedAt: Date.now() }
       await this.rt.deps.tasks.put(record)
       if (create.title !== undefined) {
+        this.rt.assertSession(await this.rt.row(sessionId, context.signal), context)
         await this.rt.sessions.rename({ sessionId, title: create.title }).catch((error: unknown) => {
           this.rt.deps.logger.warn('Remora: could not title the new session', error)
         })
@@ -429,7 +450,7 @@ export class Tasks {
 
   async wait(params: Params<'task.wait'>, context: OperationContext): Promise<Result<'task.wait'>> {
     let record = this.own(params.taskId, context, true)
-    if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
+    if (!await this.checkRequestScope(record, context)) return this.missingInfo(record)
     const deadline = Date.now() + Math.min(params.timeoutMs ?? TASK_WAIT_MAX_MS, TASK_WAIT_MAX_MS)
     const settled = (state: TaskState): boolean => TERMINAL_TASK_STATES.has(state) || state === 'needs_attention'
     let evaluation: Evaluation | undefined
@@ -438,7 +459,7 @@ export class Tasks {
     } catch {
       // keep the stored state
     }
-    if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
+    if (!await this.checkRequestScope(record, context)) return this.missingInfo(record)
     while (!settled(record.state) && Date.now() < deadline && !context.signal.aborted) {
       await new Promise<void>((resolveWait) => {
         const set = this.waiters.get(record.taskId) ?? new Set()
@@ -454,7 +475,7 @@ export class Tasks {
         context.signal.addEventListener('abort', done, { once: true })
       })
       record = this.rt.deps.tasks.get(record.taskId) ?? record
-      if (!await this.checkScope(record, context.signal)) return this.missingInfo(record)
+      if (!await this.checkRequestScope(record, context)) return this.missingInfo(record)
       evaluation = undefined
     }
     return this.info(record, context, evaluation)
@@ -512,17 +533,19 @@ export class Tasks {
 
   async cancel(params: Params<'task.cancel'>, context: OperationContext): Promise<Result<'task.cancel'>> {
     let record = this.own(params.taskId, context, true)
-    if (!await this.checkScope(record, context.signal)) return { cancelled: false, how: 'already-finished' }
+    if (!await this.checkRequestScope(record, context)) return { cancelled: false, how: 'already-finished' }
     if (TERMINAL_TASK_STATES.has(record.state)) return { cancelled: false, how: 'already-finished' }
     if (!record.sessionId) {
       await this.save(record, 'cancelled')
       return { cancelled: true, how: 'removed-from-queue' }
     }
     const sessionId = record.sessionId
+    const row = await this.rt.row(sessionId, context.signal)
     const values = await this.rt.projections(sessionId, context.signal)
     const inbox = [...values?.inbox?.['next-turn'] ?? [], ...values?.inbox?.['next-step'] ?? []]
     const queued = inbox.find(item => rpcIdOf(item) === record.requestId) as { id?: unknown } | undefined
     if (queued && typeof queued.id === 'string') {
+      this.rt.assertSession(row, context)
       try {
         await this.rt.sessions.updateQueue({ sessionId, itemId: queued.id, action: { kind: 'remove' } })
         await this.save(record, 'cancelled')
@@ -538,6 +561,7 @@ export class Tasks {
     const turn = findTaskTurn(events, record.requestId)
     const latest = events.findLast(event => event.type === 'turn/start' || event.type === 'turn/end')
     if (turn && !turn.end && latest?.type === 'turn/start' && turn.turns.at(-1) === latest.data?.turn && this.rt.isRunning(sessionId)) {
+      this.rt.assertSession(row, context)
       try {
         await this.rt.sessions.cancel({ sessionId })
       } catch (error) {
