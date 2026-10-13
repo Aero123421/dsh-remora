@@ -1232,7 +1232,7 @@ export class RemoraCore {
         if (fresh.latest?.id !== release.id || fresh.latest.version !== release.version || fresh.latest.tarball?.url !== release.tarball?.url || fresh.latest.sums !== release.sums) {
           throw new UpdateError('candidate-changed', 'release changed since the check')
         }
-        const path = await downloadVerified(release, this.dataDir, this.httpFetch())
+        const path = await downloadVerified(release, this.dataDir, this.httpFetch(), this.dshVersion)
         if (this.disposed) throw new RpcError('unloading')
         // Downloads can take time: preserve the latest selection and reject a newly read-only bundle.
         const before = (await manager.listBundles()).find(item => item.name === 'dsh-remora')

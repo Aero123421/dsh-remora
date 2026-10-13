@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { gzipSync } from 'node:zlib'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { checkForUpdate, compareVersions, downloadVerified, expectedHash, MAX_TARBALL_BYTES, UpdateError, type BundleChangeResult, type UpdateInstallation, type UpdatePluginManager } from '../src/core/updates.ts'
@@ -34,7 +35,15 @@ test('invalid release metadata is reported as an error instead of up to date', a
   assert.equal(duplicated.error, 'invalid-release')
 })
 
-const tarball = new TextEncoder().encode('fake tarball bytes')
+function packageArchive(overrides: Record<string, unknown> = {}): Uint8Array<ArrayBuffer> {
+  const manifest = { name: 'dsh-remora', version: '0.2.0', dsh: { bundle: { patch: './cordis.patch.yml' } }, peerDependencies: { '@deepseek-ai/dsh': '>=0.2.1-alpha.2 <0.2.2-0' }, ...overrides }
+  const content = Buffer.from(JSON.stringify(manifest)), header = Buffer.alloc(512)
+  header.write('package/package.json')
+  header.write(content.length.toString(8).padStart(11, '0'), 124)
+  header[156] = 48
+  return new Uint8Array(gzipSync(Buffer.concat([header, content, Buffer.alloc((512 - content.length % 512) % 512), Buffer.alloc(1024)])))
+}
+const tarball = packageArchive()
 const sha = createHash('sha256').update(tarball).digest('hex')
 
 function github(sums: string) {
@@ -538,4 +547,24 @@ test('two profiles share auth data but never inherit each other\'s unresolved or
     assert.notEqual(receiptB.path, receiptA.path)
     assert.equal(a.dataDir, b.dataDir)
   } finally { await b?.dispose(); await a.dispose(); await shared.cleanup(); await profileA.cleanup(); await profileB.cleanup() }
+})
+
+test('checksum-matching archives with wrong identity/version/bundle/peers never reach manager', async t => {
+  for (const overrides of [{ name: 'other-package' }, { version: '0.1.0' }, { dsh: { bundle: { patch: './other.patch.yml' } } }, { peerDependencies: { '@deepseek-ai/dsh': '>=0.3.0' } }, { peerDependencies: {} }]) await t.test(JSON.stringify(overrides), async () => {
+    const archive = packageArchive(overrides)
+    const digest = createHash('sha256').update(archive).digest('hex')
+    let installs = 0
+    const base = github(`${digest}  dsh-remora-0.2.0.tgz\n`)
+    const h = await updateCore({
+      listBundles: async () => [{ name: 'dsh-remora', version: '0.1.2', installed: true, enabled: false, source: 'https://github.com/Aero123421/dsh-remora/releases/download/v0.1.2/dsh-remora-0.1.2.tgz' }],
+      installBundle: async () => { installs++; return success() },
+    }, async url => url.endsWith('.tgz') ? new Response(archive) : base(url))
+    try {
+      const result = await h.core.installUpdate(true, '0.2.0')
+      assert.equal(result.phase, 'failed')
+      assert.ok(['invalid-manifest', 'incompatible-dsh', 'compatibility-unknown'].includes(result.error!))
+      assert.equal(installs, 0)
+      assert.equal((await h.core.auditEntries()).find(entry => entry.action === 'update:0.2.0')?.outcome, 'error')
+    } finally { await h.cleanup() }
+  })
 })

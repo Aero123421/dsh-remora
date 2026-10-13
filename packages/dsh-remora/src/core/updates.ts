@@ -13,6 +13,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { satisfies, valid, validRange } from 'semver'
 import { lstat, mkdir, mkdtemp } from 'node:fs/promises'
+import { gunzipSync } from 'node:zlib'
 import { writeAtomic, asObject, type DocumentSpec } from './storage.ts'
 
 export const RELEASES_REPO = 'Aero123421/dsh-remora'
@@ -281,8 +282,46 @@ async function fetchAsset(url: string, signal: AbortSignal, fetchImpl: FetchLike
   throw new UpdateError('redirect-refused', 'too many redirects')
 }
 
+/** Inspect the bounded archive in memory; never extract files or execute package code. */
+export function packageManifest(bytes: Uint8Array): unknown {
+  try {
+    const tar = gunzipSync(bytes, { maxOutputLength: 64 * 1024 * 1024 })
+    let manifest: unknown
+    for (let offset = 0; offset + 512 <= tar.length;) {
+      const header = tar.subarray(offset, offset + 512)
+      if (header.every(byte => byte === 0)) break
+      const name = header.subarray(0, 100).toString().replace(/\0.*$/, '')
+      const prefix = header.subarray(345, 500).toString().replace(/\0.*$/, '')
+      const sizeText = header.subarray(124, 136).toString().replace(/\0.*$/, '').trim()
+      if (!/^[0-7]+$/.test(sizeText)) throw new Error('invalid tar size')
+      const size = Number.parseInt(sizeText, 8)
+      if (!Number.isSafeInteger(size) || offset + 512 + size > tar.length) throw new Error('truncated tar')
+      if ((prefix ? `${prefix}/${name}` : name) === 'package/package.json') {
+        if (manifest !== undefined || ![0, 48].includes(header[156]!) || size > 64 * 1024) throw new Error('invalid package manifest entry')
+        manifest = JSON.parse(tar.subarray(offset + 512, offset + 512 + size).toString())
+      }
+      offset += 512 + Math.ceil(size / 512) * 512
+    }
+    if (manifest === undefined) throw new Error('missing package manifest')
+    return manifest
+  } catch { throw new UpdateError('invalid-archive', 'invalid plugin archive') }
+}
+
+function validateArchive(bytes: Uint8Array, version: string, runtimeVersion?: string | null): void {
+  const raw = packageManifest(bytes)
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new UpdateError('invalid-manifest', 'invalid archive manifest')
+  const manifest = asObject(raw, 'archive manifest')
+  const dsh = manifest.dsh && typeof manifest.dsh === 'object' ? asObject(manifest.dsh, 'archive dsh') : {}
+  const bundle = dsh.bundle && typeof dsh.bundle === 'object' ? asObject(dsh.bundle, 'archive bundle') : {}
+  if (manifest.name !== 'dsh-remora' || manifest.version !== version || bundle.patch !== './cordis.patch.yml') throw new UpdateError('invalid-manifest', 'archive package, version or bundle mismatch')
+  const peers = manifest.peerDependencies && typeof manifest.peerDependencies === 'object' ? asObject(manifest.peerDependencies, 'archive peers') : {}
+  const range = peers['@deepseek-ai/dsh']
+  if (typeof range !== 'string' || !validRange(range) || runtimeVersion === null) throw new UpdateError('compatibility-unknown', 'archive compatibility is unknown')
+  if (runtimeVersion !== undefined && (!valid(runtimeVersion) || !satisfies(runtimeVersion, range, { includePrerelease: true }))) throw new UpdateError('incompatible-dsh', 'archive does not support this DSH version')
+}
+
 /** Download the release tarball, verify it against SHA256SUMS, and store it. Returns the absolute path. */
-export async function downloadVerified(release: ReleaseInfo, dataDir: string, fetchImpl: FetchLike = fetch): Promise<string> {
+export async function downloadVerified(release: ReleaseInfo, dataDir: string, fetchImpl: FetchLike = fetch, runtimeVersion?: string | null): Promise<string> {
   if (!release.tarball || !release.sums) throw new UpdateError('no-assets', 'the release has no tarball or SHA256SUMS')
   if (!parseVersion(release.version) || release.tarball.name !== `dsh-remora-${release.version}.tgz`) throw new UpdateError('bad-name', 'unexpected tarball name')
   const tag = new URL(release.url).pathname.split('/').at(-1)!
@@ -298,6 +337,7 @@ export async function downloadVerified(release: ReleaseInfo, dataDir: string, fe
   const bytes = await readLimited(tarResponse, MAX_TARBALL_BYTES)
   const actual = createHash('sha256').update(bytes).digest('hex')
   if (actual !== expected) throw new UpdateError('checksum-mismatch', 'the tarball does not match SHA256SUMS')
+  validateArchive(bytes, release.version, runtimeVersion)
   if (!/^dsh-remora-[0-9A-Za-z.+-]+\.tgz$/.test(release.tarball.name)) throw new UpdateError('bad-name', 'unexpected tarball name')
   const updatesDir = join(dataDir, 'updates')
   await mkdir(updatesDir, { recursive: true, mode: 0o700 })
