@@ -153,9 +153,10 @@ export function CompatSection({ snapshot, t, ctx, busy }: Pick<SectionProps, 'sn
       <div className="rmr-title-row"><h3>{t('compat.update')}</h3><Button variant="outline" size="sm" disabled={checking || busy || installing} onClick={() => runCheck(true)}>{t('compat.check')}</Button></div>
     </div>
     {check?.installUnavailable ? <p className="rmr-muted">{t('compat.unavailable', { code: check.installUnavailable })}</p> : null}
+    {check?.restartRequired ? <p className="rmr-muted">{t('compat.installedPending', { version: check.installedVersion ?? '?', current: snapshot.version })}</p> : null}
     {check?.error ? <p className="rmr-error">{t('compat.checkFailed', { code: check.error })}</p> : null}
     {check && !check.error && !latest ? <p className="rmr-muted">{t('compat.noRelease')}</p> : null}
-    {check && latest && !check.newer ? <p className="rmr-muted">{t('compat.upToDate')}</p> : null}
+    {check && latest && !check.newer && !check.restartRequired ? <p className="rmr-muted">{t('compat.upToDate')}</p> : null}
     {check && latest && check.newer ? <div className="rmr-stack">
       <p>{t('compat.newer', { version: latest.version })}</p>
       {latest.notes ? <><span className="rmr-faint">{t('compat.notes')}</span><div className="rmr-notes">{latest.notes}</div></> : null}

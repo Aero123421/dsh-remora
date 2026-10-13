@@ -568,3 +568,80 @@ test('checksum-matching archives with wrong identity/version/bundle/peers never 
     } finally { await h.cleanup() }
   })
 })
+
+test('a newer candidate and a second Client cannot overwrite an unresolved operation', async () => {
+  let newer = false
+  let installs = 0
+  const base = github(`${sha}  dsh-remora-0.2.0.tgz\n`)
+  const archive = packageArchive({ version: '0.2.1' })
+  const digest = createHash('sha256').update(archive).digest('hex')
+  const h = await updateCore({
+    listBundles: async () => [{ name: 'dsh-remora', version: '0.1.2', installed: true, enabled: true, source: 'https://github.com/Aero123421/dsh-remora/releases/download/v0.1.2/dsh-remora-0.1.2.tgz' }],
+    installBundle: async () => { installs++; throw new Error('lost result after manager admission') },
+    waitForInstall: async () => null,
+  }, async url => {
+    if (!newer) return base(url)
+    if (url.endsWith('/releases/latest') || url.startsWith('https://raw.')) {
+      const metadata = JSON.parse(JSON.stringify(await (await base(url)).json()).replaceAll('0.2.0', '0.2.1'))
+      if (url.endsWith('/releases/latest')) metadata.id = 124
+      return Response.json(metadata)
+    }
+    return new Response(url.endsWith('.tgz') ? archive : `${digest}  dsh-remora-0.2.1.tgz\n`)
+  })
+  try {
+    const original = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(original.phase, 'unknown')
+    newer = true
+    assert.equal((await h.core.checkUpdate(true)).latest?.version, '0.2.1')
+    const [newClient, oldClient] = await Promise.all([
+      rpc<UpdateInstallation>(h.host.routes, 'update-install', { version: '0.2.1' }),
+      rpc<UpdateInstallation>(h.host.routes, 'update-install', { version: '0.2.0' }),
+    ])
+    assert.equal(newClient.ok, false)
+    if (!newClient.ok) assert.equal(newClient.error.code, 'remora/update-in-progress')
+    assert.equal(oldClient.ok && oldClient.value.requestId, original.requestId)
+    assert.equal(h.core.snapshot(true).updateInstallation?.requestId, original.requestId)
+    assert.equal(h.core.snapshot(true).updateInstallation?.attempt, original.attempt)
+    assert.equal(installs, 1)
+    assert.equal((await h.core.reconcileUpdate())?.requestId, original.requestId)
+  } finally { await h.cleanup() }
+})
+
+test('an externally installed newer version blocks a downgrade and shows restart pending', async () => {
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => [{ name: 'dsh-remora', version: '0.3.0', installed: true, enabled: true, source: 'https://github.com/Aero123421/dsh-remora/releases/download/v0.3.0/dsh-remora-0.3.0.tgz' }],
+    installBundle: async () => { installs++; return success() },
+  })
+  try {
+    const check = await h.core.checkUpdate(false)
+    assert.equal(check.latest?.version, '0.2.0')
+    assert.equal(check.newer, false)
+    assert.equal(check.installedVersion, '0.3.0')
+    assert.equal(check.restartRequired, true)
+    await assert.rejects(h.core.installUpdate(true, '0.2.0'))
+    assert.equal(installs, 0)
+  } finally { await h.cleanup() }
+})
+
+test('external upgrade during receipt I/O is rechecked immediately before manager invocation', async () => {
+  let installedVersion = '0.1.2'
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => [{ name: 'dsh-remora', version: installedVersion, installed: true, enabled: true, source: 'https://github.com/Aero123421/dsh-remora/releases/download/v0.1.2/dsh-remora-0.1.2.tgz' }],
+    installBundle: async () => { installs++; return success() },
+  })
+  const receipt: StoredDocument<UpdateInstallation | null> = Reflect.get(h.core, 'updateReceipt')
+  const save = receipt.update.bind(receipt)
+  receipt.update = async change => {
+    const result = await save(change)
+    if (result?.phase === 'installing') installedVersion = '0.3.0'
+    return result
+  }
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'installed-version-current')
+    assert.equal(installs, 0)
+  } finally { receipt.update = save; await h.cleanup() }
+})

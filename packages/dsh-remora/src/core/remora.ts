@@ -49,7 +49,7 @@ import { FileWorkspaceCreationStore, workspaceCreationsSpec } from './workspace-
 import { FileRemoteScheduleStore, remoteSchedulesSpec } from './remote-schedules.ts'
 import { FileTaskStore } from './tasks.ts'
 import { readQuestionModes, switchToTimed, type QuestionModeReport } from './question-mode.ts'
-import { checkForUpdate, downloadVerified, installationResult, newInstallRequestId, updateReceiptSpec, UpdateError, type UpdateCheck, type UpdateInstallation, type UpdatePluginManager } from './updates.ts'
+import { checkForUpdate, compareVersions, downloadVerified, installationResult, newInstallRequestId, updateReceiptSpec, UpdateError, type UpdateCheck, type UpdateInstallation, type UpdatePluginManager } from './updates.ts'
 
 type GetFetch = (input: string, init?: { headers?: Record<string, string>; signal?: AbortSignal; redirect?: RequestRedirect }) => Promise<Response>
 
@@ -1126,6 +1126,11 @@ export class RemoraCore {
           const bundle = (await manager.listBundles()).find(item => item.name === 'dsh-remora')
           if (!bundle?.installed || bundle.readOnlyReason) check.installUnavailable = bundle?.readOnlyReason ?? 'read-only'
           else if (!await this.isReleaseSource(bundle.source, bundle.version)) check.installUnavailable = 'manual-source'
+          if (bundle?.version) {
+            check.installedVersion = bundle.version
+            check.restartRequired = bundle.version !== PLUGIN_VERSION
+            if (check.latest && compareVersions(check.latest.version, bundle.version) <= 0) check.newer = false
+          } else check.installUnavailable = 'unknown-installed-version'
         } catch { check.installUnavailable = 'manager-unavailable' }
       }
       if (this.disposed) throw new RpcError('unloading')
@@ -1199,6 +1204,11 @@ export class RemoraCore {
   async installUpdate(local: boolean, expectedVersion: unknown): Promise<UpdateInstallation> {
     this.requireLocal(local, ['plugin-update'])
     if (this.disposed) throw new RpcError('unloading')
+    // An unresolved operation owns its receipt even if a newer release is published.
+    if (this.updateInstallation && ['downloading', 'installing', 'unknown'].includes(this.updateInstallation.phase)) {
+      if (expectedVersion !== this.updateInstallation.version) throw new RpcError('update-in-progress')
+      return this.updateInstalling ?? this.updateInstallation
+    }
     const check = this.updateCheck
     if (!check?.latest || !check.newer) throw new RpcError('no-update')
     if (expectedVersion !== check.latest.version) throw new RpcError('update-candidate-changed')
@@ -1222,6 +1232,8 @@ export class RemoraCore {
         if (this.disposed) throw new RpcError('unloading')
         if (!bundle || typeof bundle.enabled !== 'boolean') throw new UpdateError('unknown-bundle', 'cannot read the current bundle selection')
         if (!bundle.installed || bundle.readOnlyReason) throw new UpdateError('read-only', 'bundle is not writable')
+        if (!bundle.version) throw new UpdateError('unknown-installed-version', 'cannot read installed version')
+        if (compareVersions(release.version, bundle.version) <= 0) throw new UpdateError('installed-version-current', 'candidate is not newer than installed bundle')
         const source = bundle.source
         if (!await this.isReleaseSource(source, bundle.version)) {
           throw new UpdateError('manual-source', 'update this installation from its original source')
@@ -1241,8 +1253,13 @@ export class RemoraCore {
         this.updateInstallation = { ...this.updateInstallation!, phase: 'installing' }
         await this.updateReceipt.update(() => this.updateInstallation)
         if (this.disposed) throw new RpcError('unloading')
+        const finalBundle = (await manager.listBundles()).find(item => item.name === 'dsh-remora')
+        if (this.disposed) throw new RpcError('unloading')
+        if (!finalBundle?.installed || finalBundle.readOnlyReason || finalBundle.source !== source) throw new UpdateError('read-only', 'bundle changed during receipt save')
+        if (!finalBundle.version) throw new UpdateError('unknown-installed-version', 'cannot read installed version')
+        if (compareVersions(release.version, finalBundle.version) <= 0) throw new UpdateError('installed-version-current', 'candidate is not newer than installed bundle')
         managerStarted = true
-        const result = await manager.installBundle(path, { enabled: before.enabled, requestId: this.updateInstallation.requestId! })
+        const result = await manager.installBundle(path, { enabled: finalBundle.enabled, requestId: this.updateInstallation.requestId! })
         this.updateInstallation = installationResult(result, this.updateInstallation)
       } catch (error) {
         this.updateInstallation = {

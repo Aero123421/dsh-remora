@@ -37,6 +37,8 @@ export interface UpdateCheck {
   newer: boolean
   error?: string
   installUnavailable?: string
+  installedVersion?: string
+  restartRequired?: boolean
 }
 
 /** The subset of DSH 0.2.1-alpha.2's direct Host service used for self-updates. */
