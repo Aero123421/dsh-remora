@@ -63,3 +63,7 @@ Remora は DSH の質問（`user-questions/request`）と承認（`approval/requ
 Node 22 の標準 WebSocket は、DSH を `NODE_USE_ENV_PROXY=1` 付きで起動したときだけ `HTTPS_PROXY`／`HTTP_PROXY` を通ります（Node 22.21 以上）。プロキシ変数があるのにこの指定が無いと、タブに警告を出します。
 
 詳しくは[リポジトリの README](https://github.com/Aero123421/dsh-remora#readme) を見てください。
+
+## v0.1.3 の更新結果
+
+自己更新の操作 ID・結果を保存し、再接続・再起動後に導入版と実行版を照合します。結果不明の導入は再送しません。正式 Release のプラグイン tgz だけを検証して DSH manager に渡し、無効化状態を維持します。manager がない構成・read-only・互換性不明・開発用ディレクトリは手動更新してください。CLI・hub の更新は連動しません。

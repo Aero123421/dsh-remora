@@ -35,7 +35,7 @@ npm test
 
 ## 決まりごと
 
-- DSH のパッケージは依存に入れません。起動・終了処理と設定 RPC の型は `src/dsh.ts`、操作で使うサービスの型は `src/adapter/dsh-types.ts` に置きます。DSH の操作はアダプタ層から呼びます。
+- DSH の実行時依存は配布物に追加しません。更新処理の型検査だけに、固定版の plugin-manager 型を開発依存として使います。起動・終了処理と設定 RPC の型は `src/dsh.ts`、操作で使うサービスの型は `src/adapter/dsh-types.ts` に置きます。DSH の操作はアダプタ層から呼びます。
 - プラグインの `peerDependencies` は DSH の互換性チェック用です（`@deepseek-ai/dsh` の範囲だけ）。ワークスペースには `autoInstallPeers: false` を設定しています。
 - 配布するプラグインは実行時の依存なし、インストール時のスクリプトなしです。`pack:plugin` は `scripts` と `devDependencies` を外した `package.json` で固めます。
 - TypeScript は型を消すだけで動く書き方に限ります（`erasableSyntaxOnly`）。テストは Node が `.ts` をそのまま読みます。

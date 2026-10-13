@@ -9,14 +9,17 @@
  * path as Plugins → Add plugin with a local file. When that service is not
  * available the tab shows the manual steps instead.
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { join } from 'node:path'
-import { writeAtomic } from './storage.ts'
+import { satisfies, valid, validRange } from 'semver'
+import { lstat, mkdir, mkdtemp } from 'node:fs/promises'
+import { writeAtomic, asObject, type DocumentSpec } from './storage.ts'
 
 export const RELEASES_REPO = 'Aero123421/dsh-remora'
 export const MAX_TARBALL_BYTES = 20 * 1024 * 1024
 
 export interface ReleaseInfo {
+  id: number
   version: string
   name: string
   notes: string
@@ -32,33 +35,48 @@ export interface UpdateCheck {
   latest: ReleaseInfo | null
   newer: boolean
   error?: string
+  installUnavailable?: string
 }
 
 /** The subset of DSH 0.2.1-alpha.2's direct Host service used for self-updates. */
+import type { BundleInfo, ChangeResult, InstallBundleOptions, PluginInstallRequestId } from '@deepseek-ai/dsh-plugin-manager/types'
+export type { PluginInstallRequestId } from '@deepseek-ai/dsh-plugin-manager/types'
+export type BundleChangeResult = ChangeResult
+export function newInstallRequestId(): PluginInstallRequestId { return randomUUID() as PluginInstallRequestId }
 export interface UpdatePluginManager {
-  listBundles(): Promise<{ name: string; enabled: boolean }[]>
-  installBundle(spec: string, options: { enabled: boolean }): Promise<BundleChangeResult>
-}
-
-export interface BundleChangeResult {
-  changed: boolean
-  application: 'applied' | 'restart-required' | 'overridden' | 'failed' | 'cancelled'
-  stage: 'install' | 'enable' | 'remove'
-  target: string
-  bundle?: string
-  version?: string
-  error?: { code: string; diagnostic?: string }
-  packageResult?: { exitCode: number; kind?: string }
+  listBundles(): Promise<Pick<BundleInfo, 'name' | 'enabled' | 'installed' | 'readOnlyReason' | 'version' | 'source'>[]>
+  installBundle(spec: string, options: InstallBundleOptions): Promise<ChangeResult>
+  waitForInstall?(requestId: PluginInstallRequestId): Promise<ChangeResult | null>
 }
 
 export interface UpdateInstallation {
   /** Increases within the Host instance so polling cannot replace a newer attempt. */
   attempt: number
+  requestId?: PluginInstallRequestId
   version: string
-  phase: 'downloading' | 'installing' | BundleChangeResult['application']
+  phase: 'downloading' | 'installing' | 'unknown' | 'confirmed' | BundleChangeResult['application']
   installedVersion?: string
   stage?: BundleChangeResult['stage']
   error?: string
+}
+
+/** Only the non-secret operation receipt survives self-disposal and DSH restart. */
+export const updateReceiptSpec: DocumentSpec<UpdateInstallation | null> = {
+  file: 'update-receipt.json', version: 1, migrations: [], initial: () => null,
+  parse(data) {
+    if (data === null) return null
+    const value = asObject(data, 'update receipt')
+    if (!Number.isSafeInteger(value.attempt) || Number(value.attempt) < 1 || typeof value.version !== 'string' || !parseVersion(value.version) ||
+        typeof value.requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.requestId) ||
+        !['downloading', 'installing', 'unknown', 'confirmed', 'applied', 'restart-required', 'overridden', 'failed', 'cancelled'].includes(String(value.phase))) {
+      throw new Error('invalid update receipt')
+    }
+    const result: UpdateInstallation = { attempt: Number(value.attempt), version: value.version, requestId: value.requestId as PluginInstallRequestId, phase: value.phase as UpdateInstallation['phase'] }
+    if (typeof value.installedVersion === 'string' && parseVersion(value.installedVersion)) result.installedVersion = value.installedVersion
+    if (value.stage === 'install' || value.stage === 'enable' || value.stage === 'remove') result.stage = value.stage
+    if (typeof value.error === 'string') result.error = value.error.slice(0, 200)
+    return result
+  },
 }
 
 /** HTTP/RPC completion alone is not evidence that DSH applied the requested version. */
@@ -80,10 +98,10 @@ export function installationResult(result: BundleChangeResult, operation: Update
   return state
 }
 
-type FetchLike = (input: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => Promise<Response>
+type FetchLike = (input: string, init?: { headers?: Record<string, string>; signal?: AbortSignal; redirect?: RequestRedirect }) => Promise<Response>
 
 function parseVersion(version: string): { core: string[]; pre: string | null } | null {
-  const match = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(version.trim())
+  const match = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(version)
   if (!match) return null
   const pre = match[4] ?? null
   if (pre?.split('.').some(id => /^0\d+$/.test(id))) return null
@@ -94,11 +112,11 @@ function compareNumeric(a: string, b: string): number {
   return a.length !== b.length ? a.length - b.length : a === b ? 0 : a < b ? -1 : 1
 }
 
-/** Semver precedence: >0 when a is newer than b. Unparsable versions compare as equal. */
+/** Semver precedence: >0 when a is newer than b. Invalid versions are metadata errors. */
 export function compareVersions(a: string, b: string): number {
   const x = parseVersion(a)
   const y = parseVersion(b)
-  if (!x || !y) return 0
+  if (!x || !y) throw new UpdateError('invalid-version', 'invalid semantic version')
   for (let i = 0; i < 3; i++) {
     const order = compareNumeric(x.core[i]!, y.core[i]!)
     if (order !== 0) return order
@@ -122,32 +140,39 @@ export function compareVersions(a: string, b: string): number {
   return 0
 }
 
-export async function checkForUpdate(current: string, fetchImpl: FetchLike = fetch, now = Date.now()): Promise<UpdateCheck> {
+export async function checkForUpdate(current: string, fetchImpl: FetchLike = fetch, now = Date.now(), runtimeVersion?: string | null): Promise<UpdateCheck> {
   try {
+    if (!parseVersion(current)) throw new UpdateError('invalid-version', 'invalid current version')
     const response = await fetchImpl(`https://api.github.com/repos/${RELEASES_REPO}/releases/latest`, {
       headers: { accept: 'application/vnd.github+json', 'user-agent': `dsh-remora/${current}` },
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(15_000), redirect: 'error',
     })
     if (response.status === 404) return { current, checkedAt: now, latest: null, newer: false }
     if (!response.ok) return { current, checkedAt: now, latest: null, newer: false, error: `github-${response.status}` }
-    const body = await response.json() as {
-      tag_name?: unknown; name?: unknown; body?: unknown; html_url?: unknown; published_at?: unknown
+    const body = JSON.parse(new TextDecoder().decode(await readLimited(response, 256 * 1024))) as {
+      id?: unknown; draft?: unknown; prerelease?: unknown; tag_name?: unknown; name?: unknown; body?: unknown; html_url?: unknown; published_at?: unknown
       assets?: { name?: unknown; browser_download_url?: unknown }[]
     }
-    if (!body || typeof body.tag_name !== 'string' || !parseVersion(body.tag_name) || body.tag_name !== body.tag_name.trim()) {
+    if (!body || !Number.isSafeInteger(body.id) || Number(body.id) < 1 || typeof body.tag_name !== 'string' || !parseVersion(body.tag_name) || body.tag_name !== body.tag_name.trim()) {
       return { current, checkedAt: now, latest: null, newer: false, error: 'invalid-release' }
     }
+    if (body.draft !== false || body.prerelease !== false) throw new UpdateError('invalid-release', 'not a stable public release')
     const version = body.tag_name.replace(/^v/, '')
-    const assets = Array.isArray(body.assets) ? body.assets : []
+    if (parseVersion(version)?.pre) throw new UpdateError('invalid-release', 'prerelease is not a stable update')
+    if (!Array.isArray(body.assets)) throw new UpdateError('invalid-release', 'missing release assets')
+    const assets = body.assets
     const asset = (match: (name: string) => boolean) => {
-      const found = assets.filter(item => item && typeof item.name === 'string' && match(item.name) && typeof item.browser_download_url === 'string')
+      const found = assets.filter(item => item && typeof item.name === 'string' && match(item.name))
+      if (found.length === 1 && typeof found[0]!.browser_download_url !== 'string') throw new UpdateError('invalid-release', 'missing asset URL')
       if (found.length > 1) throw new UpdateError('invalid-release', 'duplicate release assets')
       return found[0] ? { name: found[0].name as string, url: found[0].browser_download_url as string } : null
     }
     const tarball = asset(name => name === `dsh-remora-${version}.tgz`)
     const sums = asset(name => name === 'SHA256SUMS')
+    for (const item of [tarball, sums]) if (item) validateAssetUrl(item.url, body.tag_name, item.name)
+    if (typeof body.html_url === 'string' && body.html_url !== `https://github.com/${RELEASES_REPO}/releases/tag/${body.tag_name}`) throw new UpdateError('invalid-release', 'unexpected release URL')
     const latest: ReleaseInfo = {
-      version,
+      id: Number(body.id), version,
       name: typeof body.name === 'string' && body.name !== '' ? body.name : `v${version}`,
       notes: typeof body.body === 'string' ? body.body.slice(0, 20_000) : '',
       url: typeof body.html_url === 'string' ? body.html_url : `https://github.com/${RELEASES_REPO}/releases`,
@@ -155,7 +180,25 @@ export async function checkForUpdate(current: string, fetchImpl: FetchLike = fet
       tarball,
       sums: sums?.url ?? null,
     }
-    return { current, checkedAt: now, latest, newer: compareVersions(version, current) > 0 }
+    const check: UpdateCheck = { current, checkedAt: now, latest, newer: compareVersions(version, current) > 0 }
+    if (!tarball || !sums) check.installUnavailable = 'no-assets'
+    if (runtimeVersion !== undefined) {
+      const manifestResponse = await fetchImpl(`https://raw.githubusercontent.com/${RELEASES_REPO}/${encodeURIComponent(body.tag_name)}/packages/dsh-remora/package.json`, {
+        signal: AbortSignal.timeout(15_000), redirect: 'error',
+      })
+      if (!manifestResponse.ok) throw new UpdateError('compatibility-unknown', 'candidate manifest is unavailable')
+      const manifest: unknown = JSON.parse(new TextDecoder().decode(await readLimited(manifestResponse, 64 * 1024)))
+      if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) throw new UpdateError('invalid-manifest', 'candidate manifest is malformed')
+      const record = asObject(manifest, 'candidate manifest')
+      if (record.name !== 'dsh-remora' || record.version !== version || !record.dsh || typeof record.dsh !== 'object' || !('bundle' in record.dsh)) {
+        throw new UpdateError('invalid-manifest', 'candidate manifest does not describe this bundle')
+      }
+      const peers = record.peerDependencies && typeof record.peerDependencies === 'object' && !Array.isArray(record.peerDependencies) ? asObject(record.peerDependencies, 'candidate peers') : {}
+      const range = peers['@deepseek-ai/dsh']
+      if (typeof range !== 'string' || !validRange(range) || !runtimeVersion || !valid(runtimeVersion)) check.installUnavailable = 'compatibility-unknown'
+      else if (!satisfies(runtimeVersion, range, { includePrerelease: true })) check.installUnavailable = 'incompatible-dsh'
+    }
+    return check
   } catch (error) {
     return { current, checkedAt: now, latest: null, newer: false, error: error instanceof UpdateError ? error.code : error instanceof SyntaxError ? 'invalid-release' : (error as Error).name === 'TimeoutError' ? 'timeout' : 'network' }
   }
@@ -202,27 +245,65 @@ async function readLimited(response: Response, limit: number): Promise<Uint8Arra
 
 /** Find `<hex>  <name>` in a SHA256SUMS file. */
 export function expectedHash(sums: string, name: string): string | null {
+  let found: string | null = null
   for (const line of sums.split(/\r?\n/)) {
     const match = /^([0-9a-f]{64})\s+\*?(.+)$/i.exec(line.trim())
-    if (match && match[2] === name) return (match[1] as string).toLowerCase()
+    if (match && match[2] === name) {
+      if (found) throw new UpdateError('invalid-checksum', 'duplicate checksum')
+      found = match[1]!.toLowerCase()
+    }
   }
-  return null
+  return found
+}
+
+function validateAssetUrl(value: string, tag: string, name: string): void {
+  const url = new URL(value)
+  const path = `/${RELEASES_REPO}/releases/download/${encodeURIComponent(tag)}/${name}`
+  if (url.protocol !== 'https:' || url.hostname !== 'github.com' || url.port || url.username || url.password || url.search || url.hash || url.pathname !== path) {
+    throw new UpdateError('invalid-release', 'unexpected release asset URL')
+  }
+}
+
+async function fetchAsset(url: string, signal: AbortSignal, fetchImpl: FetchLike): Promise<Response> {
+  for (let redirects = 0; redirects <= 5; redirects++) {
+    const response = await fetchImpl(url, { signal, redirect: 'manual' })
+    if (![301, 302, 303, 307, 308].includes(response.status)) return response
+    await response.body?.cancel()
+    const location = response.headers.get('location')
+    if (!location) throw new UpdateError('redirect-refused', 'redirect has no location')
+    const next = new URL(location, url)
+    if (next.protocol !== 'https:' || next.port || next.username || next.password || next.hash ||
+        !['release-assets.githubusercontent.com', 'objects.githubusercontent.com'].includes(next.hostname)) {
+      throw new UpdateError('redirect-refused', 'unexpected asset redirect')
+    }
+    url = next.href
+  }
+  throw new UpdateError('redirect-refused', 'too many redirects')
 }
 
 /** Download the release tarball, verify it against SHA256SUMS, and store it. Returns the absolute path. */
 export async function downloadVerified(release: ReleaseInfo, dataDir: string, fetchImpl: FetchLike = fetch): Promise<string> {
   if (!release.tarball || !release.sums) throw new UpdateError('no-assets', 'the release has no tarball or SHA256SUMS')
-  const sumsResponse = await fetchImpl(release.sums, { signal: AbortSignal.timeout(30_000) })
+  if (!parseVersion(release.version) || release.tarball.name !== `dsh-remora-${release.version}.tgz`) throw new UpdateError('bad-name', 'unexpected tarball name')
+  const tag = new URL(release.url).pathname.split('/').at(-1)!
+  if (tag.replace(/^v/, '') !== release.version) throw new UpdateError('invalid-release', 'tag/version mismatch')
+  validateAssetUrl(release.sums, tag, 'SHA256SUMS')
+  validateAssetUrl(release.tarball.url, tag, release.tarball.name)
+  const sumsResponse = await fetchAsset(release.sums, AbortSignal.timeout(30_000), fetchImpl)
   if (!sumsResponse.ok) throw new UpdateError('download-failed', `SHA256SUMS: ${sumsResponse.status}`)
   const expected = expectedHash(new TextDecoder().decode(await readLimited(sumsResponse, 64 * 1024)), release.tarball.name)
   if (!expected) throw new UpdateError('no-checksum', 'SHA256SUMS does not list the tarball')
-  const tarResponse = await fetchImpl(release.tarball.url, { signal: AbortSignal.timeout(120_000) })
+  const tarResponse = await fetchAsset(release.tarball.url, AbortSignal.timeout(120_000), fetchImpl)
   if (!tarResponse.ok) throw new UpdateError('download-failed', `tarball: ${tarResponse.status}`)
   const bytes = await readLimited(tarResponse, MAX_TARBALL_BYTES)
   const actual = createHash('sha256').update(bytes).digest('hex')
   if (actual !== expected) throw new UpdateError('checksum-mismatch', 'the tarball does not match SHA256SUMS')
   if (!/^dsh-remora-[0-9A-Za-z.+-]+\.tgz$/.test(release.tarball.name)) throw new UpdateError('bad-name', 'unexpected tarball name')
-  const path = join(dataDir, 'updates', release.tarball.name)
+  const updatesDir = join(dataDir, 'updates')
+  await mkdir(updatesDir, { recursive: true, mode: 0o700 })
+  const directory = await lstat(updatesDir)
+  if (!directory.isDirectory() || directory.isSymbolicLink()) throw new UpdateError('unsafe-storage', 'update directory is not an owned directory')
+  const path = join(await mkdtemp(join(updatesDir, 'download-')), release.tarball.name)
   await writeAtomic(path, bytes)
   return path
 }

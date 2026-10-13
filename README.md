@@ -73,6 +73,10 @@ MCP のツール名と説明は `packages/protocol/src/operations.ts` で固定�
 
 設計は [docs/design.md](docs/design.md)（設計書）と [docs/architecture.md](docs/architecture.md)（要点）、開発は [docs/development.md](docs/development.md)、通しテストは [docs/e2e.md](docs/e2e.md) にあります。npm には公開しません。
 
+## プラグインの更新
+
+設定の「互換性と更新」で確認してから更新します。導入中・再起動待ち・実行版確認済みを区別し、通信切断後は同じ操作 ID を照合します。結果不明の場合は再送せず、DSH のプラグイン管理と実行版を確認してください。manager がない構成・read-only・開発用ディレクトリ・独自名の配布物は手動更新です。更新対象はプラグインの tgz だけで、CLI 更新や hub のデプロイは行いません。[v0.1.3 の変更と検証](docs/releases/v0.1.3.md)を参照してください。
+
 ## リリースの確かめ方
 
 各リリースには、すべての配布物の `SHA256SUMS` と、GitHub Actions でビルドしたことを示すビルド来歴（attestation）が付いています。
