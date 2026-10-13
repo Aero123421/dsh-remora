@@ -2,8 +2,10 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { checkForUpdate, compareVersions, downloadVerified, expectedHash, MAX_TARBALL_BYTES, UpdateError, type BundleChangeResult, type UpdateInstallation, type UpdatePluginManager } from '../src/core/updates.ts'
 import { apply } from '../src/index.ts'
+import type { JsonDocument as StoredDocument } from '../src/core/storage.ts'
 import { PLUGIN_VERSION } from '../src/dsh.ts'
 import { fakeHost, rpc, tempDir, until } from './helpers.ts'
 
@@ -80,7 +82,7 @@ const success = (application: 'applied' | 'restart-required' = 'restart-required
 
 async function updateCore(manager: UpdatePluginManager, fetchImpl = github(`${sha}  dsh-remora-0.2.0.tgz\n`)) {
   const temp = await tempDir()
-  const host = fakeHost({ pluginManager: manager })
+  const host = fakeHost({ pluginManager: manager, profileContext: { dir: temp.dir } })
   const core = apply(host.ctx, undefined, { dataDir: temp.dir, dshVersion: '0.2.1-alpha.2', githubFetch: fetchImpl })
   await core.ready
   await core.checkUpdate(true)
@@ -210,7 +212,7 @@ test('same-version Host reloads retain durable receipts and have distinct connec
     assert.equal(before.updateInstallation?.attempt, 1)
     assert.equal(before.updateHostInstance, h.core.snapshot(true).updateHostInstance)
     await h.core.dispose()
-    const host = fakeHost({ pluginManager: manager })
+    const host = fakeHost({ pluginManager: manager, profileContext: { dir: h.core.dataDir } })
     replacement = apply(host.ctx, undefined, { dataDir: h.core.dataDir, dshVersion: '0.2.1-alpha.2', githubFetch: github(`${sha}  dsh-remora-0.2.0.tgz\n`) })
     await replacement.ready
     const after = replacement.snapshot(true)
@@ -298,7 +300,7 @@ test('self-disposal retains request ID; replacement mounts before manager settle
     const pending = h.core.installUpdate(true, '0.2.0')
     await until(() => installs === 1)
     await h.core.dispose()
-    replacement = apply(fakeHost({ pluginManager: manager }).ctx, undefined, { dataDir: h.core.dataDir, dshVersion: '0.2.1-alpha.2', githubFetch: github(`${sha}  dsh-remora-0.2.0.tgz\n`) })
+    replacement = apply(fakeHost({ pluginManager: manager, profileContext: { dir: h.core.dataDir } }).ctx, undefined, { dataDir: h.core.dataDir, dshVersion: '0.2.1-alpha.2', githubFetch: github(`${sha}  dsh-remora-0.2.0.tgz\n`) })
     await replacement.ready
     await until(() => waitedId !== undefined)
     assert.equal(waitedId, requestId)
@@ -319,14 +321,14 @@ test('null waitForInstall stays unknown until installed and executing versions b
   const temp = await tempDir()
   let version = 'other'
   let installs = 0
-  const receipt = await JsonDocument.open(temp.dir, updateReceiptSpec)
+  const receipt = await JsonDocument.open(join(temp.dir, '.dsh-remora-updates'), updateReceiptSpec)
   await receipt.update(() => ({ attempt: 1, version: PLUGIN_VERSION, requestId: newInstallRequestId(), phase: 'installing' }))
   const manager: UpdatePluginManager = {
     listBundles: async () => [{ name: 'dsh-remora', installed: true, enabled: true, version }],
     waitForInstall: async () => null,
     installBundle: async () => { installs++; return success() },
   }
-  const core = apply(fakeHost({ pluginManager: manager }).ctx, undefined, { dataDir: temp.dir })
+  const core = apply(fakeHost({ pluginManager: manager, profileContext: { dir: temp.dir } }).ctx, undefined, { dataDir: temp.dir })
   try {
     await core.ready
     assert.equal((await core.reconcileUpdate())?.phase, 'unknown')
@@ -377,9 +379,9 @@ test('pre-install interruption remains retryable after restart and manager absen
   const { JsonDocument } = await import('../src/core/storage.ts')
   const { newInstallRequestId, updateReceiptSpec } = await import('../src/core/updates.ts')
   const temp = await tempDir()
-  const receipt = await JsonDocument.open(temp.dir, updateReceiptSpec)
+  const receipt = await JsonDocument.open(join(temp.dir, '.dsh-remora-updates'), updateReceiptSpec)
   await receipt.update(() => ({ attempt: 1, version: '0.2.0', requestId: newInstallRequestId(), phase: 'downloading' }))
-  const core = apply(fakeHost().ctx, undefined, { dataDir: temp.dir, dshVersion: '0.2.1-alpha.2', githubFetch: github('') })
+  const core = apply(fakeHost({ profileContext: { dir: temp.dir } }).ctx, undefined, { dataDir: temp.dir, dshVersion: '0.2.1-alpha.2', githubFetch: github('') })
   try {
     await core.ready
     assert.equal(core.snapshot(true).updateInstallation?.phase, 'failed')
@@ -427,7 +429,7 @@ test('local release tarballs are updateable; directory links and custom archives
   const temp = await tempDir()
   const tgz = join(temp.dir, 'dsh-remora-0.1.2.tgz')
   await writeFile(tgz, 'installed release archive')
-  const core = apply(fakeHost({ pluginManager: {
+  const core = apply(fakeHost({ profileContext: { dir: temp.dir }, pluginManager: {
     listBundles: async () => [{ name: 'dsh-remora', version: '0.1.2', installed: true, enabled: false, source: pathToFileURL(tgz).href }],
     installBundle: async (_path: string, options: { enabled: boolean }) => { assert.equal(options.enabled, false); return success() },
   } }).ctx, undefined, { dataDir: temp.dir, dshVersion: '0.2.1-alpha.2', githubFetch: github(`${sha}  dsh-remora-0.2.0.tgz\n`) })
@@ -469,4 +471,71 @@ test('timeouts and symlinked update storage fail before installer handoff', asyn
     await symlink(outside.dir, join(temp.dir, 'updates'), 'dir')
     await assert.rejects(downloadVerified(release, temp.dir, base), (e: unknown) => e instanceof UpdateError && e.code === 'unsafe-storage')
   } finally { await temp.cleanup(); await outside.cleanup() }
+})
+
+test('OFF during the awaited installing receipt write prevents manager invocation', async () => {
+  const resume = gate<void>()
+  let writing = false
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => [{ name: 'dsh-remora', version: '0.1.2', installed: true, enabled: true, source: 'https://github.com/Aero123421/dsh-remora/releases/download/v0.1.2/dsh-remora-0.1.2.tgz' }],
+    installBundle: async () => { installs++; return success() },
+  })
+  // Delay this owned receipt writer only; other documents and Host instances keep running.
+  const receipt: StoredDocument<UpdateInstallation | null> = Reflect.get(h.core, 'updateReceipt')
+  const save = receipt.update.bind(receipt)
+  receipt.update = async change => {
+    if (change(receipt.value)?.phase === 'installing') { writing = true; await resume.promise }
+    return save(change)
+  }
+  try {
+    const pending = h.core.installUpdate(true, '0.2.0')
+    await until(() => writing)
+    await h.core.dispose()
+    resume.resolve()
+    const result = await pending
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'unloading')
+    assert.equal(installs, 0)
+    const recorded = await receipt.refresh()
+    assert.equal(recorded?.requestId, result.requestId)
+    assert.equal(recorded?.phase, 'failed')
+  } finally { resume.resolve(); receipt.update = save; await h.cleanup() }
+})
+
+test('two profiles share auth data but never inherit each other\'s unresolved or restart receipt', async () => {
+  const shared = await tempDir()
+  const profileA = await tempDir()
+  const profileB = await tempDir()
+  const manager: UpdatePluginManager = {
+    listBundles: async () => [{ name: 'dsh-remora', version: '0.1.2', installed: true, enabled: true, source: 'https://github.com/Aero123421/dsh-remora/releases/download/v0.1.2/dsh-remora-0.1.2.tgz' }],
+    installBundle: async () => success(),
+    waitForInstall: async () => null,
+  }
+  const options = { dataDir: shared.dir, dshVersion: '0.2.1-alpha.2', githubFetch: github(`${sha}  dsh-remora-0.2.0.tgz\n`) }
+  const a = apply(fakeHost({ pluginManager: manager, profileContext: { dir: profileA.dir } }).ctx, undefined, options)
+  let b: ReturnType<typeof apply> | undefined
+  try {
+    await a.ready
+    await a.checkUpdate(true)
+    const installedA = await a.installUpdate(true, '0.2.0')
+    assert.equal(installedA.phase, 'restart-required')
+    const receiptA: StoredDocument<UpdateInstallation | null> = Reflect.get(a, 'updateReceipt')
+    await receiptA.update(current => current ? { ...current, phase: 'unknown' } : current)
+    // An old home-level receipt belongs to no current profile and is ignored.
+    const { JsonDocument } = await import('../src/core/storage.ts')
+    const { updateReceiptSpec } = await import('../src/core/updates.ts')
+    await (await JsonDocument.open(shared.dir, updateReceiptSpec)).update(() => installedA)
+    b = apply(fakeHost({ pluginManager: manager, profileContext: { dir: profileB.dir } }).ctx, undefined, options)
+    await b.ready
+    assert.equal(b.snapshot(true).updateInstallation, null)
+    await b.checkUpdate(true)
+    const installedB = await b.installUpdate(true, '0.2.0')
+    assert.equal(installedB.phase, 'restart-required')
+    assert.notEqual(installedB.requestId, installedA.requestId)
+    assert.equal((await receiptA.refresh())?.phase, 'unknown')
+    const receiptB: StoredDocument<UpdateInstallation | null> = Reflect.get(b, 'updateReceipt')
+    assert.notEqual(receiptB.path, receiptA.path)
+    assert.equal(a.dataDir, b.dataDir)
+  } finally { await b?.dispose(); await a.dispose(); await shared.cleanup(); await profileA.cleanup(); await profileB.cleanup() }
 })

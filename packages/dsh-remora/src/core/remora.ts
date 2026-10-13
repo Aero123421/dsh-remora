@@ -5,7 +5,7 @@
  */
 import { homedir, hostname } from 'node:os'
 import { randomUUID } from 'node:crypto'
-import { basename, win32 } from 'node:path'
+import { basename, join, win32 } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { lstat } from 'node:fs/promises'
 import { createRequire } from 'node:module'
@@ -189,6 +189,7 @@ export class RemoraCore {
   private readonly updateHostInstance = randomUUID()
   private updateChecking: Promise<UpdateCheck> | null = null
   private updateInstallation: UpdateInstallation | null = null
+  private readonly updateDir: string | null
   private updateReceipt!: JsonDocument<UpdateInstallation | null>
   private updateReconciling: Promise<UpdateInstallation | null> | null = null
   private updateInstalling: Promise<UpdateInstallation> | null = null
@@ -206,6 +207,9 @@ export class RemoraCore {
     this.options = options
     this.clock = options.clock ?? systemClock
     this.dshVersion = options.dshVersion ?? dshVersion()
+    const profile = ctx.get('profileContext')
+    const profileDir = profile && typeof profile === 'object' && 'dir' in profile && typeof profile.dir === 'string' ? profile.dir : null
+    this.updateDir = profileDir ? join(profileDir, '.dsh-remora-updates') : null
     const homePath = ctx.get('dshHomePath')
     this.dataDir = options.dataDir ?? remoraDataDir(typeof homePath === 'function' ? homePath as (...segments: string[]) => string : undefined)
     this.nativeCacheStale = staleNativeDirs.has(this.dataDir)
@@ -227,13 +231,15 @@ export class RemoraCore {
     const creationsDoc = await JsonDocument.open(dir, workspaceCreationsSpec)
     this.remoteSchedules = new FileRemoteScheduleStore(await JsonDocument.open(dir, remoteSchedulesSpec))
     this.auditLog = await AuditLog.open(dir, { now: () => this.clock.now() })
-    this.updateReceipt = await JsonDocument.open(dir, updateReceiptSpec)
-    this.updateInstallation = this.updateReceipt.value
-    // The manager may be waiting for this replacement Host to mount: do not await its own installation here.
-    if (this.updateInstallation && ['installing', 'unknown'].includes(this.updateInstallation.phase)) {
-      void this.reconcileUpdate().catch(error => this.ctx.logger.warn('Remora: update reconciliation failed', error))
-    } else {
-      await this.reconcileUpdate().catch(error => this.ctx.logger.warn('Remora: update reconciliation failed', error))
+    if (this.updateDir) {
+      this.updateReceipt = await JsonDocument.open(this.updateDir, updateReceiptSpec)
+      this.updateInstallation = this.updateReceipt.value
+      // The manager may be waiting for this replacement Host to mount: do not await its own installation here.
+      if (this.updateInstallation && ['installing', 'unknown'].includes(this.updateInstallation.phase)) {
+        void this.reconcileUpdate().catch(error => this.ctx.logger.warn('Remora: update reconciliation failed', error))
+      } else {
+        await this.reconcileUpdate().catch(error => this.ctx.logger.warn('Remora: update reconciliation failed', error))
+      }
     }
     await this.settingsDoc.update(adoptNewOperations)
     const credentials = this.ctx.get('credentials') as CredentialsLike | undefined
@@ -1137,7 +1143,7 @@ export class RemoraCore {
 
   private pluginManager(): UpdatePluginManager | null {
     const manager = this.ctx.get('pluginManager') as Partial<UpdatePluginManager> | undefined
-    return manager && typeof manager.installBundle === 'function' && typeof manager.listBundles === 'function' ? manager as UpdatePluginManager : null
+    return this.updateDir && manager && typeof manager.installBundle === 'function' && typeof manager.listBundles === 'function' ? manager as UpdatePluginManager : null
   }
 
   private async isReleaseSource(source: string | undefined, version: string | undefined): Promise<boolean> {
@@ -1166,6 +1172,7 @@ export class RemoraCore {
   }
 
   private async readUpdateReceipt(): Promise<UpdateInstallation | null> {
+    if (!this.updateDir) return null
     const operation = await this.updateReceipt.refresh()
     if (!operation || this.updateInstalling) return this.updateInstallation
     const manager = this.pluginManager()
@@ -1233,6 +1240,7 @@ export class RemoraCore {
         if (this.disposed) throw new RpcError('unloading')
         this.updateInstallation = { ...this.updateInstallation!, phase: 'installing' }
         await this.updateReceipt.update(() => this.updateInstallation)
+        if (this.disposed) throw new RpcError('unloading')
         managerStarted = true
         const result = await manager.installBundle(path, { enabled: before.enabled, requestId: this.updateInstallation.requestId! })
         this.updateInstallation = installationResult(result, this.updateInstallation)
