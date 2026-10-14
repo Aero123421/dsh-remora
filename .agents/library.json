@@ -1,0 +1,26 @@
+{
+  "repository": "https://github.com/Aero123421/dsh-plginreview",
+  "commit": "be59afc6bfeadcc6bc1c4b405ee8f80b4a936b40",
+  "source_path": ".agents",
+  "skills": [
+    "agent-experience",
+    "cordis-composition-reference",
+    "cordis-plugin-development",
+    "dsh-archive-agent-notes",
+    "dsh-ci-test-reliability",
+    "dsh-client-ui-ux",
+    "dsh-code-review",
+    "dsh-create-upgrade-guide",
+    "dsh-doc",
+    "dsh-error-handling",
+    "dsh-find-simplifications",
+    "dsh-merging-stacked-prs",
+    "dsh-pre-push-checks",
+    "dsh-prose-standard",
+    "dsh-speed-up-perf",
+    "dsh-translate-docs",
+    "dsh-trim-cot-leakage",
+    "editing-cordis-compositions",
+    "record-browser-gif"
+  ]
+}
