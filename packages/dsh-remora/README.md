@@ -67,3 +67,5 @@ Node 22 の標準 WebSocket は、DSH を `NODE_USE_ENV_PROXY=1` 付きで起動
 ## v0.1.3 の更新結果
 
 自己更新の操作 ID・結果を保存し、再接続・再起動後に導入版と実行版を照合します。結果不明の導入は再送しません。正式 Release のプラグイン tgz だけを検証して DSH manager に渡し、無効化状態を維持します。manager がない構成・read-only・互換性不明・開発用ディレクトリは手動更新してください。CLI・hub の更新は連動しません。
+
+DSH 0.2.1-alpha.3 以降、HMR が有効なプロファイルでは、導入済みパッケージへの `installBundle` はファイルを変えずに `already-installed` で失敗します。そのときは Plugins ページと同じ順で `removeBundle` してから、外す前のオン／オフのまま入れ直します。HMR がないときに取り外しが `stop-profile` で拒まれた場合は、入ったままのパッケージへ `installBundle` します。取り外しは実行中のプラグインを止めてから戻るので、続く導入はホストの manager だけを使います。取り外しがそれ以外で失敗したときは、入れ直しません。

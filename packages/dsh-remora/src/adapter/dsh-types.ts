@@ -6,7 +6,8 @@
  * service is looked up with `ctx.get(name)` and may be absent; the adapter
  * then disables the operations that need it (see `features.ts`).
  *
- * Source of truth (commit d743267):
+ * Source of truth (commit d743267). On 2fbf435 (0.2.1-alpha.3), sessionController.list
+ * and search filter rows with remoteAccess.allows; the fields below are the ones the adapter reads.
  * - sessionController: packages/api/session-controller/src/{index,types,commands}.ts
  * - workspaceRegistry: packages/workspace/workspace/src/{index,types}.ts
  * - userQuestions:     packages/interaction/user-questions/src/{index,types}.ts

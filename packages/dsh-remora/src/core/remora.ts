@@ -49,7 +49,7 @@ import { FileWorkspaceCreationStore, workspaceCreationsSpec } from './workspace-
 import { FileRemoteScheduleStore, remoteSchedulesSpec } from './remote-schedules.ts'
 import { FileTaskStore } from './tasks.ts'
 import { readQuestionModes, switchToTimed, type QuestionModeReport } from './question-mode.ts'
-import { checkForUpdate, compareVersions, downloadVerified, installationResult, newInstallRequestId, updateReceiptSpec, UpdateError, type UpdateCheck, type UpdateInstallation, type UpdatePluginManager } from './updates.ts'
+import { checkForUpdate, compareVersions, downloadVerified, installationResult, installVerifiedBundle, newInstallRequestId, updateReceiptSpec, UpdateError, type UpdateCheck, type UpdateInstallation, type UpdatePluginManager } from './updates.ts'
 
 type GetFetch = (input: string, init?: { headers?: Record<string, string>; signal?: AbortSignal; redirect?: RequestRedirect }) => Promise<Response>
 
@@ -1259,7 +1259,9 @@ export class RemoraCore {
         if (!finalBundle.version) throw new UpdateError('unknown-installed-version', 'cannot read installed version')
         if (compareVersions(release.version, finalBundle.version) <= 0) throw new UpdateError('installed-version-current', 'candidate is not newer than installed bundle')
         managerStarted = true
-        const result = await manager.installBundle(path, { enabled: finalBundle.enabled, requestId: this.updateInstallation.requestId! })
+        // Do not consult `this.disposed` after this returns. On HMR, removal stops this plugin
+        // before `removeBundle` resolves; the host manager still accepts the following install.
+        const result = await installVerifiedBundle(manager, path, { enabled: finalBundle.enabled, requestId: this.updateInstallation.requestId! })
         this.updateInstallation = installationResult(result, this.updateInstallation)
       } catch (error) {
         this.updateInstallation = {

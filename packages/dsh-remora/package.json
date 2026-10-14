@@ -72,6 +72,7 @@
     "@types/ws": "8.18.1",
     "clsx": "2.1.1",
     "mime-types": "3.0.2",
+    "p-limit": "7.3.3",
     "qrcode-generator": "1.5.2",
     "semver": "7.7.4",
     "undici": "8.11.2",

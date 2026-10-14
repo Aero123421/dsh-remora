@@ -9,10 +9,16 @@ export { default as SystemPrompt } from '@deepseek-ai/dsh-system-prompt'
 export { default as ToolRuntime } from '@deepseek-ai/dsh-tools'
 export { default as AgentRegistry } from '@deepseek-ai/dsh-agent'
 export { default as AgentLoop } from '@deepseek-ai/dsh-agent-loop'
-export { default as JsonlSessionPersistence } from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlSessionPersistenceModule from '@deepseek-ai/dsh-session-persistence-jsonl'
+// alpha.3 publishes `apply`. alpha.2 publishes the plugin class as the default export.
+export const JsonlSessionPersistence = typeof JsonlSessionPersistenceModule.apply === 'function'
+  ? JsonlSessionPersistenceModule
+  : JsonlSessionPersistenceModule.default
 export * as SessionCheckpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy'
 export { default as SessionProjectionCache } from '@deepseek-ai/dsh-session-projection-cache'
 export { default as SessionController } from '@deepseek-ai/dsh-api-session-controller'
+export { default as RemoteAccess } from '@deepseek-ai/dsh-api-remote-access'
+export { default as TypertRegistry } from '@deepseek-ai/dsh-typert-registry'
 export { default as Storage } from '@deepseek-ai/dsh-storage'
 export * as StorageJson from '@deepseek-ai/dsh-storage-json'
 export * as StorageDomain from '@deepseek-ai/dsh-storage-domain'

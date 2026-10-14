@@ -46,6 +46,14 @@ npm test
 - 質問・プランの確認・承認への外からの回答は `src/adapter/answerer.ts` が DSH の waterfall に入って受け付けます。`timed` モードの質問は `userQuestions.answer` で答えます。承認はパスキー確認が既定で、DSH 側のスイッチで MCP・CLI からも許可できます。
 - `packages/protocol` や `assets/` のロゴを変えたら `pnpm vendor:sync` を実行し、`hub/` 側のコピーも一緒にコミットします。
 
+## DSH 0.2.1-alpha.3
+
+`upstream.json` は `2fbf435`（0.2.1-alpha.3、2026-10-14）です。`peerDependencies` の `@deepseek-ai/dsh` は `>=0.2.1-alpha.2 <0.2.2-0` のままです。DSH は `semver.satisfies(runtime, range, { includePrerelease: true })` で見るので、0.2.1-alpha.3 と、それ以降の 0.2.1 プレリリース（`alpha.10`、`beta`、`rc` を含む）および 0.2.1 ではプラグインを読み飛ばしません。`0.2.2-alpha.1` 以降はこの範囲の外で、DSH は起動時に読み飛ばします。
+
+HMR のあるプロファイルでは、導入済みパッケージへの `installBundle` はファイルを変えずに `already-installed` で失敗します。自己更新はそのときだけ `removeBundle` してから、外す前のオン／オフで入れ直します。HMR がない取り外しが `stop-profile` のときは、入ったままのパッケージへ `installBundle` します。取り外しがそれ以外で失敗したときは入れ直しません。
+
+CI のジョブ `Adapter compat (latest DSH alpha)` は、`dsh-v*-alpha.*` で最も新しいタグのコミットに `DSH_UPSTREAM_COMMIT` を渡して `pnpm --filter dsh-remora test:compat` を実行します。ローカルの `test:compat` は `upstream.json` のコミットです。
+
 ## v0.1.2 の追加検証（2026-10-13）
 
 権限取り消し後の操作・遅延応答、タスクの配達とキャンセル、ペアリングの中断と複数インスタンス、設定画面の古い応答、更新処理の回帰テストを追加しました。protocol・プラグイン・CLI のテスト計 370 件、ハブの単体テスト 15 件と結合テスト 51 件、固定 DSH ソースとの互換テスト 15 件、厳密モードの通しテスト 43 項目を確認しています。通しテストのモデル応答は模擬プロバイダです。変更点と更新時の注意は [v0.1.2 のリリースノート](releases/v0.1.2.md) に記載しています。

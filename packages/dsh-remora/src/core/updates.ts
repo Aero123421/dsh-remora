@@ -8,6 +8,14 @@
  * plugin manager (`pluginManager.installBundle(<absolute path>)`) — the same
  * path as Plugins → Add plugin with a local file. When that service is not
  * available the tab shows the manual steps instead.
+ *
+ * With HMR, DSH 0.2.1-alpha.3 refuses `installBundle` of a package the profile
+ * already depends on (`application: 'failed'`, `error.code: 'already-installed'`,
+ * no profile file changed). The Plugins page then calls `removeBundle` and
+ * installs the new spec; a `stop-profile` removal (no HMR, bundle still running)
+ * is followed by `installBundle` over the package that stayed installed.
+ * `removeBundle` stops this plugin before it returns, so the follow-up install
+ * uses only the host manager, which outlives the bundle.
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { join } from 'node:path'
@@ -41,7 +49,7 @@ export interface UpdateCheck {
   restartRequired?: boolean
 }
 
-/** The subset of DSH 0.2.1-alpha.2's direct Host service used for self-updates. */
+/** The subset of the DSH host plugin manager used for self-updates (0.2.1-alpha.2 and alpha.3). */
 import type { BundleInfo, ChangeResult, InstallBundleOptions, PluginInstallRequestId } from '@deepseek-ai/dsh-plugin-manager/types'
 export type { PluginInstallRequestId } from '@deepseek-ai/dsh-plugin-manager/types'
 export type BundleChangeResult = ChangeResult
@@ -49,7 +57,34 @@ export function newInstallRequestId(): PluginInstallRequestId { return randomUUI
 export interface UpdatePluginManager {
   listBundles(): Promise<Pick<BundleInfo, 'name' | 'enabled' | 'installed' | 'readOnlyReason' | 'version' | 'source'>[]>
   installBundle(spec: string, options: InstallBundleOptions): Promise<ChangeResult>
+  /** Present on the DSH host service. Optional so a manager that cannot remove still reports `already-installed`. */
+  removeBundle?(name: string): Promise<ChangeResult>
   waitForInstall?(requestId: PluginInstallRequestId): Promise<ChangeResult | null>
+}
+
+const REMORA_BUNDLE = 'dsh-remora'
+
+function resultCode(result: BundleChangeResult): string | undefined {
+  return result.error?.code
+}
+
+/** HMR refused to install over the package, and did not change the profile files. */
+function isAlreadyInstalled(result: BundleChangeResult): boolean {
+  return result.application === 'failed' && result.changed === false && resultCode(result) === 'already-installed'
+}
+
+/**
+ * Install `spec`, removing `dsh-remora` first when DSH answers `already-installed`.
+ * The second `installBundle` runs even if removal unloaded the caller: only `manager` is used after that.
+ * A failed or cancelled removal, other than `stop-profile`, is returned unchanged and is not followed by another install.
+ */
+export async function installVerifiedBundle(manager: UpdatePluginManager, spec: string, options: InstallBundleOptions): Promise<BundleChangeResult> {
+  const installed = await manager.installBundle(spec, options)
+  if (!isAlreadyInstalled(installed) || typeof manager.removeBundle !== 'function') return installed
+  const removed = await manager.removeBundle(REMORA_BUNDLE)
+  if (removed.application === 'cancelled') return removed
+  if (removed.application === 'failed' && resultCode(removed) !== 'stop-profile') return removed
+  return manager.installBundle(spec, options)
 }
 
 export interface UpdateInstallation {
@@ -91,7 +126,7 @@ export function installationResult(result: BundleChangeResult, operation: Update
   if (successful && (result.error || (result.packageResult && result.packageResult.exitCode !== 0))) {
     state.phase = 'failed'
     state.error ??= result.packageResult?.kind ?? 'package-failed'
-  } else if (successful && (result.bundle !== 'dsh-remora' || result.version !== operation.version)) {
+  } else if (successful && (result.bundle !== REMORA_BUNDLE || result.version !== operation.version)) {
     state.phase = 'failed'
     state.error = 'installed-version-mismatch'
   } else if (!['applied', 'restart-required', 'overridden', 'failed', 'cancelled'].includes(result.application)) {
