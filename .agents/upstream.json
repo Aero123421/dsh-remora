@@ -1,0 +1,195 @@
+{
+  "repository": "https://github.com/deepseek-ai/deepseek-harness",
+  "commit": "d743267388641bc76f17c45ce8b4c231aed1d32c",
+  "dsh_version": "0.2.1-alpha.2",
+  "adapted_on_jst": "2026-10-14",
+  "license": "MIT",
+  "skills": [
+    {
+      "name": "agent-experience",
+      "source_path": "packages/preset/agent-preset/skills/agent-experience/SKILL.md",
+      "source_blob": "0d12d9c3019c61d282fa760e05a3f746726b1adb",
+      "local_path": ".agents/skills/agent-experience/SKILL.md"
+    },
+    {
+      "name": "cordis-composition-reference",
+      "source_path": "packages/preset/agent-preset/skills/cordis-composition-reference/SKILL.md",
+      "source_blob": "8fcb9d59b6b5ed74aa15670830a61aa39f6d1f71",
+      "local_path": ".agents/skills/cordis-composition-reference/SKILL.md"
+    },
+    {
+      "name": "cordis-plugin-development",
+      "source_path": "packages/preset/agent-preset/skills/cordis-plugin-development/SKILL.md",
+      "source_blob": "938798a37451b2c2d9ffb842d7db46edf435f670",
+      "local_path": ".agents/skills/cordis-plugin-development/SKILL.md"
+    },
+    {
+      "name": "dsh-archive-agent-notes",
+      "source_path": ".agents/skills/dsh-archive-agent-notes/SKILL.md",
+      "source_blob": "6052cbf1fc51460533b0443eab9e282104cce6d9",
+      "local_path": ".agents/skills/dsh-archive-agent-notes/SKILL.md"
+    },
+    {
+      "name": "dsh-ci-test-reliability",
+      "source_path": ".agents/skills/dsh-ci-test-reliability/SKILL.md",
+      "source_blob": "d9fd0f1700476f8fc9bb6f90f3824ce8a8304de6",
+      "local_path": ".agents/skills/dsh-ci-test-reliability/SKILL.md"
+    },
+    {
+      "name": "dsh-client-ui-ux",
+      "source_path": ".agents/skills/dsh-client-ui-ux/SKILL.md",
+      "source_blob": "fa6ebb70a11f9b72324c465c882890814bec4ac6",
+      "local_path": ".agents/skills/dsh-client-ui-ux/SKILL.md"
+    },
+    {
+      "name": "dsh-code-review",
+      "source_path": ".agents/skills/dsh-code-review/SKILL.md",
+      "source_blob": "e75ca077441736c16b8920f8b1e259c4c9da889c",
+      "local_path": ".agents/skills/dsh-code-review/SKILL.md"
+    },
+    {
+      "name": "dsh-create-upgrade-guide",
+      "source_path": ".agents/skills/dsh-create-upgrade-guide/SKILL.md",
+      "source_blob": "9723537e22b096b856a51398cb1485c7e1d0f3d0",
+      "local_path": ".agents/skills/dsh-create-upgrade-guide/SKILL.md"
+    },
+    {
+      "name": "dsh-doc",
+      "source_path": ".agents/skills/dsh-doc/SKILL.md",
+      "source_blob": "5e32d4c07ec5fe26b2407b8d408713f4f9cb7457",
+      "local_path": ".agents/skills/dsh-doc/SKILL.md"
+    },
+    {
+      "name": "dsh-error-handling",
+      "source_path": ".agents/skills/dsh-error-handling/SKILL.md",
+      "source_blob": "f9dd7fd80999c7c5f4cf03096d6a42649b15e40e",
+      "local_path": ".agents/skills/dsh-error-handling/SKILL.md"
+    },
+    {
+      "name": "dsh-find-simplifications",
+      "source_path": ".agents/skills/dsh-find-simplifications/SKILL.md",
+      "source_blob": "fe98baba2978fcc90ea9f976c27414dad82c708e",
+      "local_path": ".agents/skills/dsh-find-simplifications/SKILL.md"
+    },
+    {
+      "name": "dsh-merging-stacked-prs",
+      "source_path": ".agents/skills/dsh-merging-stacked-prs/SKILL.md",
+      "source_blob": "7e6a985614b5ebd1c841b678090e0c4fe5d07aab",
+      "local_path": ".agents/skills/dsh-merging-stacked-prs/SKILL.md"
+    },
+    {
+      "name": "dsh-pre-push-checks",
+      "source_path": ".agents/skills/dsh-pre-push-checks/SKILL.md",
+      "source_blob": "6567dde5dc6df2d9d292fda3f6b8daac8b7dcd9a",
+      "local_path": ".agents/skills/dsh-pre-push-checks/SKILL.md"
+    },
+    {
+      "name": "dsh-prose-standard",
+      "source_path": ".agents/skills/dsh-prose-standard/SKILL.md",
+      "source_blob": "bb8347823b99fb8c871c697032b2bf33d1bcea43",
+      "local_path": ".agents/skills/dsh-prose-standard/SKILL.md"
+    },
+    {
+      "name": "dsh-speed-up-perf",
+      "source_path": ".agents/skills/dsh-speed-up-perf/SKILL.md",
+      "source_blob": "f8b5eb614107b1ef431727d068f1dd4e188c0fdf",
+      "local_path": ".agents/skills/dsh-speed-up-perf/SKILL.md"
+    },
+    {
+      "name": "dsh-translate-docs",
+      "source_path": ".agents/skills/dsh-translate-docs/SKILL.md",
+      "source_blob": "6ff2650c74c7f581e6ff7f095b36eb82584c785c",
+      "local_path": ".agents/skills/dsh-translate-docs/SKILL.md"
+    },
+    {
+      "name": "dsh-trim-cot-leakage",
+      "source_path": ".agents/skills/dsh-trim-cot-leakage/SKILL.md",
+      "source_blob": "f8a852bd66f398fc8c29f50d336df07d47218c27",
+      "local_path": ".agents/skills/dsh-trim-cot-leakage/SKILL.md"
+    },
+    {
+      "name": "editing-cordis-compositions",
+      "source_path": "packages/preset/agent-preset/skills/editing-cordis-compositions/SKILL.md",
+      "source_blob": "86daf27621b8a7ce9dac54bb0022830916beae3c",
+      "local_path": ".agents/skills/editing-cordis-compositions/SKILL.md"
+    },
+    {
+      "name": "record-browser-gif",
+      "source_path": ".agents/skills/record-browser-gif/SKILL.md",
+      "source_blob": "a16f8294e9fd822256584f66d1a0136fa819fdcd",
+      "local_path": ".agents/skills/record-browser-gif/SKILL.md"
+    }
+  ],
+  "references": [
+    {
+      "local_path": ".agents/skills/cordis-plugin-development/references/host-plugin.md",
+      "source_path": "packages/preset/agent-preset/skills/cordis-plugin-development/references/host-plugin.md",
+      "source_blob": "fe88761ae47a73e0d98eb6305b8e724f9dcb57bf"
+    },
+    {
+      "local_path": ".agents/skills/cordis-plugin-development/references/mcp-bundle.md",
+      "source_path": "packages/preset/agent-preset/skills/cordis-plugin-development/references/mcp-bundle.md",
+      "source_blob": "f1159538ec35a683bd16230d111e97202d17ccce"
+    },
+    {
+      "local_path": ".agents/skills/cordis-plugin-development/references/practices.md",
+      "source_path": "packages/preset/agent-preset/skills/cordis-plugin-development/references/practices.md",
+      "source_blob": "0f42e10f0c0d81e1f1dc151fd96825a511db3a46"
+    },
+    {
+      "local_path": ".agents/skills/cordis-plugin-development/references/ui-plugin.md",
+      "source_path": "packages/preset/agent-preset/skills/cordis-plugin-development/references/ui-plugin.md",
+      "source_blob": "d647923d75f2267e751a5d265dc378c9aa4755c5"
+    },
+    {
+      "local_path": ".agents/skills/cordis-plugin-development/references/user-actions.md",
+      "source_path": "packages/preset/agent-preset/skills/cordis-plugin-development/references/user-actions.md",
+      "source_blob": "8b0e00c9860149e529e09185781c99ed2395abb0"
+    },
+    {
+      "local_path": ".agents/skills/cordis-plugin-development/references/verification.md",
+      "source_path": "packages/preset/agent-preset/skills/cordis-plugin-development/references/verification.md",
+      "source_blob": "350f6a3d84b38cdd90a88a463da3ea0ea4d64480"
+    }
+  ],
+  "added_guidance_sources": [
+    "https://github.com/Aero123421/dsh-plginreview/blob/1efb6e9c02faea4bd0170e4f8e0a4e0e928dc88f/docs/installation.md",
+    "https://github.com/Aero123421/dsh-plginreview/blob/1efb6e9c02faea4bd0170e4f8e0a4e0e928dc88f/docs/update-button.md",
+    "https://github.com/Aero123421/dsh-plginreview/blob/1efb6e9c02faea4bd0170e4f8e0a4e0e928dc88f/docs/plugin-coexistence.md",
+    "https://github.com/Aero123421/dsh-plginreview/blob/1efb6e9c02faea4bd0170e4f8e0a4e0e928dc88f/docs/ecosystem/deep-patterns.md"
+  ],
+  "api_sources": [
+    {
+      "source_path": "packages/core/session/README.md",
+      "source_blob": "178dc708b878d8648942c7b6124c59f69db71a8a"
+    },
+    {
+      "source_path": "packages/core/session/src/index.ts",
+      "source_blob": "e97585e4635dd2f0764cd6c2bb5fb8791708e321"
+    },
+    {
+      "source_path": "packages/session/session-format-v3-to-v4/src/validation.ts",
+      "source_blob": "8c0e74d61de7c94a2cc37131912c96fe3288b544"
+    },
+    {
+      "source_path": "packages/boot/plugin-manager/src/tools.ts",
+      "source_blob": "29c58e898d2a908b19db4dd9d48382a538387c8a"
+    },
+    {
+      "source_path": "packages/boot/plugin-manager/README.md",
+      "source_blob": "bc1550d9aa262d8837704b3b971c91c419161fc2"
+    },
+    {
+      "source_path": "vendor/loader/src/config/isolate.ts",
+      "source_blob": "e2fd5391576b0e7b1bd41541b2360cccb92d1af5"
+    },
+    {
+      "source_path": "packages/boot/plugin-manager/src/build-approval.ts",
+      "source_blob": "75600f8c22a468fcae74db1f645bde372e35911e"
+    },
+    {
+      "source_path": "packages/client/ui-approval/src/client/index.ts",
+      "source_blob": "ca6d674e36c65cd30724f4676c5a95bd617125e2"
+    }
+  ]
+}
