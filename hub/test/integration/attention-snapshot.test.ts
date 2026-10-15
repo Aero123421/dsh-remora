@@ -7,7 +7,7 @@ import { FakeHost, eventually, setupOwner } from './helpers.ts'
 const caller: Caller = { clientId: 'attention-reader', clientName: 'Attention', kind: 'client', scopes: ['dsh.read', 'dsh.content', 'dsh.tasks'] }
 
 function item(sessionId: string, attentionId: string, title: string): AttentionItem {
-  return { attentionId, hostId: '', sessionId, kind: 'question', title, answerable: false, answerVia: 'dsh-web' }
+  return { attentionId, hostId: '', sessionId, kind: 'question', title, answerable: false, answerVia: 'dsh-web', createdAt: 1 }
 }
 
 describe('attention snapshot', () => {
