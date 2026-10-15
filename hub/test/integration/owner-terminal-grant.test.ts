@@ -48,4 +48,34 @@ describe('owner terminal grant', () => {
     expect(Number.isFinite(expires)).toBe(true)
     host.socket?.close(1000, 'done')
   })
+
+  it('uses the extended grant deadline on a direct confirmation', async () => {
+    const owner = await setupOwner()
+    const { host, requests } = await fullHost(owner)
+    const options = await owner.browser.postJson('/auth/confirm/options', {
+      hostId: host.hostId,
+      operation: 'terminal.run',
+      params: { command: 'sleep 120', cwdWorkspaceId: 'ws-1', timeoutMs: 120_000 },
+    })
+    expect(options.status).toBe(200)
+    const prepared = (await options.json()) as { requestId: string; issuedAt: number; params: Record<string, unknown>; options: { challenge: string; rpId: string } }
+    const signed = await owner.authenticator.get(prepared.options)
+    const started = Date.now()
+    const sent = await owner.browser.postJson('/ops/confirmed', {
+      hostId: host.hostId,
+      operation: 'terminal.run',
+      params: prepared.params,
+      requestId: prepared.requestId,
+      issuedAt: prepared.issuedAt,
+      assertion: { credentialId: signed.id, authenticatorData: signed.response.authenticatorData, clientDataJSON: signed.response.clientDataJSON, signature: signed.response.signature, userHandle: signed.response.userHandle },
+    })
+    expect(sent.status).toBe(200)
+    const frame = requests.find(item => item.op === 'terminal.run')
+    const expires = frame?.grant.fullAccessExpiresAt ?? 0
+    const deadline = frame?.deadline ?? 0
+    expect(expires - started).toBeGreaterThanOrEqual(120_000 + 30_000 - 2_000)
+    expect(deadline - started).toBeGreaterThan(60_000)
+    expect(Math.abs(deadline - expires)).toBeLessThan(5_000)
+    host.socket?.close(1000, 'done')
+  })
 })

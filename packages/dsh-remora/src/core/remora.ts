@@ -49,7 +49,7 @@ import { FileWorkspaceCreationStore, workspaceCreationsSpec } from './workspace-
 import { FileRemoteScheduleStore, remoteSchedulesSpec } from './remote-schedules.ts'
 import { FileTaskStore } from './tasks.ts'
 import { readQuestionModes, switchToTimed, type QuestionModeReport } from './question-mode.ts'
-import { checkForUpdate, compareVersions, downloadVerified, installationResult, installVerifiedBundle, newInstallRequestId, updateReceiptSpec, UpdateError, type UpdateCheck, type UpdateInstallation, type UpdatePluginManager } from './updates.ts'
+import { checkForUpdate, compareVersions, downloadVerified, installationResult, installVerifiedBundle, newInstallRequestId, restoreInstallationResult, updateReceiptSpec, UpdateError, type UpdateCheck, type UpdateInstallation, type UpdatePluginManager } from './updates.ts'
 
 type GetFetch = (input: string, init?: { headers?: Record<string, string>; signal?: AbortSignal; redirect?: RequestRedirect }) => Promise<Response>
 
@@ -1184,8 +1184,10 @@ export class RemoraCore {
     let next = operation
     if (operation.phase === 'downloading') next = { ...operation, phase: 'failed', error: 'interrupted-before-install' }
     if (operation.phase === 'installing' || operation.phase === 'unknown') {
-      const result = operation.requestId && manager?.waitForInstall ? await manager.waitForInstall(operation.requestId) : null
-      next = result ? installationResult(result, operation) : { ...operation, phase: 'unknown' }
+      const trackingId = operation.restoreRequestId ?? operation.requestId
+      const result = trackingId && manager?.waitForInstall ? await manager.waitForInstall(trackingId) : null
+      if (operation.restoreRequestId) next = result ? await restoreInstallationResult(manager, result, operation) : { ...operation, phase: 'unknown' }
+      else next = result ? installationResult(result, operation) : { ...operation, phase: 'unknown' }
     }
     const bundle = manager ? (await manager.listBundles()).find(item => item.name === 'dsh-remora') : undefined
     // A lost result alone is never success. Confirm with both installed and executing versions.
@@ -1257,12 +1259,24 @@ export class RemoraCore {
         if (this.disposed) throw new RpcError('unloading')
         if (!finalBundle?.installed || finalBundle.readOnlyReason || finalBundle.source !== source) throw new UpdateError('read-only', 'bundle changed during receipt save')
         if (!finalBundle.version) throw new UpdateError('unknown-installed-version', 'cannot read installed version')
-        if (compareVersions(release.version, finalBundle.version) <= 0) throw new UpdateError('installed-version-current', 'candidate is not newer than installed bundle')
+        const previousVersion = finalBundle.version
+        if (compareVersions(release.version, previousVersion) <= 0) throw new UpdateError('installed-version-current', 'candidate is not newer than installed bundle')
         managerStarted = true
         // Do not consult `this.disposed` after this returns. On HMR, removal stops this plugin
         // before `removeBundle` resolves; the host manager still accepts the following install.
         if (typeof source !== 'string') throw new UpdateError('manual-source', 'update this installation from its original source')
-        const result = await installVerifiedBundle(manager, path, { enabled: finalBundle.enabled, requestId: this.updateInstallation.requestId! }, { spec: source, enabled: finalBundle.enabled })
+        const result = await installVerifiedBundle(manager, path, { enabled: finalBundle.enabled, requestId: this.updateInstallation.requestId! }, {
+          spec: source,
+          enabled: finalBundle.enabled,
+          version: previousVersion,
+          rememberRequest: async requestId => {
+            this.updateInstallation = { ...this.updateInstallation!, phase: 'installing', restoreRequestId: requestId, restoreVersion: previousVersion }
+            await this.updateReceipt.update(current => {
+              if (!current || current.requestId !== this.updateInstallation?.requestId) return current
+              return this.updateInstallation
+            })
+          },
+        })
         this.updateInstallation = installationResult(result, this.updateInstallation)
       } catch (error) {
         this.updateInstallation = {

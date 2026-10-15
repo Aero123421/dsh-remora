@@ -50,7 +50,7 @@ npm test
 
 `upstream.json` は `2fbf435`（0.2.1-alpha.3、2026-10-14）です。`peerDependencies` の `@deepseek-ai/dsh` は `>=0.2.1-alpha.2 <0.2.2-0` のままです。DSH は `semver.satisfies(runtime, range, { includePrerelease: true })` で見るので、0.2.1-alpha.3 と、それ以降の 0.2.1 プレリリース（`alpha.10`、`beta`、`rc` を含む）および 0.2.1 ではプラグインを読み飛ばしません。`0.2.2-alpha.1` 以降はこの範囲の外で、DSH は起動時に読み飛ばします。
 
-HMR のあるプロファイルでは、導入済みパッケージへの `installBundle` はファイルを変えずに `already-installed` で失敗します。自己更新はそのときだけ `removeBundle` してから、外す前のオン／オフで入れ直します。HMR がない取り外しが `stop-profile` のときは、入ったままのパッケージへ `installBundle` します。取り外しがそれ以外で失敗したときは入れ直しません。
+HMR のあるプロファイルでは、導入済みパッケージへの `installBundle` はファイルを変えずに `already-installed` で失敗します。自己更新はそのときだけ `removeBundle` してから、外す前のオン／オフで入れ直します。HMR がない取り外しが `stop-profile` で、パッケージが残っているときは、入ったままのパッケージへ `installBundle` します。取り外しが例外で終わったとき、`stop-profile` 以外の失敗で一覧から消えているとき、または外したあとの導入が失敗・中止・上書き・例外でプラグインが無いときは、前の版を入れ直します。一覧に残っている失敗はそのまま返し、一覧を読めないときは前の版を入れません。入れ直したと表示するのは、bundle 名・版・package の結果が前の版と一致するときだけです。入れ直しの request id は receipt に保存し、再起動後もその結果を追います。
 
 CI のジョブ `Adapter compat (latest DSH alpha)` は、`dsh-v*-alpha.*` で最も新しいタグのコミットに `DSH_UPSTREAM_COMMIT` を渡して `pnpm --filter dsh-remora test:compat` を実行します。ローカルの `test:compat` は `upstream.json` のコミットです。
 

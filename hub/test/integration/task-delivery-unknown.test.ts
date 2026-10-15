@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:workers'
 import { runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
-import type { ExecuteResult } from '../../src/host-do.ts'
+import { RECONCILE_MAX_ATTEMPTS, RECONCILE_PER_CONNECT, type ExecuteResult } from '../../src/host-do.ts'
 import { runOperation, type Caller } from '../../src/ops.ts'
 import type { TaskInfo } from '../../src/vendor/protocol/index.ts'
 import { FakeHost, eventually, setupOwner } from './helpers.ts'
@@ -92,6 +92,51 @@ describe('unconfirmed delivery', () => {
     const late = sentRow.delivery_id
     host.socket!.send(JSON.stringify({ t: 'response', id: late, ok: true, result: { taskId: sent.taskId, sessionId: 's', state: 'accepted', updatedAt: Date.now() } }))
     await eventually(async () => expect((await stub.summary()).recent.some(task => task.taskId === sent.taskId && task.state === 'completed')).toBe(true))
+    host.socket?.close(1000, 'done')
+  })
+
+  it('asks about a limited number of unconfirmed tasks and then stops', async () => {
+    const { host } = await setup()
+    const stub = hostObject(host.hostId)
+    await offline(host)
+    const total = RECONCILE_PER_CONNECT + 2
+    for (let index = 0; index < total; index++) {
+      resultOf<TaskInfo>(await runOperation(env, caller, 'task.start', startParams(host.hostId, `unconfirmed-${index}`)))
+    }
+    await runInDurableObject(stub, (_instance, state) => {
+      const rows = state.storage.sql.exec<{ task_id: string; frame: string }>('SELECT task_id, frame FROM tasks').toArray()
+      expect(rows).toHaveLength(total)
+      for (const row of rows) {
+        const frame = JSON.parse(row.frame) as Record<string, unknown>
+        frame.deliveryStarted = true
+        state.storage.sql.exec('UPDATE tasks SET frame = ?, expires_at = ? WHERE task_id = ?', JSON.stringify(frame), Date.now() - 1, row.task_id)
+      }
+    })
+    await runInDurableObject(stub, instance => instance.alarm())
+    const taskGets = () => host.frames.filter(frame => frame.t === 'request' && frame.op === 'task.get').length
+    await host.connect()
+    await host.next('ready')
+    await eventually(async () => expect(taskGets()).toBe(RECONCILE_PER_CONNECT))
+    await runInDurableObject(stub, (_instance, state) => {
+      const rows = state.storage.sql.exec<{ task_id: string; frame: string }>("SELECT task_id, frame FROM tasks WHERE state = 'parked'").toArray()
+      expect(rows.length).toBeGreaterThan(RECONCILE_PER_CONNECT)
+      rows.forEach((row, index) => {
+        const frame = JSON.parse(row.frame) as Record<string, unknown>
+        if (index % 2 === 0) frame.reconcileAttempts = RECONCILE_MAX_ATTEMPTS
+        else frame.reconcileUntil = Date.now() - 1
+        state.storage.sql.exec('UPDATE tasks SET frame = ? WHERE task_id = ?', JSON.stringify(frame), row.task_id)
+      })
+    })
+    const asked = taskGets()
+    await offline(host)
+    await host.connect()
+    await host.next('ready')
+    await eventually(async () => {
+      const rows = await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{ state: string; error: string | null }>('SELECT state, error FROM tasks').toArray())
+      expect(rows.every(row => row.state === 'failed')).toBe(true)
+      for (const row of rows) expect(String(row.error)).not.toContain('never delivered')
+    })
+    expect(taskGets()).toBe(asked)
     host.socket?.close(1000, 'done')
   })
 })

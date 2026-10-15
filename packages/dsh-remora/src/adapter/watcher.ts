@@ -26,6 +26,8 @@ export class Watcher {
   private readonly sent = new Map<string, string>()
   /** Sessions whose last event to the hub was an empty list. */
   private readonly cleared = new Set<string>()
+  /** Sessions whose startup read failed. The snapshot tells the hub to keep their rows. */
+  private readonly unread = new Set<string>()
   private readonly abort = new AbortController()
   private started = false
   private snapshot: Promise<void> | null = null
@@ -155,7 +157,26 @@ export class Watcher {
       const items = JSON.parse(json) as AttentionSnapshotEvent['sessions'][number]['items']
       if (Array.isArray(items) && items.length > 0) sessions.push({ sessionId, items })
     }
-    this.rt.deps.emit({ kind: 'attention-snapshot', sessions })
+    this.rt.deps.emit({
+      kind: 'attention-snapshot',
+      sessions,
+      ...(this.unread.size > 0 ? { unreadSessionIds: [...this.unread] } : {}),
+    })
+  }
+
+  /**
+   * A deleted, missing, or out-of-scope session drops its attention.
+   * A temporary read failure leaves the hub's current row in place.
+   */
+  private keepUnread(sessionId: string, error: unknown): void {
+    const code = error instanceof OperationError ? error.code : undefined
+    if (code === 'gone' || code === 'denied' || code === 'not_found') {
+      this.unread.delete(sessionId)
+      if (code === 'gone') void this.tasks.sessionGone(sessionId, error instanceof OperationError ? error.message : '')
+      this.clearAttention(sessionId)
+      return
+    }
+    this.unread.add(sessionId)
   }
 
   private clearAttention(sessionId: string): void {
@@ -172,16 +193,14 @@ export class Watcher {
       await this.rt.row(sessionId, signal)
       inspection = await this.rt.sessions.inspect(sessionId, signal)
     } catch (error) {
-      if (error instanceof OperationError && error.code === 'gone') await this.tasks.sessionGone(sessionId, error.message)
-      this.clearAttention(sessionId)
+      this.keepUnread(sessionId, error)
       return
     }
     const values = await this.rt.projections(sessionId, signal).catch(() => null)
     try {
       await this.rt.row(sessionId, signal)
     } catch (error) {
-      if (error instanceof OperationError && error.code === 'gone') await this.tasks.sessionGone(sessionId, error.message)
-      this.clearAttention(sessionId)
+      this.keepUnread(sessionId, error)
       return
     }
     const events = inspection.events
@@ -195,10 +214,10 @@ export class Watcher {
     try {
       await this.rt.row(sessionId, signal)
     } catch (error) {
-      if (error instanceof OperationError && error.code === 'gone') await this.tasks.sessionGone(sessionId, error.message)
-      this.clearAttention(sessionId)
+      this.keepUnread(sessionId, error)
       return
     }
+    this.unread.delete(sessionId)
     const items = this.rt.attention(sessionId, events, values).map(withoutDetail)
     const key = JSON.stringify(items)
     if (this.sent.get(sessionId) === key) return

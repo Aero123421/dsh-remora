@@ -67,7 +67,21 @@ export interface ExecuteCall {
 export type ExecuteResult = { ok: true; result: unknown } | { ok: false; error: RemoraError }
 type TaskQueryResult = { ok: true; result: TaskInfo } | { ok: false; error: RemoraError }
 /** Explicit false means never sent; absent on older records means unknown. */
-type ParkedCall = ExecuteCall & { deliveryStarted?: boolean }
+type ParkedCall = ExecuteCall & {
+  deliveryStarted?: boolean
+  /** How many times a reconnect has asked the host about this sent task. */
+  reconcileAttempts?: number
+  /** Epoch ms after which reconnects stop asking and record that the result is still unknown. */
+  reconcileUntil?: number
+}
+
+/** Unconfirmed tasks asked on one reconnect. The rest wait for a later connection. */
+const RECONCILE_PER_CONNECT = 8
+/** Reconnects stop asking after this many attempts. */
+export const RECONCILE_MAX_ATTEMPTS = 10
+/** Reconnects also stop asking this long after the task was marked unconfirmed. */
+export const RECONCILE_WINDOW_MS = 24 * 60 * 60_000
+export { RECONCILE_PER_CONNECT }
 
 export interface HostLive {
   hostId: string
@@ -506,13 +520,14 @@ export class HostDO extends DurableObject<Env> {
         return
       case 'attention-snapshot': {
         const listed = new Set<string>()
+        const unread = new Set((Array.isArray(event.unreadSessionIds) ? event.unreadSessionIds : []).filter((id): id is string => typeof id === 'string'))
         for (const session of Array.isArray(event.sessions) ? event.sessions : []) {
           if (!session || typeof session.sessionId !== 'string') continue
           listed.add(session.sessionId)
           this.storeAttention(session.sessionId, Array.isArray(session.items) ? session.items : [], pushes)
         }
         for (const row of this.sql.exec<{ session_id: string }>('SELECT session_id FROM attention').toArray()) {
-          if (!listed.has(row.session_id)) this.sql.exec('DELETE FROM attention WHERE session_id = ?', row.session_id)
+          if (!listed.has(row.session_id) && !unread.has(row.session_id)) this.sql.exec('DELETE FROM attention WHERE session_id = ?', row.session_id)
         }
         return
       }
@@ -607,6 +622,19 @@ export class HostDO extends DurableObject<Env> {
       deadline: Date.now() + timeoutMs,
     })
     return true
+  }
+
+  /**
+   * A confirmed `terminal.run` waits until the grant that authorized it expires.
+   * Other relays keep the short timeout.
+   */
+  private relayTimeout(call: ExecuteCall): number {
+    if (call.op !== 'terminal.run' || !call.confirmation) return RELAY_TIMEOUT_MS
+    const expires = call.grant.level === 'full' ? call.grant.fullAccessExpiresAt : undefined
+    if (typeof expires !== 'number' || !Number.isFinite(expires)) return RELAY_TIMEOUT_MS
+    const remaining = Math.ceil(expires - Date.now())
+    if (remaining <= RELAY_TIMEOUT_MS) return RELAY_TIMEOUT_MS
+    return Math.min(remaining, 600_000 + CONFIRMED_RUN_SLACK_MS)
   }
 
   /** Send a request and wait for its response. Null on timeout. */
@@ -782,7 +810,7 @@ export class HostDO extends DurableObject<Env> {
     if (OWNER_APPROVED_OPERATIONS.has(call.op)) return this.requestConfirmation(call)
     const ws = this.readySockets()[0]
     if (!ws) return { ok: false, error: err('host_offline', 'The DSH host is offline. Start DSH Web on that machine and try again.') }
-    const frame = await this.relay(ws, call.requestId ?? `r_${randomToken(12)}`, call, RELAY_TIMEOUT_MS)
+    const frame = await this.relay(ws, call.requestId ?? `r_${randomToken(12)}`, call, this.relayTimeout(call))
     if (!frame) return { ok: false, error: err('unavailable', 'The DSH host did not answer in time.') }
     if (frame.ok) return { ok: true, result: stampHostId(frame.result ?? null, this.hostId ?? '') }
     return { ok: false, error: this.explainRefusal(call, frame.error ?? err('internal', 'The host returned an error without details.')) }
@@ -1210,15 +1238,41 @@ export class HostDO extends DurableObject<Env> {
     if (current === null || current > at) await this.ctx.storage.setAlarm(at)
   }
 
+  /** Stop asking. The task may still have run on the host. */
+  private stopReconciling(taskId: string, now: number): boolean {
+    const changed = this.sql.exec(
+      "UPDATE tasks SET state = 'failed', params = NULL, frame = NULL, expires_at = NULL, updated_at = ?, error = ? WHERE task_id = ? AND state = 'parked'",
+      now,
+      JSON.stringify(err('unavailable', 'The hub stopped asking the host about this task. It may still have run. Check the machine before starting it again.')),
+      taskId,
+    ).rowsWritten
+    if (changed > 0) this.notify(taskId)
+    return changed > 0
+  }
+
   /**
    * Ask the host about tasks this hub already sent but whose result never arrived.
    * The prompt body is already gone, so this does not submit the task again.
+   * One reconnect asks at most `RECONCILE_PER_CONNECT` tasks. Attempts and `reconcileUntil` stop the rest.
    */
   private async reconcileUnconfirmed(ws: WebSocket): Promise<void> {
-    const rows = this.sql.exec<TaskRow>("SELECT * FROM tasks WHERE state = 'parked' AND delivered = 0 AND params IS NULL").toArray()
+    const now = Date.now()
+    const rows = this.sql.exec<TaskRow>("SELECT * FROM tasks WHERE state = 'parked' AND delivered = 0 AND params IS NULL ORDER BY updated_at").toArray()
+    const pushes: PushEvent[] = []
+    let queried = 0
     for (const row of rows) {
       const parked = parseJson<ParkedCall | null>(row.frame, null)
       if (!parked?.deliveryStarted) continue
+      const attempts = parked.reconcileAttempts ?? 0
+      const until = parked.reconcileUntil
+      if (attempts >= RECONCILE_MAX_ATTEMPTS || (until !== undefined && now >= until)) {
+        if (this.stopReconciling(row.task_id, now)) pushes.push(this.taskPush(row.task_id, 'failed'))
+        continue
+      }
+      if (queried >= RECONCILE_PER_CONNECT) continue
+      queried++
+      const next: ParkedCall = { ...parked, reconcileAttempts: attempts + 1, reconcileUntil: until ?? now + RECONCILE_WINDOW_MS }
+      this.sql.exec("UPDATE tasks SET frame = ?, updated_at = ? WHERE task_id = ? AND state = 'parked'", JSON.stringify(next), now, row.task_id)
       const frame = await this.relay(ws, `r_${randomToken(12)}`, {
         op: 'task.get', params: { taskId: row.task_id }, actor: parked.actor, scopes: parked.scopes, grant: parked.grant,
       }, RELAY_TIMEOUT_MS)
@@ -1226,23 +1280,20 @@ export class HostDO extends DurableObject<Env> {
         const error = frame?.error
         if (frame && (error?.code === 'gone' || error?.code === 'not_found')) {
           const recorded = err('gone', 'The host has no record of this task.')
-          const pushes: PushEvent[] = []
           await this.onEvent({ kind: 'task', taskId: row.task_id, state: 'failed', updatedAt: Date.now(), error: recorded }, pushes)
-          this.push(pushes)
         }
         continue
       }
       const fromHost = frame.result as Partial<TaskInfo> | null | undefined
       if (!fromHost || typeof fromHost !== 'object' || fromHost.taskId !== row.task_id || !isTaskState(fromHost.state)) continue
-      const pushes: PushEvent[] = []
       await this.onEvent({
         kind: 'task', taskId: row.task_id, state: fromHost.state,
         ...(typeof fromHost.sessionId === 'string' ? { sessionId: fromHost.sessionId } : {}),
         updatedAt: typeof fromHost.updatedAt === 'number' && Number.isFinite(fromHost.updatedAt) ? fromHost.updatedAt : Date.now(),
         ...(fromHost.error ? { error: fromHost.error } : {}),
       }, pushes)
-      this.push(pushes)
     }
+    this.push(pushes)
   }
 
   override async alarm(): Promise<void> {
@@ -1255,11 +1306,16 @@ export class HostDO extends DurableObject<Env> {
       if (!row || row.state !== 'parked') continue
       const parked = parseJson<ParkedCall | null>(row.frame, null)
       if (parked?.deliveryStarted === true) {
+        const kept: ParkedCall = {
+          ...parked,
+          reconcileAttempts: parked.reconcileAttempts ?? 0,
+          reconcileUntil: parked.reconcileUntil ?? now + RECONCILE_WINDOW_MS,
+        }
         this.sql.exec(
           "UPDATE tasks SET params = NULL, expires_at = NULL, updated_at = ?, error = ?, frame = ? WHERE task_id = ? AND state = 'parked'",
           now,
           JSON.stringify(err('unavailable', 'The hub sent this task but has not received the result. It may still be running. Query again after the host reconnects.')),
-          JSON.stringify(parked),
+          JSON.stringify(kept),
           task_id,
         )
       } else {

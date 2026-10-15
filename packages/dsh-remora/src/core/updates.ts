@@ -15,9 +15,12 @@
  * installs the new spec; a `stop-profile` removal (no HMR, bundle still running)
  * is followed by `installBundle` over the package that stayed installed.
  * `removeBundle` stops this plugin before it returns, so the follow-up install
- * uses only the host manager, which outlives the bundle. If that install fails
- * and the bundle is actually gone, the previous source is installed again
- * under a new request id. A failed restore is reported; it is not ignored.
+ * uses only the host manager, which outlives the bundle. If that install fails,
+ * is overridden, or removal throws or reports failure while the bundle is
+ * actually gone, the previous source is installed again under a new request id
+ * that is saved on the update receipt before the call. A failed restore is
+ * reported. "Previous version restored" is shown only after the bundle name,
+ * version and package result agree with that source.
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { join } from 'node:path'
@@ -79,14 +82,21 @@ function isAlreadyInstalled(result: BundleChangeResult): boolean {
 export interface PreviousBundle {
   spec: string
   enabled: boolean
+  /** Manifest version that was installed, checked before a restore is reported. */
+  version: string
+  /**
+   * Persist `requestId` before the restore install starts. Removal can stop this
+   * process; the next start follows this id instead of the failed new install.
+   */
+  rememberRequest?: (requestId: PluginInstallRequestId) => Promise<void>
 }
 
 function failedInstall(code: string): BundleChangeResult {
   return { changed: false, application: 'failed', stage: 'install', target: REMORA_BUNDLE, error: { code } } as BundleChangeResult
 }
 
-function withError(result: BundleChangeResult, code: string): BundleChangeResult {
-  return { ...result, application: 'failed', error: { code } } as BundleChangeResult
+function withError(result: BundleChangeResult, code: string, extra?: Pick<BundleChangeResult, 'bundle' | 'version'>): BundleChangeResult {
+  return { ...result, ...extra, application: 'failed', error: { code } } as BundleChangeResult
 }
 
 /** `true` installed, `false` absent, `null` when the list could not be read. */
@@ -99,38 +109,99 @@ async function bundlePresent(manager: UpdatePluginManager): Promise<boolean | nu
   }
 }
 
+function packageAgrees(result: BundleChangeResult): boolean {
+  if (result.packageResult && result.packageResult.exitCode !== 0) return false
+  if (result.error && resultCode(result) !== 'already-installed') return false
+  return true
+}
+
+/** The result itself names this bundle at `previous.version`, and the package run did not fail. */
+function identityAgrees(result: BundleChangeResult, previous: PreviousBundle): boolean {
+  return result.bundle === REMORA_BUNDLE && result.version === previous.version && packageAgrees(result)
+}
+
+async function previousListed(manager: UpdatePluginManager | null, previous: PreviousBundle): Promise<boolean | null> {
+  if (!manager) return null
+  try {
+    const rows = await manager.listBundles()
+    return rows.some(row => row.name === REMORA_BUNDLE && row.installed && row.version === previous.version)
+  } catch {
+    return null
+  }
+}
+
+export type RestoreCode = 'previous-restored' | 'restore-failed' | 'presence-unknown'
+
 /**
- * Put `previous` back when the new install failed or was cancelled and the bundle is gone.
+ * `previous-restored` only after the bundle name, version and package result match
+ * `previous`, or the bundle list shows that version when the result omits those fields.
+ */
+export async function classifyRestore(manager: UpdatePluginManager | null, restored: BundleChangeResult, previous: PreviousBundle): Promise<RestoreCode> {
+  const settled = restored.application === 'applied' || restored.application === 'restart-required' || resultCode(restored) === 'already-installed'
+  if (!settled || !packageAgrees(restored)) return 'restore-failed'
+  if (restored.bundle !== undefined && restored.bundle !== REMORA_BUNDLE) return 'restore-failed'
+  if (restored.version !== undefined && restored.version !== previous.version) return 'restore-failed'
+  if (identityAgrees(restored, previous)) return 'previous-restored'
+  const listed = await previousListed(manager, previous)
+  if (listed === true) return 'previous-restored'
+  if (listed === null) return 'presence-unknown'
+  return 'restore-failed'
+}
+
+function reportedRestore(installed: BundleChangeResult, previous: PreviousBundle, code: RestoreCode): BundleChangeResult {
+  if (code !== 'previous-restored') return withError(installed, code)
+  return withError(installed, code, { bundle: REMORA_BUNDLE, version: previous.version })
+}
+
+/**
+ * Put `previous` back when the new install failed, was cancelled, or was overridden, and the bundle is gone.
  * `already-installed` means the new install did not remove anything. A list failure does not
- * install the old spec: the new one may still be present. Restore uses a new request id.
+ * install the old spec: the new one may still be present. The restore request id is saved first.
  */
 async function restoreIfMissing(manager: UpdatePluginManager, installed: BundleChangeResult, previous: PreviousBundle | undefined): Promise<BundleChangeResult> {
-  if (!previous?.spec || (installed.application !== 'failed' && installed.application !== 'cancelled') || resultCode(installed) === 'already-installed') return installed
+  const missing = installed.application === 'failed' || installed.application === 'cancelled' || installed.application === 'overridden'
+  if (!previous?.spec || !missing || resultCode(installed) === 'already-installed') return installed
   const present = await bundlePresent(manager)
   if (present === null) return withError(installed, 'presence-unknown')
   if (present) return installed
+  const requestId = newInstallRequestId()
+  try {
+    await previous.rememberRequest?.(requestId)
+  } catch {
+    // The receipt may not mention this id after a restart. The install still runs, or the bundle stays absent.
+  }
   let restored: BundleChangeResult
   try {
-    restored = await manager.installBundle(previous.spec, { enabled: previous.enabled, requestId: newInstallRequestId() })
+    restored = await manager.installBundle(previous.spec, { enabled: previous.enabled, requestId })
   } catch {
     return withError(installed, 'restore-failed')
   }
-  const back = restored.application === 'applied' || restored.application === 'restart-required' || resultCode(restored) === 'already-installed'
-  return withError(installed, back ? 'previous-restored' : 'restore-failed')
+  return reportedRestore(installed, previous, await classifyRestore(manager, restored, previous))
 }
 
 /**
  * Install `spec`, removing `dsh-remora` first when DSH answers `already-installed`.
  * The second `installBundle` runs even if removal unloaded the caller: only `manager` is used after that.
- * A failed or cancelled removal, other than `stop-profile`, is returned unchanged and is not followed by another install.
- * When `previous` is set and the install after removal fails with the bundle absent, that source is installed again.
+ * A removal that throws, or that fails other than `stop-profile` while the bundle is gone, restores `previous`.
+ * A removal that fails and leaves the bundle in place is returned unchanged.
+ * When the install after removal fails, is overridden, or throws, and the bundle is absent, `previous` is installed again.
  */
 export async function installVerifiedBundle(manager: UpdatePluginManager, spec: string, options: InstallBundleOptions, previous?: PreviousBundle): Promise<BundleChangeResult> {
   const installed = await manager.installBundle(spec, options)
   if (!isAlreadyInstalled(installed) || typeof manager.removeBundle !== 'function') return installed
-  const removed = await manager.removeBundle(REMORA_BUNDLE)
+  let removed: BundleChangeResult
+  try {
+    removed = await manager.removeBundle(REMORA_BUNDLE)
+  } catch {
+    return restoreIfMissing(manager, failedInstall('install-failed'), previous)
+  }
   if (removed.application === 'cancelled') return removed
-  if (removed.application === 'failed' && resultCode(removed) !== 'stop-profile') return removed
+  if (removed.application === 'failed' && resultCode(removed) !== 'stop-profile') {
+    const present = await bundlePresent(manager)
+    if (present === false) return restoreIfMissing(manager, failedInstall('install-failed'), previous)
+    if (present === null) return withError(removed, 'presence-unknown')
+    return removed
+  }
   try {
     return await restoreIfMissing(manager, await manager.installBundle(spec, options), previous)
   } catch {
@@ -147,6 +218,10 @@ export interface UpdateInstallation {
   installedVersion?: string
   stage?: BundleChangeResult['stage']
   error?: string
+  /** Request id of a restore install that started after the new version failed. */
+  restoreRequestId?: PluginInstallRequestId
+  /** Version the restore is putting back. */
+  restoreVersion?: string
 }
 
 /** Only the non-secret operation receipt survives self-disposal and DSH restart. */
@@ -164,6 +239,14 @@ export const updateReceiptSpec: DocumentSpec<UpdateInstallation | null> = {
     if (typeof value.installedVersion === 'string' && parseVersion(value.installedVersion)) result.installedVersion = value.installedVersion
     if (value.stage === 'install' || value.stage === 'enable' || value.stage === 'remove') result.stage = value.stage
     if (typeof value.error === 'string') result.error = value.error.slice(0, 200)
+    if (value.restoreRequestId !== undefined) {
+      if (typeof value.restoreRequestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.restoreRequestId)) throw new Error('invalid update receipt')
+      result.restoreRequestId = value.restoreRequestId as PluginInstallRequestId
+    }
+    if (value.restoreVersion !== undefined) {
+      if (typeof value.restoreVersion !== 'string' || !parseVersion(value.restoreVersion)) throw new Error('invalid update receipt')
+      result.restoreVersion = value.restoreVersion
+    }
     return result
   },
 }
@@ -184,6 +267,16 @@ export function installationResult(result: BundleChangeResult, operation: Update
     state.phase = 'failed'
     state.error = 'invalid-result'
   }
+  return state
+}
+
+/** A restart follows `restoreRequestId`. The candidate version stays `operation.version`. */
+export async function restoreInstallationResult(manager: UpdatePluginManager | null, result: BundleChangeResult, operation: UpdateInstallation): Promise<UpdateInstallation> {
+  if (!operation.restoreVersion) return { ...operation, phase: 'unknown' }
+  const previous: PreviousBundle = { spec: '', enabled: true, version: operation.restoreVersion }
+  const code = await classifyRestore(manager, result, previous)
+  const state: UpdateInstallation = { ...operation, phase: 'failed', stage: result.stage, error: code }
+  if (code === 'previous-restored') state.installedVersion = operation.restoreVersion
   return state
 }
 

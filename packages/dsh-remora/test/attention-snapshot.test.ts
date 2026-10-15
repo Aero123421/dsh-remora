@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import type { AttentionSnapshotEvent } from '@dsh-remora/protocol'
+import type { AttentionEvent, AttentionSnapshotEvent } from '@dsh-remora/protocol'
 import { buildAdapter } from '../src/adapter/index.ts'
+import { OperationError } from '../src/ops/types.ts'
 import { createFake, harness } from './fake-dsh.ts'
 
 const wakes = (dsh: ReturnType<typeof createFake>) => dsh.calls.filter(call => call.method === 'wake' || call.method === 'resolveAgent').length
@@ -44,4 +45,52 @@ test('plugin start republishes open questions, including a subagent, without wak
   await restarted.watcher.idle()
   assert.equal(h.events.filter(event => event.kind === 'attention-snapshot').length, 2)
   restarted.dispose()
+})
+
+test('a temporary read failure during startup keeps that session unread', async () => {
+  const dsh = createFake()
+  dsh.addWorkspace('ws-a', '/work/a')
+  dsh.addSession('healthy', { workspace: 'ws-a' })
+  dsh.addSession('flaky', { workspace: 'ws-a' })
+  question(dsh, 'healthy', 'q-healthy', 'Still open?')
+  question(dsh, 'flaky', 'q-flaky', 'Read failed?')
+  const original = dsh.sessionController.inspect.bind(dsh.sessionController)
+  dsh.sessionController.inspect = async (id: string) => {
+    if (id === 'flaky') throw new Error('temporary')
+    return original(id)
+  }
+  const h = harness(dsh, { workspaces: ['ws-a'] })
+  const adapter = buildAdapter(dsh.ctx(), h.deps)
+  adapter.start()
+  await adapter.watcher.idle()
+  const snapshots = h.events.filter((event): event is AttentionSnapshotEvent => event.kind === 'attention-snapshot')
+  assert.equal(snapshots.length, 1)
+  assert.deepEqual(snapshots[0]!.sessions.map(session => session.sessionId), ['healthy'])
+  assert.ok(snapshots[0]!.unreadSessionIds?.includes('flaky'))
+  const cleared = h.events.filter((event): event is AttentionEvent => event.kind === 'attention' && event.sessionId === 'flaky' && event.items.length === 0)
+  assert.equal(cleared.length, 0)
+  assert.equal(wakes(dsh), 0)
+  adapter.dispose()
+})
+
+test('a session that is gone during startup still clears its attention', async () => {
+  const dsh = createFake()
+  dsh.addWorkspace('ws-a', '/work/a')
+  dsh.addSession('healthy', { workspace: 'ws-a' })
+  dsh.addSession('missing', { workspace: 'ws-a' })
+  question(dsh, 'healthy', 'q-healthy', 'Still open?')
+  question(dsh, 'missing', 'q-missing', 'Deleted?')
+  const original = dsh.sessionController.inspect.bind(dsh.sessionController)
+  dsh.sessionController.inspect = async (id: string) => {
+    if (id === 'missing') throw new OperationError('gone', 'session missing was deleted')
+    return original(id)
+  }
+  const h = harness(dsh, { workspaces: ['ws-a'] })
+  const adapter = buildAdapter(dsh.ctx(), h.deps)
+  adapter.start()
+  await adapter.watcher.idle()
+  const snapshots = h.events.filter((event): event is AttentionSnapshotEvent => event.kind === 'attention-snapshot')
+  assert.equal(snapshots[0]!.unreadSessionIds, undefined)
+  assert.equal(h.events.some(event => event.kind === 'attention' && event.sessionId === 'missing' && event.items.length === 0), true)
+  adapter.dispose()
 })

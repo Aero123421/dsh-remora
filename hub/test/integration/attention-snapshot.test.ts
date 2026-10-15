@@ -34,4 +34,26 @@ describe('attention snapshot', () => {
     if (status.ok) expect((status.result as StatusResult).attention.map(entry => entry.sessionId)).toEqual(['s'])
     host.socket?.close(1000, 'done')
   })
+
+  it('keeps attention for sessions the snapshot could not read', async () => {
+    const owner = await setupOwner()
+    const host = await FakeHost.create()
+    await host.pair(owner)
+    await host.connect()
+    await host.next('ready')
+    const stub = env.HOST.get(env.HOST.idFromName(host.hostId))
+    host.sendEvent([
+      { kind: 'attention', sessionId: 's', items: [item('s', 'a', 'Keep')] },
+      { kind: 'attention', sessionId: 't', items: [item('t', 'b', 'Unread')] },
+      { kind: 'attention', sessionId: 'u', items: [item('u', 'c', 'Drop')] },
+    ])
+    await eventually(async () => expect((await stub.summary()).attention.map(entry => entry.sessionId).sort()).toEqual(['s', 't', 'u']))
+    host.sendEvent([{
+      kind: 'attention-snapshot',
+      sessions: [{ sessionId: 's', items: [item('s', 'a', 'Keep')] }],
+      unreadSessionIds: ['t', 12],
+    }])
+    await eventually(async () => expect((await stub.summary()).attention.map(entry => entry.sessionId).sort()).toEqual(['s', 't']))
+    host.socket?.close(1000, 'done')
+  })
 })
