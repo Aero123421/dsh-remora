@@ -1276,6 +1276,7 @@ export class RemoraCore {
               return this.updateInstallation
             })
           },
+          log: error => { this.ctx.logger.warn('Remora: could not save the restore request id', error) },
         })
         this.updateInstallation = installationResult(result, this.updateInstallation)
       } catch (error) {

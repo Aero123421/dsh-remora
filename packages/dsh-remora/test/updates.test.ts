@@ -70,7 +70,7 @@ test('a newer release is found and its tarball is verified against SHA256SUMS', 
   assert.equal(expectedHash(`${sha}  dsh-remora-0.2.0.tgz`, 'dsh-remora-0.2.0.tgz'), sha)
   const t = await tempDir()
   try {
-    const path = await downloadVerified(check.latest!, t.dir, github(`${sha}  dsh-remora-0.2.0.tgz\n`))
+    const path = await downloadVerified(check.latest!, t.dir, github(`${sha}  dsh-remora-0.2.0.tgz\n`), '0.2.1-alpha.2')
     assert.deepEqual(new Uint8Array(await readFile(path)), tarball)
     await assert.rejects(downloadVerified(check.latest!, t.dir, github(`${'0'.repeat(64)}  dsh-remora-0.2.0.tgz\n`)), (error: unknown) => error instanceof UpdateError && error.code === 'checksum-mismatch')
     await assert.rejects(downloadVerified(check.latest!, t.dir, github('')), (error: unknown) => error instanceof UpdateError && error.code === 'no-checksum')
@@ -508,7 +508,7 @@ test('asset redirects only accept GitHub asset delivery hosts', async () => {
       requests.push(url)
       if (url.startsWith('https://github.com/')) return new Response(null, { status: 302, headers: { location: `https://release-assets.githubusercontent.com/${url.split('/').at(-1)}` } })
       return base(url)
-    })
+    }, '0.2.1-alpha.2')
     assert.deepEqual(new Uint8Array(await readFile(path)), tarball)
     assert.equal(requests.length, 4)
   } finally { await temp.cleanup() }
@@ -640,6 +640,89 @@ test('a changed release is rejected before any download or install', async () =>
   } finally { await h.cleanup() }
 })
 
+test('a cancelled removal restores the previous source only when the plugin is gone', async t => {
+  for (const label of ['absent', 'still listed', 'list unreadable'] as const) await t.test(label, async () => {
+    let removed = false
+    const specs: string[] = []
+    const h = await updateCore({
+      listBundles: async () => {
+        if (label === 'list unreadable' && removed) throw new Error('list failed')
+        return removed && label === 'absent' ? [] : [installedBundle]
+      },
+      installBundle: async (spec) => {
+        specs.push(spec)
+        if (specs.length === 1) return alreadyInstalled()
+        return { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2' }
+      },
+      removeBundle: async () => {
+        removed = true
+        return { changed: false, application: 'cancelled', stage: 'remove', target: 'dsh-remora' }
+      },
+    })
+    try {
+      const result = await h.core.installUpdate(true, '0.2.0')
+      if (label === 'absent') {
+        assert.equal(specs.length, 2)
+        assert.equal(specs[1], installedBundle.source)
+        assert.equal(result.phase, 'failed')
+        assert.equal(result.error, 'previous-restored')
+        assert.equal(result.installedVersion, '0.1.2')
+      } else if (label === 'still listed') {
+        assert.equal(specs.length, 1)
+        assert.equal(result.phase, 'cancelled')
+        assert.equal(result.error, undefined)
+      } else {
+        assert.equal(specs.length, 1)
+        assert.equal(result.phase, 'failed')
+        assert.equal(result.error, 'presence-unknown')
+      }
+    } finally { await h.cleanup() }
+  })
+})
+
+test('a failed restore receipt save is logged and kept on the update', async () => {
+  let removed = false
+  const specs: string[] = []
+  const h = await updateCore({
+    listBundles: async () => removed ? [] : [installedBundle],
+    installBundle: async (spec) => {
+      specs.push(spec)
+      if (specs.length === 1) return alreadyInstalled()
+      if (specs.length === 2) return { changed: false, application: 'failed', stage: 'install', target: 'dsh-remora', error: { code: 'operation-error' } }
+      return { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2' }
+    },
+    removeBundle: async () => {
+      removed = true
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+  })
+  const receipt: StoredDocument<UpdateInstallation | null> = Reflect.get(h.core, 'updateReceipt')
+  const save = receipt.update.bind(receipt)
+  let blocked = 0
+  receipt.update = async change => {
+    const next = change(receipt.value)
+    if (next?.restoreRequestId && next.phase === 'installing') {
+      blocked++
+      throw new Error('receipt write failed')
+    }
+    return save(change)
+  }
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(blocked, 1)
+    assert.equal(specs.length, 3)
+    assert.equal(specs[2], installedBundle.source)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'restore-receipt-failed')
+    assert.equal(result.installedVersion, '0.1.2')
+    assert.ok(h.host.warnings.some(entry => String(entry[0]).includes('could not save the restore request id')))
+    const raw = JSON.parse(await readFile(join(h.core.dataDir, '.dsh-remora-updates', 'update-receipt.json'), 'utf8')) as { data: UpdateInstallation }
+    assert.equal(raw.data.error, 'restore-receipt-failed')
+    assert.equal(raw.data.installedVersion, '0.1.2')
+    assert.equal(typeof raw.data.restoreRequestId, 'string')
+  } finally { receipt.update = save; await h.cleanup() }
+})
+
 test('candidate peers are checked against prerelease DSH and unknown compatibility blocks install', async () => {
   const base = github('')
   for (const runtime of ['0.2.1-alpha.2', '0.2.2', null]) {
@@ -650,6 +733,52 @@ test('candidate peers are checked against prerelease DSH and unknown compatibili
   assert.equal(missing.error, 'compatibility-unknown')
   const mismatched = await checkForUpdate('0.1.0', async url => url.startsWith('https://raw.') ? Response.json({ name: 'dsh-remora', version: '9.0.0' }) : base(url), 123, '0.2.1-alpha.2')
   assert.equal(mismatched.error, 'invalid-manifest')
+  const omittedRuntime = await checkForUpdate('0.1.0', base, 123)
+  assert.equal(omittedRuntime.newer, true)
+  assert.equal(omittedRuntime.installUnavailable, 'compatibility-unknown')
+  assert.equal((await checkForUpdate('0.1.0', base, 123, 'not-a-version')).installUnavailable, 'compatibility-unknown')
+})
+
+test('unbounded DSH peer ranges are refused, and a 0.2 ceiling is accepted', async () => {
+  const runtime = '0.2.1-alpha.2'
+  const refused = ['*', 'x', '>=0', '', '<99', '^0', '<0.3.0-0', '>=0.2.1-alpha.2', '>=0.2.1 <0.4.0', '>=0.2.1-alpha.2 <0.3.0']
+  for (const peer of refused) {
+    const fetchImpl = async (url: string) => {
+      if (url.startsWith('https://raw.githubusercontent.com/')) return Response.json({ name: 'dsh-remora', version: '0.2.0', dsh: { bundle: { patch: './cordis.patch.yml' } }, peerDependencies: { '@deepseek-ai/dsh': peer } })
+      return github('')(url)
+    }
+    const result = await checkForUpdate('0.1.0', fetchImpl, 123, runtime)
+    assert.equal(result.installUnavailable, 'compatibility-unknown', peer)
+  }
+  const accepted = ['>=0.2.1-alpha.2 <0.2.2-0', '>=0.2.1-alpha.2 <0.3.0-0', '^0.2.1']
+  for (const peer of accepted) {
+    const fetchImpl = async (url: string) => {
+      if (url.startsWith('https://raw.githubusercontent.com/')) return Response.json({ name: 'dsh-remora', version: '0.2.0', dsh: { bundle: { patch: './cordis.patch.yml' } }, peerDependencies: { '@deepseek-ai/dsh': peer } })
+      return github('')(url)
+    }
+    assert.equal((await checkForUpdate('0.1.0', fetchImpl, 123, '0.2.1-alpha.3')).installUnavailable, undefined, peer)
+  }
+  const temp = await tempDir()
+  try {
+    const sums = `${sha}  dsh-remora-0.2.0.tgz\n`
+    const release = (await checkForUpdate('0.1.0', github(sums), 123, runtime)).latest!
+    const base = github(sums)
+    await assert.rejects(downloadVerified(release, temp.dir, base), (error: unknown) => error instanceof UpdateError && error.code === 'compatibility-unknown')
+    await assert.rejects(downloadVerified(release, temp.dir, base, null), (error: unknown) => error instanceof UpdateError && error.code === 'compatibility-unknown')
+    await assert.rejects(downloadVerified(release, temp.dir, base, '0.2.2'), (error: unknown) => error instanceof UpdateError && error.code === 'incompatible-dsh')
+    for (const peer of refused) {
+      const archive = packageArchive({ peerDependencies: { '@deepseek-ai/dsh': peer } })
+      const digest = createHash('sha256').update(archive).digest('hex')
+      const fetchImpl = async (url: string) => url.endsWith('.tgz') ? new Response(archive) : github(`${digest}  dsh-remora-0.2.0.tgz\n`)(url)
+      const ranged = (await checkForUpdate('0.1.0', github(`${digest}  dsh-remora-0.2.0.tgz\n`), 123, runtime)).latest!
+      await assert.rejects(downloadVerified(ranged, temp.dir, fetchImpl, runtime), (error: unknown) => error instanceof UpdateError && error.code === 'compatibility-unknown', peer)
+    }
+    const ceiling = packageArchive({ peerDependencies: { '@deepseek-ai/dsh': '>=0.2.1-alpha.2 <0.3.0-0' } })
+    const ceilingDigest = createHash('sha256').update(ceiling).digest('hex')
+    const ceilingFetch = async (url: string) => url.endsWith('.tgz') ? new Response(ceiling) : github(`${ceilingDigest}  dsh-remora-0.2.0.tgz\n`)(url)
+    const ceilingRelease = (await checkForUpdate('0.1.0', github(`${ceilingDigest}  dsh-remora-0.2.0.tgz\n`), 123, runtime)).latest!
+    assert.equal(typeof await downloadVerified(ceilingRelease, temp.dir, ceilingFetch, '0.2.1-alpha.3'), 'string')
+  } finally { await temp.cleanup() }
 })
 
 test('local release tarballs are updateable; directory links and custom archives stay manual', async () => {
@@ -699,7 +828,7 @@ test('timeouts and symlinked update storage fail before installer handoff', asyn
   try {
     await assert.rejects(downloadVerified(release, temp.dir, async () => { throw new DOMException('timed out', 'TimeoutError') }), { name: 'TimeoutError' })
     await symlink(outside.dir, join(temp.dir, 'updates'), 'dir')
-    await assert.rejects(downloadVerified(release, temp.dir, base), (e: unknown) => e instanceof UpdateError && e.code === 'unsafe-storage')
+    await assert.rejects(downloadVerified(release, temp.dir, base, '0.2.1-alpha.2'), (e: unknown) => e instanceof UpdateError && e.code === 'unsafe-storage')
   } finally { await temp.cleanup(); await outside.cleanup() }
 })
 

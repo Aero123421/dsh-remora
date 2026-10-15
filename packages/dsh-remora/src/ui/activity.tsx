@@ -8,7 +8,7 @@ import { QuestionModeTags } from './question-mode.tsx'
 
 const OUTCOME_TONE = { ok: 'success', error: 'warning', denied: 'danger' } as const
 
-const INSTALL_OUTCOMES = new Set(['previous-restored', 'restore-failed', 'presence-unknown'])
+const INSTALL_OUTCOMES = new Set(['previous-restored', 'restore-failed', 'presence-unknown', 'restore-receipt-failed'])
 
 function installCopyKey(installation: UpdateInstallation): CopyKey {
   if (installation.error && INSTALL_OUTCOMES.has(installation.error)) return `compat.install.${installation.error}` as CopyKey
