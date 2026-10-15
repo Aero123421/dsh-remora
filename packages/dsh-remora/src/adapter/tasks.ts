@@ -59,6 +59,8 @@ export class Tasks {
   /** Tasks whose prompt call is in flight: evaluation must not judge them yet. */
   private readonly inflight = new Set<string>()
   private readonly waiters = new Map<string, Set<() => void>>()
+  /** Serializes the moment a task gains a session and the cancel that must see that write. */
+  private readonly lanes = new Map<string, Promise<void>>()
 
   constructor(rt: Runtime) {
     this.rt = rt
@@ -120,12 +122,24 @@ export class Tasks {
     for (const waiters of this.waiters.values()) for (const wake of waiters) wake()
   }
 
+  /** One task at a time. A later caller waits even when the earlier one failed. */
+  private lane<T>(taskId: string, run: () => Promise<T>): Promise<T> {
+    const previous = this.lanes.get(taskId) ?? Promise.resolve()
+    const current = previous.then(run, run)
+    const done = current.then(() => undefined, () => undefined)
+    this.lanes.set(taskId, done)
+    void done.then(() => { if (this.lanes.get(taskId) === done) this.lanes.delete(taskId) })
+    return current
+  }
+
   private async save(record: TaskRecord, state: TaskState, error?: RemoraError): Promise<TaskRecord> {
     if (record.state === state && error === undefined) return record
     const next: TaskRecord = { ...record, state, updatedAt: Date.now() }
     if (error) next.error = error
     else delete next.error
     await this.rt.deps.tasks.put(next)
+    const stored = this.rt.deps.tasks.get(next.taskId)
+    if (!stored || stored.state !== next.state || stored.updatedAt !== next.updatedAt) return stored ?? record
     this.rt.deps.emit({
       kind: 'task',
       taskId: next.taskId,
@@ -344,6 +358,9 @@ export class Tasks {
   }
 
   private async deliver(record: TaskRecord, text: string, mode: 'queue' | 'steer', context: OperationContext): Promise<TaskRecord> {
+    const current = this.rt.deps.tasks.get(record.taskId) ?? record
+    if (TERMINAL_TASK_STATES.has(current.state)) return current
+    record = current
     const sessionId = record.sessionId!
     const row = await this.rt.row(sessionId, context.signal)
     this.rt.assertSession(row, context, true)
@@ -422,23 +439,46 @@ export class Tasks {
       const sessionId = sessionIdFor(record.requestId)
       this.rt.assertWorkspace(create.workspace, context, true)
       if (create.agentPreset !== undefined && !this.rt.deps.scope.isAllowedAgentPreset(create.agentPreset)) throw denied(`agent preset "${create.agentPreset}" is not allowed for remote use`)
+      // Session creation stays outside the lane so cancel can finish while it is in flight.
+      // The created session is left in place if cancel wins; another operation may use it.
       try {
         await this.rt.sessions.create({ workspaceId: create.workspace.id, sessionId, ...(create.agentPreset !== undefined ? { agentPreset: create.agentPreset } : {}) })
       } catch (error) {
         const failure = fromDsh(error, 'creating the session failed')
-        await this.save(record, 'failed', { code: failure.code, message: failure.message })
+        const stored = await this.lane(taskId, async () => {
+          const current = this.rt.deps.tasks.get(taskId) ?? record
+          if (TERMINAL_TASK_STATES.has(current.state)) return current
+          return this.save(current, 'failed', { code: failure.code, message: failure.message })
+        })
+        if (TERMINAL_TASK_STATES.has(stored.state)) return this.finish(stored, context)
         throw failure
       }
-      this.rt.wokenByRemora.add(sessionId)
-      this.rt.markSeen(sessionId)
-      record = { ...record, sessionId, updatedAt: Date.now() }
-      await this.rt.deps.tasks.put(record)
-      if (create.title !== undefined) {
-        this.rt.assertSession(await this.rt.row(sessionId, context.signal), context)
-        await this.rt.sessions.rename({ sessionId, title: create.title }).catch((error: unknown) => {
-          this.rt.deps.logger.warn('Remora: could not title the new session', error)
-        })
-      }
+      let settled = record
+      await this.lane(taskId, async () => {
+        const current = this.rt.deps.tasks.get(taskId) ?? record
+        if (TERMINAL_TASK_STATES.has(current.state)) {
+          settled = current
+          return
+        }
+        const next = { ...current, sessionId, updatedAt: Date.now() }
+        await this.rt.deps.tasks.put(next)
+        const stored = this.rt.deps.tasks.get(taskId) ?? next
+        if (TERMINAL_TASK_STATES.has(stored.state) || stored.sessionId !== sessionId) {
+          settled = stored
+          return
+        }
+        this.rt.wokenByRemora.add(sessionId)
+        this.rt.markSeen(sessionId)
+        settled = stored
+        if (create.title !== undefined) {
+          this.rt.assertSession(await this.rt.row(sessionId, context.signal), context)
+          await this.rt.sessions.rename({ sessionId, title: create.title }).catch((error: unknown) => {
+            this.rt.deps.logger.warn('Remora: could not title the new session', error)
+          })
+        }
+        await this.deliver(settled, text, 'queue', context)
+      })
+      return this.finish(settled, context)
     }
     await this.deliver(record, text, 'queue', context)
     return this.finish(record, context)
@@ -532,11 +572,19 @@ export class Tasks {
   }
 
   async cancel(params: Params<'task.cancel'>, context: OperationContext): Promise<Result<'task.cancel'>> {
-    let record = this.own(params.taskId, context, true)
+    const record = this.own(params.taskId, context, true)
+    if (!await this.checkRequestScope(record, context)) return { cancelled: false, how: 'already-finished' }
+    if (TERMINAL_TASK_STATES.has(record.state)) return { cancelled: false, how: 'already-finished' }
+    return this.lane(record.taskId, () => this.cancelLocked(record, context))
+  }
+
+  private async cancelLocked(initial: TaskRecord, context: OperationContext): Promise<Result<'task.cancel'>> {
+    let record = this.rt.deps.tasks.get(initial.taskId) ?? initial
     if (!await this.checkRequestScope(record, context)) return { cancelled: false, how: 'already-finished' }
     if (TERMINAL_TASK_STATES.has(record.state)) return { cancelled: false, how: 'already-finished' }
     if (!record.sessionId) {
-      await this.save(record, 'cancelled')
+      const stored = await this.save(record, 'cancelled')
+      if (stored.state !== 'cancelled') return { cancelled: false, how: 'already-finished' }
       return { cancelled: true, how: 'removed-from-queue' }
     }
     const sessionId = record.sessionId

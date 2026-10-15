@@ -13,6 +13,12 @@ export const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../
 const repoRoot = resolve(packageRoot, '../..')
 export const cacheRoot = join(packageRoot, '.cache')
 export const pinned = JSON.parse(await readFile(join(repoRoot, 'upstream.json'), 'utf8'))
+const override = process.env.DSH_UPSTREAM_COMMIT?.trim()
+if (override !== undefined && override !== '' && !/^[0-9a-f]{40}$/i.test(override)) {
+  throw new Error('DSH_UPSTREAM_COMMIT must be a 40-character commit sha')
+}
+/** Pin from upstream.json, unless DSH_UPSTREAM_COMMIT names another full sha. */
+export const upstreamCommit = override && override !== '' ? override.toLowerCase() : pinned.commit
 export const upstreamRoot = process.env.DSH_UPSTREAM_DIR ? resolve(process.env.DSH_UPSTREAM_DIR) : join(cacheRoot, 'upstream')
 
 function git(args) {
@@ -26,12 +32,12 @@ export async function ensureUpstream() {
     await access(marker)
     if (process.env.DSH_UPSTREAM_DIR) return
     const head = spawnSync('git', ['-C', upstreamRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim()
-    if (head === pinned.commit) return
+    if (head === upstreamCommit) return
   } catch {}
   if (process.env.DSH_UPSTREAM_DIR) throw new Error(`DSH_UPSTREAM_DIR=${upstreamRoot} has no DSH source`)
   await mkdir(upstreamRoot, { recursive: true })
   git(['init', '-q', upstreamRoot])
-  git(['-C', upstreamRoot, 'fetch', '-q', '--depth=1', pinned.repository, pinned.commit])
+  git(['-C', upstreamRoot, 'fetch', '-q', '--depth=1', pinned.repository, upstreamCommit])
   git(['-C', upstreamRoot, 'checkout', '-q', '--detach', 'FETCH_HEAD'])
 }
 

@@ -114,6 +114,80 @@ for (const change of ['stop', 'permission', 'credential'] as const) {
   })
 }
 
+test('a finished terminal command says so when the grant expired during the run', async () => {
+  const entered = gate(), resume = gate()
+  const f = fixture({ 'terminal.run': async () => {
+    entered.release(); await resume.promise
+    return { exitCode: 0, signal: null, timedOut: false, stdout: 'done', stderr: '', truncated: false, durationMs: 65_000, untrusted: true }
+  } })
+  const key = makePasskey('ed25519')
+  f.state.pinned = { hubOrigin: 'https://hub.example', hostId: 'host', rpId: 'hub.example', owner: [key.credential], publicKey: 'host-key', pairedAt: 0 }
+  const request = f.frame('terminal.run', { cwdWorkspaceId: 'w1', command: 'sleep 65', timeoutMs: 120_000 })
+  request.grant = { level: 'full', fullAccessExpiresAt: f.state.now + 60_000 }
+  request.deadline = f.state.now + 180_000
+  request.confirmation = await makeConfirmation(key, {
+    hubOrigin: 'https://hub.example', hostId: 'host', rpId: 'hub.example',
+    requestId: request.id, operation: request.op, params: request.params, issuedAt: f.state.now,
+  })
+  const pending = f.dispatcher.handle(request)
+  await entered.promise
+  f.state.now += 65_000
+  resume.release()
+  await pending
+  assert.equal(f.responses[0]?.ok, false)
+  assert.equal(f.responses[0]?.error?.denial?.reason, 'full-access-expired')
+  assert.match(f.responses[0]?.error?.message ?? '', /already finished/)
+  assert.doesNotMatch(f.responses[0]?.error?.message ?? '', /never/i)
+})
+
+test('a terminal command whose grant covers the timeout still returns the result', async () => {
+  const entered = gate(), resume = gate()
+  const f = fixture({ 'terminal.run': async () => {
+    entered.release(); await resume.promise
+    return { exitCode: 0, signal: null, timedOut: false, stdout: 'done', stderr: '', truncated: false, durationMs: 65_000, untrusted: true }
+  } })
+  const key = makePasskey('ed25519')
+  f.state.pinned = { hubOrigin: 'https://hub.example', hostId: 'host', rpId: 'hub.example', owner: [key.credential], publicKey: 'host-key', pairedAt: 0 }
+  const request = f.frame('terminal.run', { cwdWorkspaceId: 'w1', command: 'sleep 65', timeoutMs: 120_000 })
+  request.grant = { level: 'full', fullAccessExpiresAt: f.state.now + 120_000 + 30_000 }
+  request.deadline = f.state.now + 180_000
+  request.confirmation = await makeConfirmation(key, {
+    hubOrigin: 'https://hub.example', hostId: 'host', rpId: 'hub.example',
+    requestId: request.id, operation: request.op, params: request.params, issuedAt: f.state.now,
+  })
+  const pending = f.dispatcher.handle(request)
+  await entered.promise
+  f.state.now += 65_000
+  resume.release()
+  await pending
+  assert.equal(f.responses[0]?.ok, true)
+  assert.equal((f.responses[0]?.result as { stdout?: string } | undefined)?.stdout, 'done')
+})
+
+test('a kill switch after the command finished still names the command as finished', async () => {
+  const entered = gate(), resume = gate()
+  const f = fixture({ 'terminal.run': async () => {
+    entered.release(); await resume.promise
+    return { exitCode: 0, signal: null, timedOut: false, stdout: 'done', stderr: '', truncated: false, durationMs: 1, untrusted: true }
+  } })
+  const key = makePasskey('ed25519')
+  f.state.pinned = { hubOrigin: 'https://hub.example', hostId: 'host', rpId: 'hub.example', owner: [key.credential], publicKey: 'host-key', pairedAt: 0 }
+  const request = f.frame('terminal.run', { cwdWorkspaceId: 'w1', command: 'true', timeoutMs: 60_000 })
+  request.deadline = f.state.now + 180_000
+  request.confirmation = await makeConfirmation(key, {
+    hubOrigin: 'https://hub.example', hostId: 'host', rpId: 'hub.example',
+    requestId: request.id, operation: request.op, params: request.params, issuedAt: f.state.now,
+  })
+  const pending = f.dispatcher.handle(request)
+  await entered.promise
+  f.state.stopped = true
+  resume.release()
+  await pending
+  assert.equal(f.responses[0]?.ok, false)
+  assert.equal(f.responses[0]?.error?.denial?.reason, 'kill-switch')
+  assert.match(f.responses[0]?.error?.message ?? '', /already finished/)
+})
+
 test('requiring passkeys again prevents an unconfirmed approval after an async wait', async () => {
   const entered = gate(), resume = gate()
   let answered = false

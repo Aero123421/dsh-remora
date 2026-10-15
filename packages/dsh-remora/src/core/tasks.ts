@@ -40,6 +40,8 @@ export class FileTaskStore implements TaskStore {
   async put(record: TaskRecord): Promise<void> {
     const copy: TaskRecord = { ...record }
     await this.document.update(current => {
+      const previous = current.tasks.find(item => item.taskId === copy.taskId)
+      if (previous && !canReplaceTask(previous.state, copy.state)) return current
       const tasks = current.tasks.filter(item => item.taskId !== copy.taskId)
       tasks.push(copy)
       return { tasks: prune(tasks, this.now()) }
@@ -47,6 +49,19 @@ export class FileTaskStore implements TaskStore {
     this.index.clear()
     for (const item of this.document.value.tasks) this.index.set(item.taskId, item)
   }
+}
+
+/**
+ * A cancelled task stays cancelled. A completed task stays completed.
+ * `failed` may return to `accepted` for a retry that DSH has not accepted yet.
+ * No other terminal state becomes a non-terminal one.
+ */
+export function canReplaceTask(previous: TaskRecord['state'], next: TaskRecord['state']): boolean {
+  if (previous === next) return true
+  if (previous === 'cancelled' || previous === 'completed') return false
+  if (previous === 'failed') return next === 'accepted'
+  if (TERMINAL_TASK_STATES.has(previous) && !TERMINAL_TASK_STATES.has(next)) return false
+  return true
 }
 
 /** Forget finished tasks after the retention period, and the oldest finished ones beyond the limit. */

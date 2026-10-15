@@ -41,10 +41,20 @@ npm test
 - TypeScript は型を消すだけで動く書き方に限ります（`erasableSyntaxOnly`）。テストは Node が `.ts` をそのまま読みます。
 - 操作を追加するときは `packages/protocol/src/operations.ts` に足し、`packages/dsh-remora/src/features.ts` に必要な DSH サービスを書きます。中核ツールの名前と説明文は変えません。
 - プラグインのデータは `$DSH_HOME/storages/dsh-remora/` の JSON（スキーマ版数つき、tmp → rename で原子的に書く）、ホスト鍵は `ctx.credentials`（無ければ `host-key.json`、どちらも平文・0600）に置きます。
-- 設定 RPC で権限や範囲を広げる変更は、ソケット接続元と Host・Origin がループバックの場合だけ受け付けます（`src/routes.ts` の `isLocalRequest`）。狭める変更と緊急停止はどこからでも可。
+- 設定 RPC で権限や範囲を広げる変更は、ソケット接続元と Host・Origin がループバックの場合だけ受け付けます（`src/routes.ts` の `isLocalRequest`）。転送ヘッダーはローカル扱いにせず、Host だけではローカルになりません。狭める変更と緊急停止はどこからでも可。根拠は [architecture.md](architecture.md) の権限の節です。
 - ハブへの WebSocket がプロキシを通るのは、DSH を `NODE_USE_ENV_PROXY=1` で起動したときだけです（Node 22.21 以上。Node 22.22 で確認）。
 - 質問・プランの確認・承認への外からの回答は `src/adapter/answerer.ts` が DSH の waterfall に入って受け付けます。`timed` モードの質問は `userQuestions.answer` で答えます。承認はパスキー確認が既定で、DSH 側のスイッチで MCP・CLI からも許可できます。
 - `packages/protocol` や `assets/` のロゴを変えたら `pnpm vendor:sync` を実行し、`hub/` 側のコピーも一緒にコミットします。
+
+## DSH 0.2.1-alpha.3
+
+`upstream.json` は `2fbf435`（0.2.1-alpha.3、2026-10-14）です。`peerDependencies` の `@deepseek-ai/dsh` は `>=0.2.1-alpha.2 <0.2.2-0` のままです。DSH は `semver.satisfies(runtime, range, { includePrerelease: true })` で見るので、0.2.1-alpha.3 と、それ以降の 0.2.1 プレリリース（`alpha.10`、`beta`、`rc` を含む）および 0.2.1 ではプラグインを読み飛ばしません。`0.2.2-alpha.1` 以降はこの範囲の外で、DSH は起動時に読み飛ばします。
+
+HMR のあるプロファイルでは、導入済みパッケージへの `installBundle` はファイルを変えずに `already-installed` で失敗します。自己更新はそのときだけ `removeBundle` してから、外す前のオン／オフで入れ直します。HMR がない取り外しが `stop-profile` で、パッケージが残っているときは、入ったままのパッケージへ `installBundle` します。取り外しが例外で終わったとき、取り外しが `cancelled` で一覧から消えているとき、`stop-profile` 以外の失敗で一覧から消えているとき、または外したあとの導入が失敗・中止・上書き・例外でプラグインが無いときは、前の版を入れ直します。一覧に残っている失敗と取消はそのまま返し、一覧を読めないときは前の版を入れません。入れ直したと表示するのは、bundle 名・版・package の結果が前の版と一致するときだけです。入れ直しの request id は receipt に保存し、再起動後もその結果を追います。その保存が失敗したときはログに残し、更新状態を `restore-receipt-failed` にします。前の版の導入自体は続けます。
+
+候補の `peerDependencies` の `@deepseek-ai/dsh` は、下限と、`0.3.0-0` を含まない上限が両方ある範囲だけ導入できます。`*`、`x`、`>=0`、空文字、`<99`、`^0` は互換性不明として拒否します。`>=0.2.1-alpha.2 <0.3.0-0` と、それより狭い `>=0.2.1-alpha.2 <0.2.2-0` は範囲として受けます。実行中の DSH の版が取れないときも確認を省かず、導入しません。このプラグイン自身の peer は `>=0.2.1-alpha.2 <0.2.2-0` のままです。
+
+CI のジョブ `Adapter compat (latest DSH alpha)` は、`dsh-v*-alpha.*` で最も新しいタグのコミットに `DSH_UPSTREAM_COMMIT` を渡して `pnpm --filter dsh-remora test:compat` を実行します。ローカルの `test:compat` は `upstream.json` のコミットです。
 
 ## v0.1.2 の追加検証（2026-10-13）
 

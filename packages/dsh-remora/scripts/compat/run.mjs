@@ -4,14 +4,14 @@
 //
 //   pnpm --filter dsh-remora test:compat
 //
-// DSH_UPSTREAM_DIR=<checkout> skips the git fetch and uses a local checkout
-// (it must be the pinned commit).
+// DSH_UPSTREAM_COMMIT=<40-hex sha> fetches that commit instead of upstream.json.
+// DSH_UPSTREAM_DIR=<checkout> skips the git fetch and uses a local checkout.
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { cacheRoot, compileOfficial, ensureUpstream, packageRoot, pinned } from './upstream.mjs'
+import { cacheRoot, compileOfficial, ensureUpstream, packageRoot, pinned, upstreamCommit, upstreamRoot } from './upstream.mjs'
 
 await ensureUpstream()
 const bundle = join(cacheRoot, 'compat-host.mjs')
@@ -98,8 +98,8 @@ async function boot() {
   await ctx.plugin(dsh.ApprovalService, { policy: 'ask' })
   await ctx.plugin(dsh.SubprocessLocal, {})
   // Host services the Session Controller injects but the compat run does not exercise
-  // (same stand-ins as DSH's own session-controller test harness).
-  ctx.provide('typert', { lookups: { configure: () => () => {} }, contexts: { configureHost: () => () => {} } })
+  // (same stand-ins as DSH's own session-controller test harness). `typert` is the real
+  // registry, mounted below, because session list/search register a resource on it.
   ctx.provide('agentDefaultModel', { currentSelection: () => ({ provider: 'mock', model: 'mock' }), saveSelection: async () => {} })
   ctx.provide('attachments', {
     imageLimits: { maxImageBytes: 1, maxImagesPerMessage: 1, maxMessageImageBytes: 1, maxImagePixels: 1, maxImageDimension: 1, mediaTypes: ['image/png'] },
@@ -113,9 +113,14 @@ async function boot() {
   })
   ctx.provide('fs', {})
   await ctx.plugin(dsh.CompatSessionQuery)
+  // alpha.3: session list and search filter rows through remoteAccess.allows().
+  // TypertRegistry provides that service's resource registry. An in-process call has no
+  // Remote invocation, so allows() admits every session; the adapter's own scope still applies.
+  await ctx.plugin(dsh.TypertRegistry)
+  await ctx.plugin(dsh.RemoteAccess)
   await ctx.plugin(dsh.SessionController, {})
   await ctx.plugin(dsh.ScheduleService, {})
-  for (const name of ['sessionController', 'workspaceRegistry', 'agents', 'userQuestions', 'sessionQuery', 'sessionTitle', 'approval', 'schedule', 'subprocess']) {
+  for (const name of ['sessionController', 'workspaceRegistry', 'agents', 'userQuestions', 'sessionQuery', 'sessionTitle', 'approval', 'schedule', 'subprocess', 'typert', 'remoteAccess']) {
     assert.ok(ctx.get(name) !== undefined, `${name} is mounted`)
   }
 
@@ -183,7 +188,15 @@ const taskStates = taskId => emitted.filter(e => e.kind === 'task' && e.taskId =
 const userMessages = sessionId => ctx.sessions.get(sessionId)?.snapshotEvents().filter(e => e.type === 'user/message').length ?? 0
 
 let sessionId
-console.log(`DSH ${pinned.version} (${pinned.commit.slice(0, 7)}): Remora adapter compat`)
+let runningVersion = pinned.version
+try {
+  runningVersion = JSON.parse(await readFile(join(upstreamRoot, 'apps/cli/package.json'), 'utf8')).version ?? runningVersion
+} catch { /* the pin label remains */ }
+console.log(`DSH ${runningVersion} (${upstreamCommit.slice(0, 7)}): Remora adapter compat`)
+
+await step('remote access admits an in-process session read', async () => {
+  assert.equal(ctx.get('remoteAccess').allows({ kind: 'session', id: 'compat-session' }), true)
+})
 
 await step('task.start (new session in a workspace) → real session.create + session.prompt, write-ahead record', async () => {
   const info = await h['task.start']({ target: { new: { workspaceId: workspace.id, title: 'Compat session' } }, prompt: 'hello there', idempotencyKey: 'k1' }, context('t1'))

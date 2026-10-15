@@ -1,6 +1,6 @@
 {
   "name": "dsh-remora",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Remora: drive your DSH sessions from ChatGPT, Claude, a CLI or an HTTP API through your own Cloudflare hub. Unofficial.",
   "type": "module",
   "license": "MIT",
@@ -72,6 +72,7 @@
     "@types/ws": "8.18.1",
     "clsx": "2.1.1",
     "mime-types": "3.0.2",
+    "p-limit": "7.3.3",
     "qrcode-generator": "1.5.2",
     "semver": "7.7.4",
     "undici": "8.11.2",

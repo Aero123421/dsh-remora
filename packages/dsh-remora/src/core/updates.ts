@@ -8,10 +8,30 @@
  * plugin manager (`pluginManager.installBundle(<absolute path>)`) — the same
  * path as Plugins → Add plugin with a local file. When that service is not
  * available the tab shows the manual steps instead.
+ *
+ * With HMR, DSH 0.2.1-alpha.3 refuses `installBundle` of a package the profile
+ * already depends on (`application: 'failed'`, `error.code: 'already-installed'`,
+ * no profile file changed). The Plugins page then calls `removeBundle` and
+ * installs the new spec; a `stop-profile` removal (no HMR, bundle still running)
+ * is followed by `installBundle` over the package that stayed installed.
+ * `removeBundle` stops this plugin before it returns, so the follow-up install
+ * uses only the host manager, which outlives the bundle. If that install fails,
+ * is overridden, or removal throws, is cancelled, or reports failure while the
+ * bundle is actually gone, the previous source is installed again under a new
+ * request id that is saved on the update receipt before the call. A failed
+ * receipt save is logged and kept on the update state; the previous source is
+ * still installed. A failed restore is reported. "Previous version restored"
+ * is shown only after the bundle name, version and package result agree with
+ * that source.
+ *
+ * A candidate `@deepseek-ai/dsh` range must have a lower bound and an upper
+ * bound that excludes `0.3.0-0` (the first version outside the 0.2 series).
+ * `*`, `x`, `>=0`, an empty range, `<99` and `^0` are refused. When the running
+ * DSH version cannot be read, the candidate is not installed.
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { join } from 'node:path'
-import { satisfies, valid, validRange } from 'semver'
+import { Range, satisfies, valid, validRange } from 'semver'
 import { lstat, mkdir, mkdtemp } from 'node:fs/promises'
 import { gunzipSync } from 'node:zlib'
 import { writeAtomic, asObject, type DocumentSpec } from './storage.ts'
@@ -41,7 +61,7 @@ export interface UpdateCheck {
   restartRequired?: boolean
 }
 
-/** The subset of DSH 0.2.1-alpha.2's direct Host service used for self-updates. */
+/** The subset of the DSH host plugin manager used for self-updates (0.2.1-alpha.2 and alpha.3). */
 import type { BundleInfo, ChangeResult, InstallBundleOptions, PluginInstallRequestId } from '@deepseek-ai/dsh-plugin-manager/types'
 export type { PluginInstallRequestId } from '@deepseek-ai/dsh-plugin-manager/types'
 export type BundleChangeResult = ChangeResult
@@ -49,7 +69,157 @@ export function newInstallRequestId(): PluginInstallRequestId { return randomUUI
 export interface UpdatePluginManager {
   listBundles(): Promise<Pick<BundleInfo, 'name' | 'enabled' | 'installed' | 'readOnlyReason' | 'version' | 'source'>[]>
   installBundle(spec: string, options: InstallBundleOptions): Promise<ChangeResult>
+  /** Present on the DSH host service. Optional so a manager that cannot remove still reports `already-installed`. */
+  removeBundle?(name: string): Promise<ChangeResult>
   waitForInstall?(requestId: PluginInstallRequestId): Promise<ChangeResult | null>
+}
+
+const REMORA_BUNDLE = 'dsh-remora'
+
+function resultCode(result: BundleChangeResult): string | undefined {
+  return result.error?.code
+}
+
+/** HMR refused to install over the package, and did not change the profile files. */
+function isAlreadyInstalled(result: BundleChangeResult): boolean {
+  return result.application === 'failed' && result.changed === false && resultCode(result) === 'already-installed'
+}
+
+/** The bundle that was installed before removal, used only to put that version back. */
+export interface PreviousBundle {
+  spec: string
+  enabled: boolean
+  /** Manifest version that was installed, checked before a restore is reported. */
+  version: string
+  /**
+   * Persist `requestId` before the restore install starts. Removal can stop this
+   * process; the next start follows this id instead of the failed new install.
+   */
+  rememberRequest?: (requestId: PluginInstallRequestId) => Promise<void>
+  /** Records a restore-receipt save that threw. The previous source is still installed. */
+  log?: (error: unknown) => void
+}
+
+function failedInstall(code: string): BundleChangeResult {
+  return { changed: false, application: 'failed', stage: 'install', target: REMORA_BUNDLE, error: { code } } as BundleChangeResult
+}
+
+function withError(result: BundleChangeResult, code: string, extra?: Pick<BundleChangeResult, 'bundle' | 'version'>): BundleChangeResult {
+  return { ...result, ...extra, application: 'failed', error: { code } } as BundleChangeResult
+}
+
+/** `true` installed, `false` absent, `null` when the list could not be read. */
+async function bundlePresent(manager: UpdatePluginManager): Promise<boolean | null> {
+  try {
+    const rows = await manager.listBundles()
+    return rows.some(row => row.name === REMORA_BUNDLE && row.installed)
+  } catch {
+    return null
+  }
+}
+
+function packageAgrees(result: BundleChangeResult): boolean {
+  if (result.packageResult && result.packageResult.exitCode !== 0) return false
+  if (result.error && resultCode(result) !== 'already-installed') return false
+  return true
+}
+
+/** The result itself names this bundle at `previous.version`, and the package run did not fail. */
+function identityAgrees(result: BundleChangeResult, previous: PreviousBundle): boolean {
+  return result.bundle === REMORA_BUNDLE && result.version === previous.version && packageAgrees(result)
+}
+
+async function previousListed(manager: UpdatePluginManager | null, previous: PreviousBundle): Promise<boolean | null> {
+  if (!manager) return null
+  try {
+    const rows = await manager.listBundles()
+    return rows.some(row => row.name === REMORA_BUNDLE && row.installed && row.version === previous.version)
+  } catch {
+    return null
+  }
+}
+
+export type RestoreCode = 'previous-restored' | 'restore-failed' | 'presence-unknown'
+
+/**
+ * `previous-restored` only after the bundle name, version and package result match
+ * `previous`, or the bundle list shows that version when the result omits those fields.
+ */
+export async function classifyRestore(manager: UpdatePluginManager | null, restored: BundleChangeResult, previous: PreviousBundle): Promise<RestoreCode> {
+  const settled = restored.application === 'applied' || restored.application === 'restart-required' || resultCode(restored) === 'already-installed'
+  if (!settled || !packageAgrees(restored)) return 'restore-failed'
+  if (restored.bundle !== undefined && restored.bundle !== REMORA_BUNDLE) return 'restore-failed'
+  if (restored.version !== undefined && restored.version !== previous.version) return 'restore-failed'
+  if (identityAgrees(restored, previous)) return 'previous-restored'
+  const listed = await previousListed(manager, previous)
+  if (listed === true) return 'previous-restored'
+  if (listed === null) return 'presence-unknown'
+  return 'restore-failed'
+}
+
+function reportedRestore(installed: BundleChangeResult, previous: PreviousBundle, code: RestoreCode): BundleChangeResult {
+  if (code !== 'previous-restored') return withError(installed, code)
+  return withError(installed, code, { bundle: REMORA_BUNDLE, version: previous.version })
+}
+
+/**
+ * Put `previous` back when the new install failed, was cancelled, or was overridden, and the bundle is gone.
+ * `already-installed` means the new install did not remove anything. A list failure does not
+ * install the old spec: the new one may still be present. The restore request id is saved first.
+ * A thrown save is logged and returned as `restore-receipt-failed` when the previous source is back.
+ */
+async function restoreIfMissing(manager: UpdatePluginManager, installed: BundleChangeResult, previous: PreviousBundle | undefined): Promise<BundleChangeResult> {
+  const missing = installed.application === 'failed' || installed.application === 'cancelled' || installed.application === 'overridden'
+  if (!previous?.spec || !missing || resultCode(installed) === 'already-installed') return installed
+  const present = await bundlePresent(manager)
+  if (present === null) return withError(installed, 'presence-unknown')
+  if (present) return installed
+  const requestId = newInstallRequestId()
+  let receiptFailed = false
+  try {
+    await previous.rememberRequest?.(requestId)
+  } catch (error) {
+    receiptFailed = true
+    previous.log?.(error)
+  }
+  let restored: BundleChangeResult
+  try {
+    restored = await manager.installBundle(previous.spec, { enabled: previous.enabled, requestId })
+  } catch {
+    return withError(installed, 'restore-failed')
+  }
+  const code = await classifyRestore(manager, restored, previous)
+  if (receiptFailed && code === 'previous-restored') return withError(installed, 'restore-receipt-failed', { bundle: REMORA_BUNDLE, version: previous.version })
+  return reportedRestore(installed, previous, code)
+}
+
+/**
+ * Install `spec`, removing `dsh-remora` first when DSH answers `already-installed`.
+ * The second `installBundle` runs even if removal unloaded the caller: only `manager` is used after that.
+ * A removal that throws, is cancelled, or fails other than `stop-profile` while the bundle is gone, restores `previous`.
+ * A removal that leaves the bundle in place is returned unchanged.
+ * When the install after removal fails, is overridden, or throws, and the bundle is absent, `previous` is installed again.
+ */
+export async function installVerifiedBundle(manager: UpdatePluginManager, spec: string, options: InstallBundleOptions, previous?: PreviousBundle): Promise<BundleChangeResult> {
+  const installed = await manager.installBundle(spec, options)
+  if (!isAlreadyInstalled(installed) || typeof manager.removeBundle !== 'function') return installed
+  let removed: BundleChangeResult
+  try {
+    removed = await manager.removeBundle(REMORA_BUNDLE)
+  } catch {
+    return restoreIfMissing(manager, failedInstall('install-failed'), previous)
+  }
+  if (removed.application === 'cancelled' || (removed.application === 'failed' && resultCode(removed) !== 'stop-profile')) {
+    const present = await bundlePresent(manager)
+    if (present === false) return restoreIfMissing(manager, removed.application === 'cancelled' ? removed : failedInstall('install-failed'), previous)
+    if (present === null) return withError(removed, 'presence-unknown')
+    return removed
+  }
+  try {
+    return await restoreIfMissing(manager, await manager.installBundle(spec, options), previous)
+  } catch {
+    return restoreIfMissing(manager, failedInstall('install-failed'), previous)
+  }
 }
 
 export interface UpdateInstallation {
@@ -61,6 +231,10 @@ export interface UpdateInstallation {
   installedVersion?: string
   stage?: BundleChangeResult['stage']
   error?: string
+  /** Request id of a restore install that started after the new version failed. */
+  restoreRequestId?: PluginInstallRequestId
+  /** Version the restore is putting back. */
+  restoreVersion?: string
 }
 
 /** Only the non-secret operation receipt survives self-disposal and DSH restart. */
@@ -78,6 +252,14 @@ export const updateReceiptSpec: DocumentSpec<UpdateInstallation | null> = {
     if (typeof value.installedVersion === 'string' && parseVersion(value.installedVersion)) result.installedVersion = value.installedVersion
     if (value.stage === 'install' || value.stage === 'enable' || value.stage === 'remove') result.stage = value.stage
     if (typeof value.error === 'string') result.error = value.error.slice(0, 200)
+    if (value.restoreRequestId !== undefined) {
+      if (typeof value.restoreRequestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.restoreRequestId)) throw new Error('invalid update receipt')
+      result.restoreRequestId = value.restoreRequestId as PluginInstallRequestId
+    }
+    if (value.restoreVersion !== undefined) {
+      if (typeof value.restoreVersion !== 'string' || !parseVersion(value.restoreVersion)) throw new Error('invalid update receipt')
+      result.restoreVersion = value.restoreVersion
+    }
     return result
   },
 }
@@ -91,13 +273,23 @@ export function installationResult(result: BundleChangeResult, operation: Update
   if (successful && (result.error || (result.packageResult && result.packageResult.exitCode !== 0))) {
     state.phase = 'failed'
     state.error ??= result.packageResult?.kind ?? 'package-failed'
-  } else if (successful && (result.bundle !== 'dsh-remora' || result.version !== operation.version)) {
+  } else if (successful && (result.bundle !== REMORA_BUNDLE || result.version !== operation.version)) {
     state.phase = 'failed'
     state.error = 'installed-version-mismatch'
   } else if (!['applied', 'restart-required', 'overridden', 'failed', 'cancelled'].includes(result.application)) {
     state.phase = 'failed'
     state.error = 'invalid-result'
   }
+  return state
+}
+
+/** A restart follows `restoreRequestId`. The candidate version stays `operation.version`. */
+export async function restoreInstallationResult(manager: UpdatePluginManager | null, result: BundleChangeResult, operation: UpdateInstallation): Promise<UpdateInstallation> {
+  if (!operation.restoreVersion) return { ...operation, phase: 'unknown' }
+  const previous: PreviousBundle = { spec: '', enabled: true, version: operation.restoreVersion }
+  const code = await classifyRestore(manager, result, previous)
+  const state: UpdateInstallation = { ...operation, phase: 'failed', stage: result.stage, error: code }
+  if (code === 'previous-restored') state.installedVersion = operation.restoreVersion
   return state
 }
 
@@ -143,6 +335,34 @@ export function compareVersions(a: string, b: string): number {
   return 0
 }
 
+/** First version outside the 0.2 series. A candidate peer must not admit it. */
+const DSH_SERIES_CEILING = '0.3.0-0'
+
+/**
+ * True when every alternative has a lower bound and an upper bound that stays
+ * inside the 0.2 series. `*`, `x`, `>=0`, `''`, `<99` and `^0` are not bounded.
+ */
+function peerRangeBounded(range: string): boolean {
+  if (range.trim() === '' || validRange(range) === null) return false
+  let parsed: Range
+  try { parsed = new Range(range, { includePrerelease: true }) } catch { return false }
+  if (parsed.set.length === 0) return false
+  for (const comparators of parsed.set) {
+    const hasLower = comparators.some(item => item.operator === '>' || item.operator === '>=')
+    const hasUpper = comparators.some(item => item.operator === '<' || item.operator === '<=')
+    if (!hasLower || !hasUpper) return false
+  }
+  return !satisfies('0.0.0', range, { includePrerelease: true }) && !satisfies(DSH_SERIES_CEILING, range, { includePrerelease: true })
+}
+
+/** `null` when this DSH can install the candidate. A missing runtime is unknown, not skipped. */
+function peerBlock(range: unknown, runtimeVersion: string | null | undefined): 'compatibility-unknown' | 'incompatible-dsh' | null {
+  if (typeof range !== 'string' || !peerRangeBounded(range)) return 'compatibility-unknown'
+  if (typeof runtimeVersion !== 'string' || !valid(runtimeVersion)) return 'compatibility-unknown'
+  if (!satisfies(runtimeVersion, range, { includePrerelease: true })) return 'incompatible-dsh'
+  return null
+}
+
 export async function checkForUpdate(current: string, fetchImpl: FetchLike = fetch, now = Date.now(), runtimeVersion?: string | null): Promise<UpdateCheck> {
   try {
     if (!parseVersion(current)) throw new UpdateError('invalid-version', 'invalid current version')
@@ -185,22 +405,19 @@ export async function checkForUpdate(current: string, fetchImpl: FetchLike = fet
     }
     const check: UpdateCheck = { current, checkedAt: now, latest, newer: compareVersions(version, current) > 0 }
     if (!tarball || !sums) check.installUnavailable = 'no-assets'
-    if (runtimeVersion !== undefined) {
-      const manifestResponse = await fetchImpl(`https://raw.githubusercontent.com/${RELEASES_REPO}/${encodeURIComponent(body.tag_name)}/packages/dsh-remora/package.json`, {
-        signal: AbortSignal.timeout(15_000), redirect: 'error',
-      })
-      if (!manifestResponse.ok) throw new UpdateError('compatibility-unknown', 'candidate manifest is unavailable')
-      const manifest: unknown = JSON.parse(new TextDecoder().decode(await readLimited(manifestResponse, 64 * 1024)))
-      if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) throw new UpdateError('invalid-manifest', 'candidate manifest is malformed')
-      const record = asObject(manifest, 'candidate manifest')
-      if (record.name !== 'dsh-remora' || record.version !== version || !record.dsh || typeof record.dsh !== 'object' || !('bundle' in record.dsh)) {
-        throw new UpdateError('invalid-manifest', 'candidate manifest does not describe this bundle')
-      }
-      const peers = record.peerDependencies && typeof record.peerDependencies === 'object' && !Array.isArray(record.peerDependencies) ? asObject(record.peerDependencies, 'candidate peers') : {}
-      const range = peers['@deepseek-ai/dsh']
-      if (typeof range !== 'string' || !validRange(range) || !runtimeVersion || !valid(runtimeVersion)) check.installUnavailable = 'compatibility-unknown'
-      else if (!satisfies(runtimeVersion, range, { includePrerelease: true })) check.installUnavailable = 'incompatible-dsh'
+    const manifestResponse = await fetchImpl(`https://raw.githubusercontent.com/${RELEASES_REPO}/${encodeURIComponent(body.tag_name)}/packages/dsh-remora/package.json`, {
+      signal: AbortSignal.timeout(15_000), redirect: 'error',
+    })
+    if (!manifestResponse.ok) throw new UpdateError('compatibility-unknown', 'candidate manifest is unavailable')
+    const manifest: unknown = JSON.parse(new TextDecoder().decode(await readLimited(manifestResponse, 64 * 1024)))
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) throw new UpdateError('invalid-manifest', 'candidate manifest is malformed')
+    const record = asObject(manifest, 'candidate manifest')
+    if (record.name !== 'dsh-remora' || record.version !== version || !record.dsh || typeof record.dsh !== 'object' || !('bundle' in record.dsh)) {
+      throw new UpdateError('invalid-manifest', 'candidate manifest does not describe this bundle')
     }
+    const peers = record.peerDependencies && typeof record.peerDependencies === 'object' && !Array.isArray(record.peerDependencies) ? asObject(record.peerDependencies, 'candidate peers') : {}
+    const block = peerBlock(peers['@deepseek-ai/dsh'], runtimeVersion)
+    if (block) check.installUnavailable = block
     return check
   } catch (error) {
     return { current, checkedAt: now, latest: null, newer: false, error: error instanceof UpdateError ? error.code : error instanceof SyntaxError ? 'invalid-release' : (error as Error).name === 'TimeoutError' ? 'timeout' : 'network' }
@@ -317,9 +534,9 @@ function validateArchive(bytes: Uint8Array, version: string, runtimeVersion?: st
   const bundle = dsh.bundle && typeof dsh.bundle === 'object' ? asObject(dsh.bundle, 'archive bundle') : {}
   if (manifest.name !== 'dsh-remora' || manifest.version !== version || bundle.patch !== './cordis.patch.yml') throw new UpdateError('invalid-manifest', 'archive package, version or bundle mismatch')
   const peers = manifest.peerDependencies && typeof manifest.peerDependencies === 'object' ? asObject(manifest.peerDependencies, 'archive peers') : {}
-  const range = peers['@deepseek-ai/dsh']
-  if (typeof range !== 'string' || !validRange(range) || runtimeVersion === null) throw new UpdateError('compatibility-unknown', 'archive compatibility is unknown')
-  if (runtimeVersion !== undefined && (!valid(runtimeVersion) || !satisfies(runtimeVersion, range, { includePrerelease: true }))) throw new UpdateError('incompatible-dsh', 'archive does not support this DSH version')
+  const block = peerBlock(peers['@deepseek-ai/dsh'], runtimeVersion)
+  if (block === 'incompatible-dsh') throw new UpdateError('incompatible-dsh', 'archive does not support this DSH version')
+  if (block) throw new UpdateError('compatibility-unknown', 'archive compatibility is unknown')
 }
 
 /** Download the release tarball, verify it against SHA256SUMS, and store it. Returns the absolute path. */

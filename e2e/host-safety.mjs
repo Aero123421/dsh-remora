@@ -72,27 +72,45 @@ export async function nativeHostSafety({ dsh, tarball, artifacts, checkLan = tru
     assert.equal(workspace.ok, true)
     const workspaceId = workspace.result.workspace.workspaceId
     second = await startWeb({ dsh, world, port: 0, mockUrl: mock.url, logFile: join(artifacts, 'safety-second.log') })
-    assert.equal((await rpc(second, 'state')).hub.lock, 'other')
+    // The web URL is printed before this process finishes trying the hub lock.
+    await until(async () => (await rpc(second, 'state')).hub.lock === 'other')
     await rpc(second, 'kill-switch', { on: true })
     hub.send(frame('after-stop', 'task.start', { target: { new: { workspaceId } }, prompt: 'Remora E2E nonce=must-not-run', idempotencyKey: 'after-stop' }, 'after-stop'))
     await until(async () => (await rpc(first, 'state')).hub.link.state === 'stopped')
     assert.equal((await rpc(first, 'state')).settings.killSwitch, true)
+    // link.state flips before the socket close is observed. A frame sent on that
+    // socket is dropped when the close lands.
+    await until(() => hub.socket === null)
     assert.equal(mock.requests.some(entry => entry.reply?.includes('must-not-run')), false)
     await second.proc.stop()
     second = undefined
+    const generation = hub.connections
     await rpc(first, 'kill-switch', { on: false })
-    await until(() => hub.socket !== null)
+    await until(() => hub.connections > generation && hub.socket !== null && hub.socket.readyState === 1)
     hub.send(frame('live-task', 'task.start', { target: { new: { workspaceId } }, prompt: 'Remora E2E nonce=live-safety', idempotencyKey: 'live-task' }, 'live-task'))
     const task = await hub.response('live-task', 10_000)
     assert.equal(task.ok, true)
     await until(() => mock.requests.some(entry => entry.reply?.includes('live-safety')))
-    hub.send(frame('schedule', 'schedule.create', { sessionId: task.result.sessionId, title: 'Revoked schedule', prompt: 'Remora E2E nonce=must-not-schedule', when: { afterSeconds: 2 }, idempotencyKey: 'schedule' }))
+    // The due time has to outlast revocation and the schedule-file update. A 2s
+    // timer can fire while those waits are still running, and a rename can make
+    // one read miss the file.
+    const scheduleDelayMs = 20_000
+    const scheduleStarted = Date.now()
+    hub.send(frame('schedule', 'schedule.create', { sessionId: task.result.sessionId, title: 'Revoked schedule', prompt: 'Remora E2E nonce=must-not-schedule', when: { afterSeconds: scheduleDelayMs / 1000 }, idempotencyKey: 'schedule' }))
     assert.equal((await hub.response('schedule', 10_000)).ok, true)
     hub.send({ t: 'close', reason: 'revoked' })
     await until(async () => (await rpc(first, 'state')).hub.revoked)
-    await until(async () => JSON.parse(await readFile(join(world.dshHome, 'storages', 'dsh-remora', 'remote-schedules.json'), 'utf8')).data.schedules.length === 0)
-    // The timer is real DSH behavior: wait beyond its due time, then verify no model call.
-    await new Promise(resolve => setTimeout(resolve, 2500))
+    await until(async () => {
+      try {
+        return JSON.parse(await readFile(join(world.dshHome, 'storages', 'dsh-remora', 'remote-schedules.json'), 'utf8')).data.schedules.length === 0
+      } catch (error) {
+        const code = error && typeof error === 'object' && 'code' in error ? error.code : ''
+        if (code === 'ENOENT' || error instanceof SyntaxError) return false
+        throw error
+      }
+    }, 8_000)
+    const remain = scheduleStarted + scheduleDelayMs + 1_000 - Date.now()
+    if (remain > 0) await new Promise(resolve => setTimeout(resolve, remain))
     assert.equal(mock.requests.some(entry => entry.reply?.includes('must-not-schedule')), false)
     assert.equal(mock.requests.some(entry => entry.reply?.includes('must-not-run')), false)
 
@@ -106,7 +124,10 @@ export async function nativeHostSafety({ dsh, tarball, artifacts, checkLan = tru
       // loopback Host. Remora must still see the actual non-loopback socket.
       const auth = await forgedRequest(lan, `/?token=${encodeURIComponent(lan.token)}`)
       assert.equal(auth.status, 303)
-      const cookie = auth.headers['set-cookie'][0].split(';')[0]
+      const setCookie = auth.headers['set-cookie']
+      const cookieHeader = Array.isArray(setCookie) ? setCookie[0] : setCookie
+      assert.equal(typeof cookieHeader, 'string')
+      const cookie = cookieHeader.split(';')[0]
       const envelope = (method, payload) => ({ type: 'client-request', rpcId: 'safety-lan', method: `remora/${method}`, payload })
       const response = await forgedRequest(lan, '/api/remora/permission', { cookie, method: 'POST', payload: envelope('permission', { level: 'full', confirmFull: true }) })
       assert.equal(response.status, 200)

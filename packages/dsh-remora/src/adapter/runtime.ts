@@ -135,7 +135,12 @@ export class Runtime {
 
   // --- catalog -------------------------------------------------------------------
 
-  /** Every session DSH lists, enriched with workspace, pin and archive facts. Never wakes a session. */
+  /**
+   * Every session `sessionController.list` returns, enriched with workspace, pin and archive facts.
+   * Since DSH 0.2.1-alpha.3 that list omits rows `remoteAccess.allows` rejects. This call is not a
+   * Remote invocation, so the owner plugin still receives every row; Remora's own scope applies after that.
+   * Never wakes a session.
+   */
   async catalog(signal: AbortSignal): Promise<SessionRow[]> {
     let items: readonly DshSessionSummary[]
     try {

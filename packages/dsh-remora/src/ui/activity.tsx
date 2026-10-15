@@ -8,6 +8,13 @@ import { QuestionModeTags } from './question-mode.tsx'
 
 const OUTCOME_TONE = { ok: 'success', error: 'warning', denied: 'danger' } as const
 
+const INSTALL_OUTCOMES = new Set(['previous-restored', 'restore-failed', 'presence-unknown', 'restore-receipt-failed'])
+
+function installCopyKey(installation: UpdateInstallation): CopyKey {
+  if (installation.error && INSTALL_OUTCOMES.has(installation.error)) return `compat.install.${installation.error}` as CopyKey
+  return `compat.install.${installation.phase}` as CopyKey
+}
+
 export function ActivitySection({ snapshot, t, ctx }: { snapshot: RemoraSnapshot; t: Translate; ctx: ClientContext }) {
   const [clients, setClients] = useState<ClientSummary[]>([])
   const [entries, setEntries] = useState<AuditEntry[]>([])
@@ -168,7 +175,7 @@ export function CompatSection({ snapshot, t, ctx, busy }: Pick<SectionProps, 'sn
       <span className="rmr-mono">{latest.tarball?.url ?? latest.url}</span>
     </div> : null}
     {installation ? <p className={['failed', 'overridden', 'cancelled'].includes(installation.phase) ? 'rmr-error' : 'rmr-muted'}>
-      {t(`compat.install.${installation.phase}`, { version: installation.installedVersion ?? installation.version, current: snapshot.version, code: installation.error ?? installation.phase, stage: installation.stage ?? 'download' })}
+      {t(installCopyKey(installation), { version: installation.installedVersion ?? installation.version, current: snapshot.version, code: installation.error ?? installation.phase, stage: installation.stage ?? 'download' })}
     </p> : null}
     {message ? <p className="rmr-muted">{message}</p> : null}
   </div>

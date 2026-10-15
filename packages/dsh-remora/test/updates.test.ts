@@ -70,7 +70,7 @@ test('a newer release is found and its tarball is verified against SHA256SUMS', 
   assert.equal(expectedHash(`${sha}  dsh-remora-0.2.0.tgz`, 'dsh-remora-0.2.0.tgz'), sha)
   const t = await tempDir()
   try {
-    const path = await downloadVerified(check.latest!, t.dir, github(`${sha}  dsh-remora-0.2.0.tgz\n`))
+    const path = await downloadVerified(check.latest!, t.dir, github(`${sha}  dsh-remora-0.2.0.tgz\n`), '0.2.1-alpha.2')
     assert.deepEqual(new Uint8Array(await readFile(path)), tarball)
     await assert.rejects(downloadVerified(check.latest!, t.dir, github(`${'0'.repeat(64)}  dsh-remora-0.2.0.tgz\n`)), (error: unknown) => error instanceof UpdateError && error.code === 'checksum-mismatch')
     await assert.rejects(downloadVerified(check.latest!, t.dir, github('')), (error: unknown) => error instanceof UpdateError && error.code === 'no-checksum')
@@ -88,6 +88,14 @@ function gate<T>() {
 const success = (application: 'applied' | 'restart-required' = 'restart-required'): BundleChangeResult => ({
   changed: true, application, stage: 'enable', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.2.0',
 })
+
+/** DSH 0.2.1-alpha.3 with HMR: install over an installed package changes nothing. */
+const alreadyInstalled = (): BundleChangeResult => ({
+  changed: false, application: 'failed', stage: 'install', target: 'dsh-remora-0.2.0.tgz', error: { code: 'already-installed' },
+  // The alpha.2 type package predates this code; alpha.3 returns it from installBundle.
+} as unknown as BundleChangeResult)
+
+const installedBundle = { name: 'dsh-remora', version: '0.1.2', installed: true, source: 'https://github.com/Aero123421/dsh-remora/releases/download/v0.1.2/dsh-remora-0.1.2.tgz', enabled: true }
 
 async function updateCore(manager: UpdatePluginManager, fetchImpl = github(`${sha}  dsh-remora-0.2.0.tgz\n`)) {
   const temp = await tempDir()
@@ -152,6 +160,219 @@ test('DSH failure, override, cancellation and installed-version mismatch never c
       assert.equal((await h.core.auditEntries()).find(entry => entry.action === 'update:0.2.0')?.outcome, 'error')
     } finally { await h.cleanup() }
   })
+})
+
+test('an already-installed package is removed, then installed with the same selection', async () => {
+  const calls: string[] = []
+  let enabled: boolean | undefined
+  let requestId: string | undefined
+  const h = await updateCore({
+    listBundles: async () => [{ ...installedBundle, enabled: false }],
+    installBundle: async (_spec, options) => {
+      calls.push('install')
+      enabled = options.enabled
+      requestId = options.requestId
+      return calls.filter(call => call === 'install').length === 1 ? alreadyInstalled() : success('applied')
+    },
+    removeBundle: async name => {
+      calls.push(`remove:${name}`)
+      return { changed: true, application: 'applied', stage: 'remove', target: name }
+    },
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.deepEqual(calls, ['install', 'remove:dsh-remora', 'install'])
+    assert.equal(enabled, false)
+    assert.match(requestId ?? '', /^[0-9a-f-]{36}$/)
+    assert.equal(result.phase, 'applied')
+    assert.equal(result.installedVersion, '0.2.0')
+    assert.equal((await h.core.auditEntries()).find(entry => entry.action === 'update:0.2.0')?.outcome, 'ok')
+  } finally { await h.cleanup() }
+})
+
+test('removal failure other than stop-profile does not install again', async t => {
+  for (const code of ['bundle-in-use', 'not-removable'] as const) await t.test(code, async () => {
+    let installs = 0
+    const h = await updateCore({
+      listBundles: async () => [installedBundle],
+      installBundle: async () => { installs++; return alreadyInstalled() },
+      removeBundle: async () => ({ changed: false, application: 'failed', stage: 'remove', target: 'dsh-remora', error: { code } }),
+    })
+    try {
+      const result = await h.core.installUpdate(true, '0.2.0')
+      assert.equal(installs, 1)
+      assert.equal(result.phase, 'failed')
+      assert.equal(result.error, code)
+    } finally { await h.cleanup() }
+  })
+})
+
+test('stop-profile keeps the package and installs over it', async () => {
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => [installedBundle],
+    installBundle: async () => { installs++; return installs === 1 ? alreadyInstalled() : success() },
+    removeBundle: async () => ({ changed: false, application: 'failed', stage: 'remove', target: 'dsh-remora', error: { code: 'stop-profile' } }),
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(installs, 2)
+    assert.equal(result.phase, 'restart-required')
+  } finally { await h.cleanup() }
+})
+
+test('install continues after removal unloads this plugin', async () => {
+  let core: Awaited<ReturnType<typeof updateCore>>['core'] | undefined
+  const calls: string[] = []
+  const h = await updateCore({
+    listBundles: async () => [installedBundle],
+    installBundle: async () => {
+      calls.push('install')
+      return calls.length === 1 ? alreadyInstalled() : success('applied')
+    },
+    removeBundle: async () => {
+      calls.push('remove')
+      await core!.dispose()
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+  })
+  core = h.core
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.deepEqual(calls, ['install', 'remove', 'install'])
+    assert.equal(result.phase, 'applied')
+    assert.equal(h.core.snapshot(true).updateInstallation?.phase, 'applied')
+  } finally { await h.cleanup() }
+})
+
+test('already-installed without removeBundle stays a failed install', async () => {
+  const h = await updateCore({
+    listBundles: async () => [installedBundle],
+    installBundle: async () => alreadyInstalled(),
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'already-installed')
+  } finally { await h.cleanup() }
+})
+
+test('a failed install after removal puts the previous source back with a new request id', async () => {
+  let removed = false
+  const specs: string[] = []
+  const ids: string[] = []
+  const h = await updateCore({
+    listBundles: async () => removed ? [] : [installedBundle],
+    installBundle: async (spec, options) => {
+      specs.push(spec)
+      ids.push(options.requestId)
+      if (specs.length === 1) return alreadyInstalled()
+      if (specs.length === 2) return { changed: false, application: 'failed', stage: 'install', target: spec, error: { code: 'operation-error' } }
+      return { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2' }
+    },
+    removeBundle: async () => {
+      removed = true
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'previous-restored')
+    assert.equal(specs[2], installedBundle.source)
+    assert.equal(ids[2] !== ids[1], true)
+    assert.match(ids[2] ?? '', /^[0-9a-f-]{36}$/)
+  } finally { await h.cleanup() }
+})
+
+test('a failed restore says the plugin may be missing', async () => {
+  let removed = false
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => removed ? [] : [installedBundle],
+    installBundle: async () => {
+      installs++
+      if (installs === 1) return alreadyInstalled()
+      return { changed: false, application: 'failed', stage: 'install', target: 'dsh-remora', error: { code: 'operation-error' } }
+    },
+    removeBundle: async () => {
+      removed = true
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(installs, 3)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'restore-failed')
+  } finally { await h.cleanup() }
+})
+
+test('a thrown install after removal still tries to restore, and a thrown restore is visible', async () => {
+  let removed = false
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => removed ? [] : [installedBundle],
+    installBundle: async () => {
+      installs++
+      if (installs === 1) return alreadyInstalled()
+      if (installs === 2) throw new Error('disk')
+      throw new Error('restore disk')
+    },
+    removeBundle: async () => {
+      removed = true
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(installs, 3)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'restore-failed')
+  } finally { await h.cleanup() }
+})
+
+test('stop-profile leaves the package in place, so a later failed overwrite does not restore', async () => {
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => [installedBundle],
+    installBundle: async () => {
+      installs++
+      return installs === 1 ? alreadyInstalled() : { changed: false, application: 'failed', stage: 'install', target: 'dsh-remora', error: { code: 'operation-error' } }
+    },
+    removeBundle: async () => ({ changed: false, application: 'failed', stage: 'remove', target: 'dsh-remora', error: { code: 'stop-profile' } }),
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(installs, 2)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'operation-error')
+  } finally { await h.cleanup() }
+})
+
+test('when the bundle list cannot be read, the previous version is not installed', async () => {
+  let removed = false
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => {
+      if (removed) throw new Error('list down')
+      return [installedBundle]
+    },
+    installBundle: async () => {
+      installs++
+      return installs === 1 ? alreadyInstalled() : { changed: false, application: 'failed', stage: 'install', target: 'dsh-remora', error: { code: 'operation-error' } }
+    },
+    removeBundle: async () => {
+      removed = true
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(installs, 2)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'presence-unknown')
+  } finally { await h.cleanup() }
 })
 
 test('missing bundle selection and rejected installer calls fail visibly', async t => {
@@ -287,7 +508,7 @@ test('asset redirects only accept GitHub asset delivery hosts', async () => {
       requests.push(url)
       if (url.startsWith('https://github.com/')) return new Response(null, { status: 302, headers: { location: `https://release-assets.githubusercontent.com/${url.split('/').at(-1)}` } })
       return base(url)
-    })
+    }, '0.2.1-alpha.2')
     assert.deepEqual(new Uint8Array(await readFile(path)), tarball)
     assert.equal(requests.length, 4)
   } finally { await temp.cleanup() }
@@ -419,6 +640,89 @@ test('a changed release is rejected before any download or install', async () =>
   } finally { await h.cleanup() }
 })
 
+test('a cancelled removal restores the previous source only when the plugin is gone', async t => {
+  for (const label of ['absent', 'still listed', 'list unreadable'] as const) await t.test(label, async () => {
+    let removed = false
+    const specs: string[] = []
+    const h = await updateCore({
+      listBundles: async () => {
+        if (label === 'list unreadable' && removed) throw new Error('list failed')
+        return removed && label === 'absent' ? [] : [installedBundle]
+      },
+      installBundle: async (spec) => {
+        specs.push(spec)
+        if (specs.length === 1) return alreadyInstalled()
+        return { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2' }
+      },
+      removeBundle: async () => {
+        removed = true
+        return { changed: false, application: 'cancelled', stage: 'remove', target: 'dsh-remora' }
+      },
+    })
+    try {
+      const result = await h.core.installUpdate(true, '0.2.0')
+      if (label === 'absent') {
+        assert.equal(specs.length, 2)
+        assert.equal(specs[1], installedBundle.source)
+        assert.equal(result.phase, 'failed')
+        assert.equal(result.error, 'previous-restored')
+        assert.equal(result.installedVersion, '0.1.2')
+      } else if (label === 'still listed') {
+        assert.equal(specs.length, 1)
+        assert.equal(result.phase, 'cancelled')
+        assert.equal(result.error, undefined)
+      } else {
+        assert.equal(specs.length, 1)
+        assert.equal(result.phase, 'failed')
+        assert.equal(result.error, 'presence-unknown')
+      }
+    } finally { await h.cleanup() }
+  })
+})
+
+test('a failed restore receipt save is logged and kept on the update', async () => {
+  let removed = false
+  const specs: string[] = []
+  const h = await updateCore({
+    listBundles: async () => removed ? [] : [installedBundle],
+    installBundle: async (spec) => {
+      specs.push(spec)
+      if (specs.length === 1) return alreadyInstalled()
+      if (specs.length === 2) return { changed: false, application: 'failed', stage: 'install', target: 'dsh-remora', error: { code: 'operation-error' } }
+      return { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2' }
+    },
+    removeBundle: async () => {
+      removed = true
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+  })
+  const receipt: StoredDocument<UpdateInstallation | null> = Reflect.get(h.core, 'updateReceipt')
+  const save = receipt.update.bind(receipt)
+  let blocked = 0
+  receipt.update = async change => {
+    const next = change(receipt.value)
+    if (next?.restoreRequestId && next.phase === 'installing') {
+      blocked++
+      throw new Error('receipt write failed')
+    }
+    return save(change)
+  }
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(blocked, 1)
+    assert.equal(specs.length, 3)
+    assert.equal(specs[2], installedBundle.source)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'restore-receipt-failed')
+    assert.equal(result.installedVersion, '0.1.2')
+    assert.ok(h.host.warnings.some(entry => String(entry[0]).includes('could not save the restore request id')))
+    const raw = JSON.parse(await readFile(join(h.core.dataDir, '.dsh-remora-updates', 'update-receipt.json'), 'utf8')) as { data: UpdateInstallation }
+    assert.equal(raw.data.error, 'restore-receipt-failed')
+    assert.equal(raw.data.installedVersion, '0.1.2')
+    assert.equal(typeof raw.data.restoreRequestId, 'string')
+  } finally { receipt.update = save; await h.cleanup() }
+})
+
 test('candidate peers are checked against prerelease DSH and unknown compatibility blocks install', async () => {
   const base = github('')
   for (const runtime of ['0.2.1-alpha.2', '0.2.2', null]) {
@@ -429,6 +733,52 @@ test('candidate peers are checked against prerelease DSH and unknown compatibili
   assert.equal(missing.error, 'compatibility-unknown')
   const mismatched = await checkForUpdate('0.1.0', async url => url.startsWith('https://raw.') ? Response.json({ name: 'dsh-remora', version: '9.0.0' }) : base(url), 123, '0.2.1-alpha.2')
   assert.equal(mismatched.error, 'invalid-manifest')
+  const omittedRuntime = await checkForUpdate('0.1.0', base, 123)
+  assert.equal(omittedRuntime.newer, true)
+  assert.equal(omittedRuntime.installUnavailable, 'compatibility-unknown')
+  assert.equal((await checkForUpdate('0.1.0', base, 123, 'not-a-version')).installUnavailable, 'compatibility-unknown')
+})
+
+test('unbounded DSH peer ranges are refused, and a 0.2 ceiling is accepted', async () => {
+  const runtime = '0.2.1-alpha.2'
+  const refused = ['*', 'x', '>=0', '', '<99', '^0', '<0.3.0-0', '>=0.2.1-alpha.2', '>=0.2.1 <0.4.0', '>=0.2.1-alpha.2 <0.3.0']
+  for (const peer of refused) {
+    const fetchImpl = async (url: string) => {
+      if (url.startsWith('https://raw.githubusercontent.com/')) return Response.json({ name: 'dsh-remora', version: '0.2.0', dsh: { bundle: { patch: './cordis.patch.yml' } }, peerDependencies: { '@deepseek-ai/dsh': peer } })
+      return github('')(url)
+    }
+    const result = await checkForUpdate('0.1.0', fetchImpl, 123, runtime)
+    assert.equal(result.installUnavailable, 'compatibility-unknown', peer)
+  }
+  const accepted = ['>=0.2.1-alpha.2 <0.2.2-0', '>=0.2.1-alpha.2 <0.3.0-0', '^0.2.1']
+  for (const peer of accepted) {
+    const fetchImpl = async (url: string) => {
+      if (url.startsWith('https://raw.githubusercontent.com/')) return Response.json({ name: 'dsh-remora', version: '0.2.0', dsh: { bundle: { patch: './cordis.patch.yml' } }, peerDependencies: { '@deepseek-ai/dsh': peer } })
+      return github('')(url)
+    }
+    assert.equal((await checkForUpdate('0.1.0', fetchImpl, 123, '0.2.1-alpha.3')).installUnavailable, undefined, peer)
+  }
+  const temp = await tempDir()
+  try {
+    const sums = `${sha}  dsh-remora-0.2.0.tgz\n`
+    const release = (await checkForUpdate('0.1.0', github(sums), 123, runtime)).latest!
+    const base = github(sums)
+    await assert.rejects(downloadVerified(release, temp.dir, base), (error: unknown) => error instanceof UpdateError && error.code === 'compatibility-unknown')
+    await assert.rejects(downloadVerified(release, temp.dir, base, null), (error: unknown) => error instanceof UpdateError && error.code === 'compatibility-unknown')
+    await assert.rejects(downloadVerified(release, temp.dir, base, '0.2.2'), (error: unknown) => error instanceof UpdateError && error.code === 'incompatible-dsh')
+    for (const peer of refused) {
+      const archive = packageArchive({ peerDependencies: { '@deepseek-ai/dsh': peer } })
+      const digest = createHash('sha256').update(archive).digest('hex')
+      const fetchImpl = async (url: string) => url.endsWith('.tgz') ? new Response(archive) : github(`${digest}  dsh-remora-0.2.0.tgz\n`)(url)
+      const ranged = (await checkForUpdate('0.1.0', github(`${digest}  dsh-remora-0.2.0.tgz\n`), 123, runtime)).latest!
+      await assert.rejects(downloadVerified(ranged, temp.dir, fetchImpl, runtime), (error: unknown) => error instanceof UpdateError && error.code === 'compatibility-unknown', peer)
+    }
+    const ceiling = packageArchive({ peerDependencies: { '@deepseek-ai/dsh': '>=0.2.1-alpha.2 <0.3.0-0' } })
+    const ceilingDigest = createHash('sha256').update(ceiling).digest('hex')
+    const ceilingFetch = async (url: string) => url.endsWith('.tgz') ? new Response(ceiling) : github(`${ceilingDigest}  dsh-remora-0.2.0.tgz\n`)(url)
+    const ceilingRelease = (await checkForUpdate('0.1.0', github(`${ceilingDigest}  dsh-remora-0.2.0.tgz\n`), 123, runtime)).latest!
+    assert.equal(typeof await downloadVerified(ceilingRelease, temp.dir, ceilingFetch, '0.2.1-alpha.3'), 'string')
+  } finally { await temp.cleanup() }
 })
 
 test('local release tarballs are updateable; directory links and custom archives stay manual', async () => {
@@ -478,7 +828,7 @@ test('timeouts and symlinked update storage fail before installer handoff', asyn
   try {
     await assert.rejects(downloadVerified(release, temp.dir, async () => { throw new DOMException('timed out', 'TimeoutError') }), { name: 'TimeoutError' })
     await symlink(outside.dir, join(temp.dir, 'updates'), 'dir')
-    await assert.rejects(downloadVerified(release, temp.dir, base), (e: unknown) => e instanceof UpdateError && e.code === 'unsafe-storage')
+    await assert.rejects(downloadVerified(release, temp.dir, base, '0.2.1-alpha.2'), (e: unknown) => e instanceof UpdateError && e.code === 'unsafe-storage')
   } finally { await temp.cleanup(); await outside.cleanup() }
 })
 
@@ -622,6 +972,200 @@ test('an externally installed newer version blocks a downgrade and shows restart
     await assert.rejects(h.core.installUpdate(true, '0.2.0'))
     assert.equal(installs, 0)
   } finally { await h.cleanup() }
+})
+
+const packageRun = (exitCode: number) => ({ exitCode, output: '', truncated: false, logPath: '/logs/install' })
+
+test('a thrown removal, or a non-stop-profile failure that still removed the bundle, restores the previous source', async t => {
+  for (const label of ['remove throws', 'not-removable but absent'] as const) await t.test(label, async () => {
+    let removed = false
+    const specs: string[] = []
+    const h = await updateCore({
+      listBundles: async () => removed ? [] : [installedBundle],
+      installBundle: async (spec) => {
+        specs.push(spec)
+        if (specs.length === 1) return alreadyInstalled()
+        return { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2' }
+      },
+      removeBundle: async () => {
+        removed = true
+        if (label === 'remove throws') throw new Error('remove exploded')
+        return { changed: false, application: 'failed', stage: 'remove', target: 'dsh-remora', error: { code: 'not-removable' } }
+      },
+    })
+    try {
+      const result = await h.core.installUpdate(true, '0.2.0')
+      assert.equal(specs.length, 2)
+      assert.equal(specs[1], installedBundle.source)
+      assert.equal(result.phase, 'failed')
+      assert.equal(result.error, 'previous-restored')
+      assert.equal(result.installedVersion, '0.1.2')
+    } finally { await h.cleanup() }
+  })
+})
+
+test('a thrown removal that leaves the bundle listed does not install the previous source', async () => {
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => [installedBundle],
+    installBundle: async () => { installs++; return alreadyInstalled() },
+    removeBundle: async () => { throw new Error('remove exploded') },
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(installs, 1)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'install-failed')
+  } finally { await h.cleanup() }
+})
+
+test('previous-restored is reported only when the bundle name, version and package result match', async t => {
+  const cases: { label: string; third: BundleChangeResult; listedVersion: string; error: string }[] = [
+    { label: 'matching package result', third: { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2', packageResult: packageRun(0) }, listedVersion: '9.9.9', error: 'previous-restored' },
+    { label: 'wrong version', third: { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.2.0', packageResult: packageRun(0) }, listedVersion: '0.1.2', error: 'restore-failed' },
+    { label: 'package exit code', third: { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2', packageResult: packageRun(1) }, listedVersion: '0.1.2', error: 'restore-failed' },
+    { label: 'omitted fields and the list shows the previous version', third: { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora' }, listedVersion: '0.1.2', error: 'previous-restored' },
+    { label: 'omitted fields and the list shows another version', third: { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora' }, listedVersion: '0.2.0', error: 'restore-failed' },
+  ]
+  for (const item of cases) await t.test(item.label, async () => {
+    let removed = false
+    let installs = 0
+    const h = await updateCore({
+      listBundles: async () => {
+        if (!removed || installs < 3) return removed ? [] : [installedBundle]
+        return [{ ...installedBundle, version: item.listedVersion }]
+      },
+      installBundle: async () => {
+        installs++
+        if (installs === 1) return alreadyInstalled()
+        if (installs === 2) return { changed: false, application: 'failed', stage: 'install', target: 'dsh-remora', error: { code: 'operation-error' } }
+        return item.third
+      },
+      removeBundle: async () => {
+        removed = true
+        return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+      },
+    })
+    try {
+      const result = await h.core.installUpdate(true, '0.2.0')
+      assert.equal(installs, 3)
+      assert.equal(result.phase, 'failed')
+      assert.equal(result.error, item.error)
+      if (item.error === 'previous-restored') assert.equal(result.installedVersion, '0.1.2')
+    } finally { await h.cleanup() }
+  })
+})
+
+test('an overridden install after removal restores the previous source only when the plugin is gone', async t => {
+  for (const gone of [true, false]) await t.test(gone ? 'absent' : 'still listed', async () => {
+    let removed = false
+    const specs: string[] = []
+    const h = await updateCore({
+      listBundles: async () => removed && gone ? [] : [installedBundle],
+      installBundle: async (spec) => {
+        specs.push(spec)
+        if (specs.length === 1) return alreadyInstalled()
+        if (specs.length === 2) return { ...success(), application: 'overridden' }
+        return { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2' }
+      },
+      removeBundle: async () => {
+        removed = true
+        return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+      },
+    })
+    try {
+      const result = await h.core.installUpdate(true, '0.2.0')
+      if (gone) {
+        assert.equal(specs.length, 3)
+        assert.equal(specs[2], installedBundle.source)
+        assert.equal(result.phase, 'failed')
+        assert.equal(result.error, 'previous-restored')
+      } else {
+        assert.equal(specs.length, 2)
+        assert.equal(result.phase, 'overridden')
+      }
+    } finally { await h.cleanup() }
+  })
+})
+
+test('a restart during restore follows the saved restore request id', async () => {
+  const restoreHeld = gate<BundleChangeResult>()
+  let removed = false
+  const specs: string[] = []
+  let restoreId = ''
+  let originalId = ''
+  const manager: UpdatePluginManager = {
+    listBundles: async () => removed ? [] : [installedBundle],
+    installBundle: async (spec, options) => {
+      specs.push(spec)
+      if (specs.length === 1) {
+        originalId = options.requestId
+        return alreadyInstalled()
+      }
+      if (specs.length === 2) return { changed: false, application: 'failed', stage: 'install', target: spec, error: { code: 'operation-error' } }
+      restoreId = options.requestId
+      return restoreHeld.promise
+    },
+    removeBundle: async () => {
+      removed = true
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+    waitForInstall: async id => id === restoreId
+      ? { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2' }
+      : { changed: false, application: 'failed', stage: 'install', target: 'dsh-remora', error: { code: 'operation-error' } },
+  }
+  const h = await updateCore(manager)
+  const pending = h.core.installUpdate(true, '0.2.0')
+  let replacement: ReturnType<typeof apply> | undefined
+  try {
+    await until(() => specs.length === 3)
+    const raw = JSON.parse(await readFile(join(h.core.dataDir, '.dsh-remora-updates', 'update-receipt.json'), 'utf8')) as { data: UpdateInstallation }
+    assert.equal(raw.data.phase, 'installing')
+    assert.equal(raw.data.requestId, originalId)
+    assert.equal(raw.data.restoreRequestId, restoreId)
+    assert.equal(raw.data.restoreRequestId === raw.data.requestId, false)
+    assert.equal(raw.data.restoreVersion, '0.1.2')
+    assert.equal(specs[2], installedBundle.source)
+    await h.core.dispose()
+    replacement = apply(fakeHost({ pluginManager: manager, profileContext: { dir: h.core.dataDir } }).ctx, undefined, { dataDir: h.core.dataDir, dshVersion: '0.2.1-alpha.2', githubFetch: github(`${sha}  dsh-remora-0.2.0.tgz\n`) })
+    await replacement.ready
+    const settled = await replacement.reconcileUpdate()
+    assert.equal(settled?.phase, 'failed')
+    assert.equal(settled?.error, 'previous-restored')
+    assert.equal(settled?.installedVersion, '0.1.2')
+  } finally {
+    restoreHeld.resolve({ changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2' })
+    await pending.catch(() => undefined)
+    await replacement?.dispose()
+    await h.cleanup()
+  }
+})
+
+test('a lost restore result stays unknown instead of the original failed install', async () => {
+  const { JsonDocument } = await import('../src/core/storage.ts')
+  const { newInstallRequestId, updateReceiptSpec } = await import('../src/core/updates.ts')
+  const temp = await tempDir()
+  const requestId = newInstallRequestId()
+  const restoreRequestId = newInstallRequestId()
+  const receipt = await JsonDocument.open(join(temp.dir, '.dsh-remora-updates'), updateReceiptSpec)
+  await receipt.update(() => ({ attempt: 1, version: '0.2.0', requestId, phase: 'installing', restoreRequestId, restoreVersion: '0.1.2' }))
+  let installs = 0
+  const manager: UpdatePluginManager = {
+    listBundles: async () => [],
+    installBundle: async () => { installs++; return success() },
+    waitForInstall: async id => id === requestId
+      ? { changed: false, application: 'failed', stage: 'install', target: 'dsh-remora', error: { code: 'operation-error' } }
+      : null,
+  }
+  const core = apply(fakeHost({ pluginManager: manager, profileContext: { dir: temp.dir } }).ctx, undefined, { dataDir: temp.dir, dshVersion: '0.2.1-alpha.2' })
+  try {
+    await core.ready
+    const settled = await core.reconcileUpdate()
+    assert.equal(settled?.phase, 'unknown')
+    assert.equal(settled?.restoreRequestId, restoreRequestId)
+    assert.equal(settled?.error, undefined)
+    assert.equal(installs, 0)
+  } finally { await core.dispose(); await temp.cleanup() }
 })
 
 test('external upgrade during receipt I/O is rechecked immediately before manager invocation', async () => {

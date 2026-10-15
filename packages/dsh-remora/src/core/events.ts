@@ -29,6 +29,7 @@ function keyOf(event: HostEvent): string {
   switch (event.kind) {
     case 'task': return `task:${event.taskId}`
     case 'attention': return `attention:${event.sessionId}`
+    case 'attention-snapshot': return 'attention-snapshot'
     case 'host-status': return 'host-status'
   }
 }

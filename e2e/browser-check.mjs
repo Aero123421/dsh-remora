@@ -65,13 +65,20 @@ export async function openDsh({ browser, web, artifacts, log, label = 'dsh', tra
   await page.goto(web.url)
   const notice = await firstPresent(page, DSH.previewNoticeContinue, 6000)
   if (notice) await notice.click()
-  await mustBePresent(page, DSH.settingsOpen, 'the Settings entry in the DSH sidebar', 30_000)
+  await mustBePresent(page, DSH.shellReady, 'the DSH shell (sidebar Settings, or the account menu)', 30_000)
   return { context, page, issues, artifacts }
 }
 
 export async function openSettings(page) {
-  const open = await mustBePresent(page, DSH.settingsOpen, 'the Settings entry in the DSH sidebar')
-  await open.click()
+  const direct = await firstPresent(page, DSH.settingsOpen, 1_500)
+  if (direct) {
+    await direct.click()
+  } else {
+    const menu = await mustBePresent(page, DSH.accountMenu, 'the DSH account menu')
+    await menu.click()
+    const item = await mustBePresent(page, DSH.settingsMenuItem, 'Settings in the account menu')
+    await item.click()
+  }
   await mustBePresent(page, DSH.settingsDialog, 'the settings dialog')
 }
 

@@ -28,6 +28,8 @@ export function canonicalJson(value: unknown): string {
 }
 
 export async function sha256(data: string | Uint8Array): Promise<Uint8Array> {
-  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data
+  // A fresh ArrayBuffer-backed view. Workers' SubtleCrypto rejects
+  // Uint8Array<ArrayBufferLike> (the parameter's default), including views over a SharedArrayBuffer.
+  const bytes = Uint8Array.from(typeof data === 'string' ? new TextEncoder().encode(data) : data)
   return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
 }
