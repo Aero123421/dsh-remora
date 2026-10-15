@@ -77,7 +77,17 @@ export interface HostStatusEvent {
   operations: string[]
 }
 
-export type HostEvent = TaskEvent | AttentionEvent | HostStatusEvent
+/**
+ * Every session that still has attention after the plugin process starts.
+ * The hub replaces its attention table with this list. Later `attention`
+ * events update one session. A reconnect of the same process does not send this.
+ */
+export interface AttentionSnapshotEvent {
+  kind: 'attention-snapshot'
+  sessions: { sessionId: string; items: Omit<AttentionItem, 'detail'>[] }[]
+}
+
+export type HostEvent = TaskEvent | AttentionEvent | HostStatusEvent | AttentionSnapshotEvent
 
 export interface EventFrame {
   t: 'event'

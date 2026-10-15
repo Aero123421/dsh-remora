@@ -317,7 +317,7 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
       await page.goto(back)
       const notice = await firstPresent(page, DSH_SELECTORS.previewNoticeContinue, 3000)
       if (notice) await notice.click()
-      await mustBePresent(page, DSH_SELECTORS.settingsOpen, 'DSH Web again after the no-web test', 30_000)
+      await mustBePresent(page, DSH_SELECTORS.shellReady, 'DSH Web again after the no-web test', 30_000)
     }
   })
 

@@ -41,7 +41,7 @@ npm test
 - TypeScript は型を消すだけで動く書き方に限ります（`erasableSyntaxOnly`）。テストは Node が `.ts` をそのまま読みます。
 - 操作を追加するときは `packages/protocol/src/operations.ts` に足し、`packages/dsh-remora/src/features.ts` に必要な DSH サービスを書きます。中核ツールの名前と説明文は変えません。
 - プラグインのデータは `$DSH_HOME/storages/dsh-remora/` の JSON（スキーマ版数つき、tmp → rename で原子的に書く）、ホスト鍵は `ctx.credentials`（無ければ `host-key.json`、どちらも平文・0600）に置きます。
-- 設定 RPC で権限や範囲を広げる変更は、ソケット接続元と Host・Origin がループバックの場合だけ受け付けます（`src/routes.ts` の `isLocalRequest`）。狭める変更と緊急停止はどこからでも可。
+- 設定 RPC で権限や範囲を広げる変更は、ソケット接続元と Host・Origin がループバックの場合だけ受け付けます（`src/routes.ts` の `isLocalRequest`）。転送ヘッダーはローカル扱いにせず、Host だけではローカルになりません。狭める変更と緊急停止はどこからでも可。根拠は [architecture.md](architecture.md) の権限の節です。
 - ハブへの WebSocket がプロキシを通るのは、DSH を `NODE_USE_ENV_PROXY=1` で起動したときだけです（Node 22.21 以上。Node 22.22 で確認）。
 - 質問・プランの確認・承認への外からの回答は `src/adapter/answerer.ts` が DSH の waterfall に入って受け付けます。`timed` モードの質問は `userQuestions.answer` で答えます。承認はパスキー確認が既定で、DSH 側のスイッチで MCP・CLI からも許可できます。
 - `packages/protocol` や `assets/` のロゴを変えたら `pnpm vendor:sync` を実行し、`hub/` 側のコピーも一緒にコミットします。

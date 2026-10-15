@@ -257,6 +257,124 @@ test('already-installed without removeBundle stays a failed install', async () =
   } finally { await h.cleanup() }
 })
 
+test('a failed install after removal puts the previous source back with a new request id', async () => {
+  let removed = false
+  const specs: string[] = []
+  const ids: string[] = []
+  const h = await updateCore({
+    listBundles: async () => removed ? [] : [installedBundle],
+    installBundle: async (spec, options) => {
+      specs.push(spec)
+      ids.push(options.requestId)
+      if (specs.length === 1) return alreadyInstalled()
+      if (specs.length === 2) return { changed: false, application: 'failed', stage: 'install', target: spec, error: { code: 'operation-error' } }
+      return { changed: true, application: 'applied', stage: 'install', target: 'dsh-remora', bundle: 'dsh-remora', version: '0.1.2' }
+    },
+    removeBundle: async () => {
+      removed = true
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'previous-restored')
+    assert.equal(specs[2], installedBundle.source)
+    assert.equal(ids[2] !== ids[1], true)
+    assert.match(ids[2] ?? '', /^[0-9a-f-]{36}$/)
+  } finally { await h.cleanup() }
+})
+
+test('a failed restore says the plugin may be missing', async () => {
+  let removed = false
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => removed ? [] : [installedBundle],
+    installBundle: async () => {
+      installs++
+      if (installs === 1) return alreadyInstalled()
+      return { changed: false, application: 'failed', stage: 'install', target: 'dsh-remora', error: { code: 'operation-error' } }
+    },
+    removeBundle: async () => {
+      removed = true
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(installs, 3)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'restore-failed')
+  } finally { await h.cleanup() }
+})
+
+test('a thrown install after removal still tries to restore, and a thrown restore is visible', async () => {
+  let removed = false
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => removed ? [] : [installedBundle],
+    installBundle: async () => {
+      installs++
+      if (installs === 1) return alreadyInstalled()
+      if (installs === 2) throw new Error('disk')
+      throw new Error('restore disk')
+    },
+    removeBundle: async () => {
+      removed = true
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(installs, 3)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'restore-failed')
+  } finally { await h.cleanup() }
+})
+
+test('stop-profile leaves the package in place, so a later failed overwrite does not restore', async () => {
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => [installedBundle],
+    installBundle: async () => {
+      installs++
+      return installs === 1 ? alreadyInstalled() : { changed: false, application: 'failed', stage: 'install', target: 'dsh-remora', error: { code: 'operation-error' } }
+    },
+    removeBundle: async () => ({ changed: false, application: 'failed', stage: 'remove', target: 'dsh-remora', error: { code: 'stop-profile' } }),
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(installs, 2)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'operation-error')
+  } finally { await h.cleanup() }
+})
+
+test('when the bundle list cannot be read, the previous version is not installed', async () => {
+  let removed = false
+  let installs = 0
+  const h = await updateCore({
+    listBundles: async () => {
+      if (removed) throw new Error('list down')
+      return [installedBundle]
+    },
+    installBundle: async () => {
+      installs++
+      return installs === 1 ? alreadyInstalled() : { changed: false, application: 'failed', stage: 'install', target: 'dsh-remora', error: { code: 'operation-error' } }
+    },
+    removeBundle: async () => {
+      removed = true
+      return { changed: true, application: 'applied', stage: 'remove', target: 'dsh-remora' }
+    },
+  })
+  try {
+    const result = await h.core.installUpdate(true, '0.2.0')
+    assert.equal(installs, 2)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error, 'presence-unknown')
+  } finally { await h.cleanup() }
+})
+
 test('missing bundle selection and rejected installer calls fail visibly', async t => {
   for (const missing of [false, true]) await t.test(missing ? 'unknown selection' : 'rejected installer', async () => {
     let installs = 0

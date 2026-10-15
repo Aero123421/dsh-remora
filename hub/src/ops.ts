@@ -4,6 +4,7 @@
  * the host Durable Object (or answer hub operations here).
  */
 import { stampAnswerUrls } from './attention.ts'
+import { ownerGrant, ownerGrantFor } from './owner-grant.ts'
 import { AUDIT_MAX_ROWS, FREE_TIER, OWNER_CLIENT_ID, RATE_LIMITS, dcrEnabled } from './config.ts'
 import type { ConfirmationView, ExecuteResult, HostLive } from './host-do.ts'
 import { denied } from './host-do.ts'
@@ -37,10 +38,7 @@ export interface RunOptions {
 
 const err = (code: RemoraError['code'], message: string, extra: Partial<RemoraError> = {}): ExecuteResult => ({ ok: false, error: { code, message, ...extra } })
 
-/** The owner's own grant: everything the DSH ceiling allows, briefly. */
-export function ownerGrant(): Grant {
-  return { level: 'full', fullAccessExpiresAt: Date.now() + 60_000 }
-}
+export { ownerGrant, ownerGrantFor } from './owner-grant.ts'
 
 async function contextFor(env: Env, caller: Caller): Promise<CallContext> {
   if (caller.kind === 'owner') {
@@ -147,9 +145,10 @@ async function runOperationInner(env: Env, caller: Caller, op: string, rawParams
     hostId = resolved.hostId
   }
 
-  const grant = context.grants[hostId]
+  let grant = context.grants[hostId]
   if (!grant) return { ok: false, error: { ...denied('hub', 'switched-off', op), message: `${op} was refused by the hub: this client is blocked on this host (Connections page).` } }
   const forwarded = finalParams(op, params, hostId)
+  if (caller.kind === 'owner') grant = ownerGrantFor(op, forwarded)
   boundary.hostId = hostId
   return hostStub(env, hostId).execute({
     op,

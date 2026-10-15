@@ -1,7 +1,8 @@
 // Every selector the harness uses, in one place.
 //
-// DSH Web selectors target DSH 0.2.1-alpha.2 with the English locale (the
-// browser context is created with locale en-US).
+// DSH Web selectors target the English locale (the browser context is created
+// with locale en-US). Settings opens from the sidebar on 0.2.1-alpha.2 and
+// from the account menu (More → Settings) on 0.2.1-alpha.3.
 //
 // Remora and hub selectors prefer `data-testid` hooks — the contract proposed
 // to the plugin and hub streams (see docs/e2e.md, "テスト用フック") — and fall
@@ -14,12 +15,17 @@ const role = (name, options) => scope => scope.getByRole(name, options)
 const text = (value, options = { exact: true }) => scope => scope.getByText(value, options)
 const testid = id => scope => scope.locator(`[data-testid="${id}"]`)
 
-/** DSH Web 0.2.1-alpha.2 (English). */
+/** DSH Web 0.2.1-alpha.2 and alpha.3 (English). */
 export const dsh = {
   /** "Preview Notice" shown on first use; dismissed when present. */
   previewNoticeContinue: role('button', { name: 'Continue', exact: true }),
-  /** Sidebar entry that opens the settings dialog. */
-  settingsOpen: [role('button', { name: 'Settings', exact: true }), text('Settings')],
+  /** alpha.2 sidebar button. A bare "Settings" text match is omitted so a closed menu label cannot win. */
+  settingsOpen: [role('button', { name: 'Settings', exact: true })],
+  /** alpha.3 account menu. The accessible name stays "Account menu" when the visible label is "More". */
+  accountMenu: [role('button', { name: 'Account menu', exact: true })],
+  settingsMenuItem: [role('menuitem', { name: 'Settings', exact: true })],
+  /** Either shell is enough to know DSH Web has finished loading. */
+  shellReady: [role('button', { name: 'Settings', exact: true }), role('button', { name: 'Account menu', exact: true })],
   settingsDialog: [role('dialog'), css('[role="dialog"]')],
   /** Left nav entry registered by Remora through the `settings.section` slot. */
   settingsNavRemora: [scope => scope.getByRole('dialog').getByText('Remora', { exact: true }), text('Remora')],

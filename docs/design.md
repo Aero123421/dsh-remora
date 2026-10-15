@@ -74,6 +74,10 @@ dsh-remora/
 - スコープは `dsh.read` / `dsh.content` / `dsh.tasks` / `dsh.admin` の固定セット。ホスト単位・操作単位の許可は grant の中に持つ。
 - デバイスコード（CLI 用）はライブラリが未対応のため、自前で実装する。
 
+**MCP の資格情報**（2026-10-15 に `hub/src/oauth.ts` と `hub/test/integration/oauth.test.ts` を照合）:
+
+MCP（`/mcp`）の認可は OAuth 2.1 のままにする。個人トークン（`rmr_pat_`）は HTTP API 専用で、MCP の資格情報にはしない。保護リソースメタデータは RFC 9728 の `/.well-known/oauth-protected-resource/mcp` と `/api/v1/ops`。認可サーバーメタデータは CIMD（`client_id_metadata_document_supported` とトークン認証 `none`）、PKCE は S256、デバイスコードは RFC 8628。DCR は既定オフで、`registration_endpoint` は出さない。`/mcp` が無認証のときは `WWW-Authenticate` に `resource_metadata` を付ける。この範囲は `hub/test/integration/oauth.test.ts` の discovery テストが検証している。2025-11-25 の MCP 認可草案が独自トークンを要求するという推測は、このハブの実装とは一致しない。
+
 **ドメインを変えたとき**: パスキーと OAuth の発行者（issuer）が変わるので、リカバリーコードでログインしてパスキーを登録し直し、各クライアントも接続し直してもらう。
 
 ## 権限モデル

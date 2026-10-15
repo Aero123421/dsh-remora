@@ -117,7 +117,12 @@ export class Dispatcher {
     let response: ResponseFrame
     try {
       const completed = await this.run(frame, controller, now)
-      completed.assertAuthorized()
+      try {
+        completed.assertAuthorized()
+      } catch (error) {
+        if (frame.op === 'terminal.run') throw finishedCommandRefusal(error)
+        throw error
+      }
       response = { t: 'response', id: frame.id, ok: true, result: completed.value }
     } catch (error) {
       const remora = this.toError(error, frame)
@@ -229,6 +234,22 @@ export class Dispatcher {
     this.deps.log?.(`Remora: ${String(frame.op).slice(0, 64)} failed`, error)
     return { code: 'internal', message: 'Internal error on the DSH host.' }
   }
+}
+
+/** The handler already returned, so a later refusal must not read as if the command never ran. */
+function finishedCommandRefusal(error: unknown): unknown {
+  if (error instanceof DeadlineError) {
+    return new OperationError('unavailable', 'The command already finished, but the deadline passed before the result could be returned. Check the machine before running it again.')
+  }
+  if (error instanceof OperationError && error.code === 'denied') {
+    const denial = error.details.denial
+    const reason = denial ? `${denial.layer}/${denial.reason}` : error.code
+    return new OperationError('denied', `The command already finished, and this host refused to return the result (${reason}). Check the machine before running it again.`, {
+      ...(denial ? { denial } : {}),
+      ...(typeof error.details.fix === 'string' ? { fix: error.details.fix } : {}),
+    })
+  }
+  return error
 }
 
 class Refusal extends Error {

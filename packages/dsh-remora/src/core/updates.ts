@@ -15,7 +15,9 @@
  * installs the new spec; a `stop-profile` removal (no HMR, bundle still running)
  * is followed by `installBundle` over the package that stayed installed.
  * `removeBundle` stops this plugin before it returns, so the follow-up install
- * uses only the host manager, which outlives the bundle.
+ * uses only the host manager, which outlives the bundle. If that install fails
+ * and the bundle is actually gone, the previous source is installed again
+ * under a new request id. A failed restore is reported; it is not ignored.
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { join } from 'node:path'
@@ -73,18 +75,67 @@ function isAlreadyInstalled(result: BundleChangeResult): boolean {
   return result.application === 'failed' && result.changed === false && resultCode(result) === 'already-installed'
 }
 
+/** The bundle that was installed before removal, used only to put that version back. */
+export interface PreviousBundle {
+  spec: string
+  enabled: boolean
+}
+
+function failedInstall(code: string): BundleChangeResult {
+  return { changed: false, application: 'failed', stage: 'install', target: REMORA_BUNDLE, error: { code } } as BundleChangeResult
+}
+
+function withError(result: BundleChangeResult, code: string): BundleChangeResult {
+  return { ...result, application: 'failed', error: { code } } as BundleChangeResult
+}
+
+/** `true` installed, `false` absent, `null` when the list could not be read. */
+async function bundlePresent(manager: UpdatePluginManager): Promise<boolean | null> {
+  try {
+    const rows = await manager.listBundles()
+    return rows.some(row => row.name === REMORA_BUNDLE && row.installed)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Put `previous` back when the new install failed or was cancelled and the bundle is gone.
+ * `already-installed` means the new install did not remove anything. A list failure does not
+ * install the old spec: the new one may still be present. Restore uses a new request id.
+ */
+async function restoreIfMissing(manager: UpdatePluginManager, installed: BundleChangeResult, previous: PreviousBundle | undefined): Promise<BundleChangeResult> {
+  if (!previous?.spec || (installed.application !== 'failed' && installed.application !== 'cancelled') || resultCode(installed) === 'already-installed') return installed
+  const present = await bundlePresent(manager)
+  if (present === null) return withError(installed, 'presence-unknown')
+  if (present) return installed
+  let restored: BundleChangeResult
+  try {
+    restored = await manager.installBundle(previous.spec, { enabled: previous.enabled, requestId: newInstallRequestId() })
+  } catch {
+    return withError(installed, 'restore-failed')
+  }
+  const back = restored.application === 'applied' || restored.application === 'restart-required' || resultCode(restored) === 'already-installed'
+  return withError(installed, back ? 'previous-restored' : 'restore-failed')
+}
+
 /**
  * Install `spec`, removing `dsh-remora` first when DSH answers `already-installed`.
  * The second `installBundle` runs even if removal unloaded the caller: only `manager` is used after that.
  * A failed or cancelled removal, other than `stop-profile`, is returned unchanged and is not followed by another install.
+ * When `previous` is set and the install after removal fails with the bundle absent, that source is installed again.
  */
-export async function installVerifiedBundle(manager: UpdatePluginManager, spec: string, options: InstallBundleOptions): Promise<BundleChangeResult> {
+export async function installVerifiedBundle(manager: UpdatePluginManager, spec: string, options: InstallBundleOptions, previous?: PreviousBundle): Promise<BundleChangeResult> {
   const installed = await manager.installBundle(spec, options)
   if (!isAlreadyInstalled(installed) || typeof manager.removeBundle !== 'function') return installed
   const removed = await manager.removeBundle(REMORA_BUNDLE)
   if (removed.application === 'cancelled') return removed
   if (removed.application === 'failed' && resultCode(removed) !== 'stop-profile') return removed
-  return manager.installBundle(spec, options)
+  try {
+    return await restoreIfMissing(manager, await manager.installBundle(spec, options), previous)
+  } catch {
+    return restoreIfMissing(manager, failedInstall('install-failed'), previous)
+  }
 }
 
 export interface UpdateInstallation {

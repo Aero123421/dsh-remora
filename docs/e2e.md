@@ -165,7 +165,7 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 
 ## 既知の制約
 
-- `upstream.json` の DSH は公開直後のプレリリースで、依存は「2 週間以上前の版」という決まりの例外です。現在の固定は 0.2.1-alpha.3（2026-10-14、`2fbf435`）です。DSH の推移的な依存はロックしていません（DSH 自身が版を固定している範囲で再現します）。ブラウザのセレクタは 0.2.1-alpha.2 の英語画面に合わせてあり、alpha.3 での通しテストはまだやり直していません。
+- `upstream.json` の DSH は公開直後のプレリリースで、依存は「2 週間以上前の版」という決まりの例外です。現在の固定は 0.2.1-alpha.3（2026-10-14、`2fbf435`）です。DSH の推移的な依存はロックしていません（DSH 自身が版を固定している範囲で再現します）。ブラウザのセレクタは、0.2.1-alpha.2 のサイドバー「Settings」と、0.2.1-alpha.3 のアカウントメニュー（accessible name は Account menu。広い画面で未ログインのとき表示は More）から Settings を開く経路の両方に合わせてある。
 - ブラウザ確認は DSH Web の英語表示に依存します（コンテキストを `en-US` で作る）。DSH の画面の文言や構造が変わると `selectors.mjs` の DSH 部分を直す必要があります。
 - Linux と macOS を想定しています。Windows では未確認です。
 - `dsh plugin add` は pnpm のメタデータを取りに npm レジストリへアクセスします。オフラインでは動きません。

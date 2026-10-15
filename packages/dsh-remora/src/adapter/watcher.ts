@@ -5,7 +5,7 @@
  * session after a short debounce. Only live sessions emit events; cold
  * sessions cannot change.
  */
-import { TERMINAL_TASK_STATES, type AttentionEvent } from '@dsh-remora/protocol'
+import { TERMINAL_TASK_STATES, type AttentionEvent, type AttentionSnapshotEvent } from '@dsh-remora/protocol'
 import type { Disposer } from './dsh-types.ts'
 import { OperationError } from '../ops/types.ts'
 import { isLoginFailure } from './events.ts'
@@ -22,10 +22,13 @@ export class Watcher {
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly running = new Map<string, Promise<void>>()
   private readonly again = new Set<string>()
-  /** Last attention list sent per session (JSON, without detail). */
+  /** Last attention list observed per session (JSON, without detail). */
   private readonly sent = new Map<string, string>()
+  /** Sessions whose last event to the hub was an empty list. */
+  private readonly cleared = new Set<string>()
   private readonly abort = new AbortController()
   private started = false
+  private snapshot: Promise<void> | null = null
 
   constructor(rt: Runtime, tasks: Tasks) {
     this.rt = rt
@@ -63,8 +66,8 @@ export class Watcher {
         this.schedule(sessionId)
       })
     }
-    // Catch up after a restart or reconnect: every unfinished task, once.
-    for (const sessionId of new Set(this.tasks.active().flatMap(record => record.sessionId ? [record.sessionId] : []))) this.schedule(sessionId, 0)
+    // Process start only. A later call (the hub socket reconnecting in this process) does not publish again.
+    this.snapshot = this.publishSnapshot()
   }
 
   dispose(): void {
@@ -112,17 +115,53 @@ export class Watcher {
     this.timers.set(sessionId, timer)
   }
 
-  /** Await pending refreshes during teardown or in tests. */
+  /** Await pending refreshes, including the startup snapshot, during teardown or in tests. */
   async idle(): Promise<void> {
+    await this.drain()
+    if (this.snapshot) await this.snapshot
+    await this.drain()
+  }
+
+  private async drain(): Promise<void> {
     while (this.timers.size > 0 || this.running.size > 0) {
       await Promise.all([...this.running.values()])
       await new Promise(resolve => setTimeout(resolve, 5))
     }
   }
 
+  /**
+   * Read the cold catalog and publish one snapshot of attention that is still open.
+   * `list`, `inspect` and `projections` do not wake agents. A catalog failure publishes
+   * nothing, so a restart does not wipe the hub with an empty list it could not build.
+   */
+  private async publishSnapshot(): Promise<void> {
+    const signal = this.abort.signal
+    let rows
+    try {
+      rows = await this.rt.catalog(signal)
+    } catch (error) {
+      this.rt.deps.logger.warn('Remora: attention snapshot skipped because the session list failed', error)
+      return
+    }
+    if (signal.aborted) return
+    for (const row of rows) {
+      if (!this.rt.canAccess(row)) continue
+      this.schedule(row.sessionId, 0)
+    }
+    await this.drain()
+    if (signal.aborted) return
+    const sessions: AttentionSnapshotEvent['sessions'] = []
+    for (const [sessionId, json] of this.sent) {
+      const items = JSON.parse(json) as AttentionSnapshotEvent['sessions'][number]['items']
+      if (Array.isArray(items) && items.length > 0) sessions.push({ sessionId, items })
+    }
+    this.rt.deps.emit({ kind: 'attention-snapshot', sessions })
+  }
+
   private clearAttention(sessionId: string): void {
-    if (this.sent.get(sessionId) === '[]') return
     this.sent.set(sessionId, '[]')
+    if (this.cleared.has(sessionId)) return
+    this.cleared.add(sessionId)
     this.rt.deps.emit({ kind: 'attention', sessionId, items: [] })
   }
 
@@ -168,6 +207,8 @@ export class Watcher {
       return
     }
     this.sent.set(sessionId, key)
+    if (items.length === 0) this.cleared.add(sessionId)
+    else this.cleared.delete(sessionId)
     const event: AttentionEvent = { kind: 'attention', sessionId, items }
     this.rt.deps.emit(event)
   }

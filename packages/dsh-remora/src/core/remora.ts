@@ -1261,7 +1261,8 @@ export class RemoraCore {
         managerStarted = true
         // Do not consult `this.disposed` after this returns. On HMR, removal stops this plugin
         // before `removeBundle` resolves; the host manager still accepts the following install.
-        const result = await installVerifiedBundle(manager, path, { enabled: finalBundle.enabled, requestId: this.updateInstallation.requestId! })
+        if (typeof source !== 'string') throw new UpdateError('manual-source', 'update this installation from its original source')
+        const result = await installVerifiedBundle(manager, path, { enabled: finalBundle.enabled, requestId: this.updateInstallation.requestId! }, { spec: source, enabled: finalBundle.enabled })
         this.updateInstallation = installationResult(result, this.updateInstallation)
       } catch (error) {
         this.updateInstallation = {

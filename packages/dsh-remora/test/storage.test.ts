@@ -7,7 +7,7 @@ import { readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { JsonDocument, StorageError, remoraDataDir, resolveDshHome, type DocumentSpec } from '../src/core/storage.ts'
 import { adoptNewOperations, defaultSettings, parseSettings, settingsSpec, tasksSpec } from '../src/core/settings.ts'
-import { FileTaskStore, prune, TASK_RETENTION_MS } from '../src/core/tasks.ts'
+import { FileTaskStore, canReplaceTask, prune, TASK_RETENTION_MS } from '../src/core/tasks.ts'
 import { AuditLog, verifyChain } from '../src/core/audit.ts'
 import { tempDir } from './helpers.ts'
 
@@ -157,6 +157,12 @@ test('task records are durable when put resolves and old finished tasks are prun
       { taskId: 'running', clientId: 'c', sessionId: null, requestId: 'r', state: 'running', createdAt: 0, updatedAt: 1 },
     ], now)
     assert.deepEqual(kept.map(t => t.taskId), ['running'])
+    await store.put({ taskId: 't1', clientId: 'c', sessionId: null, requestId: 'remora:c:t1', state: 'cancelled', createdAt: 1, updatedAt: 2 })
+    await store.put({ taskId: 't1', clientId: 'c', sessionId: 's', requestId: 'remora:c:t1', state: 'accepted', createdAt: 1, updatedAt: 3 })
+    assert.equal(store.get('t1')?.state, 'cancelled')
+    assert.equal(canReplaceTask('failed', 'accepted'), true)
+    assert.equal(canReplaceTask('completed', 'accepted'), false)
+    assert.equal(canReplaceTask('cancelled', 'failed'), false)
   } finally { await cleanup() }
 })
 

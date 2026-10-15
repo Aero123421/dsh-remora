@@ -443,6 +443,7 @@ export class HostDO extends DurableObject<Env> {
     }
     await this.audit('host', 'host.connect', 'ok')
     await this.deliverUndelivered(ws)
+    await this.reconcileUnconfirmed(ws)
     await this.scheduleAlarm()
   }
 
@@ -500,26 +501,19 @@ export class HostDO extends DurableObject<Env> {
         }
         return
       }
-      case 'attention': {
-        const items = stampHostId(Array.isArray(event.items) ? event.items : [], this.hostId ?? '')
-        // Notify about items that were not in this session's list before.
-        const previous = new Set(this.attentionFor(event.sessionId).map(item => item.attentionId))
-        const now = Date.now()
-        for (const item of items) {
-          if (previous.has(item.attentionId) || !PUSH_ATTENTION_KINDS.has(item.kind)) continue
-          if (typeof item.expiresAt === 'number' && item.expiresAt <= now) continue
-          pushes.push({
-            type: 'attention',
-            kind: item.kind as PushEvent['kind'],
-            hostId: this.hostId,
-            host: this.displayName(),
-            title: pushText(String(item.title ?? '')),
-            url: answerPath(this.hostId ?? '', item.attentionId),
-            expiresAt: typeof item.expiresAt === 'number' ? item.expiresAt : null,
-          })
+      case 'attention':
+        this.storeAttention(event.sessionId, Array.isArray(event.items) ? event.items : [], pushes)
+        return
+      case 'attention-snapshot': {
+        const listed = new Set<string>()
+        for (const session of Array.isArray(event.sessions) ? event.sessions : []) {
+          if (!session || typeof session.sessionId !== 'string') continue
+          listed.add(session.sessionId)
+          this.storeAttention(session.sessionId, Array.isArray(session.items) ? session.items : [], pushes)
         }
-        if (items.length === 0) this.sql.exec('DELETE FROM attention WHERE session_id = ?', event.sessionId)
-        else this.sql.exec('INSERT INTO attention (session_id, items, updated_at) VALUES (?, ?, ?) ON CONFLICT (session_id) DO UPDATE SET items = excluded.items, updated_at = excluded.updated_at', event.sessionId, JSON.stringify(items), Date.now())
+        for (const row of this.sql.exec<{ session_id: string }>('SELECT session_id FROM attention').toArray()) {
+          if (!listed.has(row.session_id)) this.sql.exec('DELETE FROM attention WHERE session_id = ?', row.session_id)
+        }
         return
       }
       case 'host-status':
@@ -1068,6 +1062,28 @@ export class HostDO extends DurableObject<Env> {
     return parseJson<AttentionItem[]>(row?.items, [])
   }
 
+  /** Replace one session's list. Pushes only items that were not already stored. */
+  private storeAttention(sessionId: string, raw: AttentionItem[], pushes: PushEvent[]): void {
+    const items = stampHostId(raw, this.hostId ?? '')
+    const previous = new Set(this.attentionFor(sessionId).map(item => item.attentionId))
+    const now = Date.now()
+    for (const item of items) {
+      if (previous.has(item.attentionId) || !PUSH_ATTENTION_KINDS.has(item.kind)) continue
+      if (typeof item.expiresAt === 'number' && item.expiresAt <= now) continue
+      pushes.push({
+        type: 'attention',
+        kind: item.kind as PushEvent['kind'],
+        hostId: this.hostId,
+        host: this.displayName(),
+        title: pushText(String(item.title ?? '')),
+        url: answerPath(this.hostId ?? '', item.attentionId),
+        expiresAt: typeof item.expiresAt === 'number' ? item.expiresAt : null,
+      })
+    }
+    if (items.length === 0) this.sql.exec('DELETE FROM attention WHERE session_id = ?', sessionId)
+    else this.sql.exec('INSERT INTO attention (session_id, items, updated_at) VALUES (?, ?, ?) ON CONFLICT (session_id) DO UPDATE SET items = excluded.items, updated_at = excluded.updated_at', sessionId, JSON.stringify(items), Date.now())
+  }
+
   private async createTask(call: ExecuteCall): Promise<ExecuteResult> {
     const hostId = this.hostId as string
     const idempotencyKey = typeof call.params.idempotencyKey === 'string' ? call.params.idempotencyKey : null
@@ -1111,19 +1127,26 @@ export class HostDO extends DurableObject<Env> {
     return this.sql.exec<TaskRow>('SELECT * FROM tasks WHERE task_id = ?', taskId).toArray()[0]
   }
 
+  private deliveryWasStarted(row: TaskRow): boolean {
+    return parseJson<ParkedCall | null>(row.frame, null)?.deliveryStarted === true
+  }
+
   /** Reconcile the ledger with the host's durable record; task content stays on the host. */
   private async readTask(call: ExecuteCall, row: TaskRow): Promise<TaskQueryResult> {
     const ws = this.readySockets()[0]
-    if (!ws || row.delivered !== 1) return { ok: true, result: this.taskFromRow(row) }
+    const unconfirmed = row.delivered !== 1 && this.deliveryWasStarted(row)
+    if (!ws || (row.delivered !== 1 && !unconfirmed)) return { ok: true, result: this.taskFromRow(row) }
     const frame = await this.relay(ws, `r_${randomToken(12)}`, { ...call, op: 'task.get', params: { taskId: row.task_id } }, RELAY_TIMEOUT_MS, row.task_id)
     if (!frame) return { ok: false, error: err('unavailable', 'The DSH host did not answer in time.') }
     if (!frame.ok) {
       const error = frame.error ?? err('internal', 'The host returned an error without details.')
       const current = this.taskRow(row.task_id)
-      if (error.code === 'gone' && current && !TERMINAL_TASK_STATES.has(current.state as TaskState)) {
+      if ((error.code === 'gone' || error.code === 'not_found') && current && !TERMINAL_TASK_STATES.has(current.state as TaskState)) {
+        const recorded = err('gone', 'The host has no record of this task.')
         const pushes: PushEvent[] = []
-        await this.onEvent({ kind: 'task', taskId: row.task_id, state: 'failed', updatedAt: Date.now(), error }, pushes)
+        await this.onEvent({ kind: 'task', taskId: row.task_id, state: 'failed', updatedAt: Date.now(), error: recorded }, pushes)
         this.push(pushes)
+        return { ok: false, error: recorded }
       }
       return { ok: false, error: this.explainRefusal(call, error) }
     }
@@ -1187,18 +1210,68 @@ export class HostDO extends DurableObject<Env> {
     if (current === null || current > at) await this.ctx.storage.setAlarm(at)
   }
 
+  /**
+   * Ask the host about tasks this hub already sent but whose result never arrived.
+   * The prompt body is already gone, so this does not submit the task again.
+   */
+  private async reconcileUnconfirmed(ws: WebSocket): Promise<void> {
+    const rows = this.sql.exec<TaskRow>("SELECT * FROM tasks WHERE state = 'parked' AND delivered = 0 AND params IS NULL").toArray()
+    for (const row of rows) {
+      const parked = parseJson<ParkedCall | null>(row.frame, null)
+      if (!parked?.deliveryStarted) continue
+      const frame = await this.relay(ws, `r_${randomToken(12)}`, {
+        op: 'task.get', params: { taskId: row.task_id }, actor: parked.actor, scopes: parked.scopes, grant: parked.grant,
+      }, RELAY_TIMEOUT_MS)
+      if (!frame?.ok) {
+        const error = frame?.error
+        if (frame && (error?.code === 'gone' || error?.code === 'not_found')) {
+          const recorded = err('gone', 'The host has no record of this task.')
+          const pushes: PushEvent[] = []
+          await this.onEvent({ kind: 'task', taskId: row.task_id, state: 'failed', updatedAt: Date.now(), error: recorded }, pushes)
+          this.push(pushes)
+        }
+        continue
+      }
+      const fromHost = frame.result as Partial<TaskInfo> | null | undefined
+      if (!fromHost || typeof fromHost !== 'object' || fromHost.taskId !== row.task_id || !isTaskState(fromHost.state)) continue
+      const pushes: PushEvent[] = []
+      await this.onEvent({
+        kind: 'task', taskId: row.task_id, state: fromHost.state,
+        ...(typeof fromHost.sessionId === 'string' ? { sessionId: fromHost.sessionId } : {}),
+        updatedAt: typeof fromHost.updatedAt === 'number' && Number.isFinite(fromHost.updatedAt) ? fromHost.updatedAt : Date.now(),
+        ...(fromHost.error ? { error: fromHost.error } : {}),
+      }, pushes)
+      this.push(pushes)
+    }
+  }
+
   override async alarm(): Promise<void> {
     if (!this.schemaReady) return
     const now = Date.now()
     const expired = this.sql.exec<{ task_id: string }>("SELECT task_id FROM tasks WHERE state = 'parked' AND expires_at IS NOT NULL AND expires_at <= ?", now).toArray()
+    const failedIds: string[] = []
     for (const { task_id } of expired) {
-      this.sql.exec(
-        "UPDATE tasks SET state = 'failed', params = NULL, frame = NULL, updated_at = ?, error = ? WHERE task_id = ?",
-        now, JSON.stringify(err('host_offline', 'The DSH host stayed offline, so the task was never delivered.')), task_id,
-      )
+      const row = this.taskRow(task_id)
+      if (!row || row.state !== 'parked') continue
+      const parked = parseJson<ParkedCall | null>(row.frame, null)
+      if (parked?.deliveryStarted === true) {
+        this.sql.exec(
+          "UPDATE tasks SET params = NULL, expires_at = NULL, updated_at = ?, error = ?, frame = ? WHERE task_id = ? AND state = 'parked'",
+          now,
+          JSON.stringify(err('unavailable', 'The hub sent this task but has not received the result. It may still be running. Query again after the host reconnects.')),
+          JSON.stringify(parked),
+          task_id,
+        )
+      } else {
+        this.sql.exec(
+          "UPDATE tasks SET state = 'failed', params = NULL, frame = NULL, updated_at = ?, error = ? WHERE task_id = ? AND state = 'parked'",
+          now, JSON.stringify(err('host_offline', 'The DSH host stayed offline, so the task was never delivered.')), task_id,
+        )
+        failedIds.push(task_id)
+      }
       this.notify(task_id)
     }
-    const pushes = expired.map(({ task_id }) => this.taskPush(task_id, 'failed'))
+    const pushes = failedIds.map(task_id => this.taskPush(task_id, 'failed'))
     const offlineSince = Number(this.info('offline_since') ?? '0') || null
     const ws = this.readySockets()[0]
     if (offlineSince !== null && !ws && this.info('revoked') !== '1' && now - offlineSince >= OFFLINE_NOTIFY_AFTER_MS) {
@@ -1215,7 +1288,7 @@ export class HostDO extends DurableObject<Env> {
     this.settleOverdue(now)
     this.sql.exec("UPDATE confirmations SET params = '{}', result = NULL WHERE state NOT IN ('pending', 'running') AND updated_at <= ? AND (params != '{}' OR result IS NOT NULL)", now - CONFIRMATION_CONTENT_MS)
     this.sql.exec("DELETE FROM confirmations WHERE updated_at < ? AND state NOT IN ('pending', 'running')", now - RETENTION_MS)
-    const pendingDelivery = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE state = 'parked' AND delivered = 0").one().n
+    const pendingDelivery = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE state = 'parked' AND delivered = 0 AND params IS NOT NULL").one().n
     await this.scheduleAlarm(pendingDelivery > 0 && ws ? 60_000 : undefined)
   }
 

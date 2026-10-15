@@ -12,7 +12,7 @@ import type { HostLive, PendingConfirmation } from '../host-do.ts'
 import { html, json, readForm, readJson, redirect, sameOrigin } from '../http.ts'
 import { hostStub, hubStub } from '../meter.ts'
 import { oauthEnv, oauthFor, resourcesFor } from '../oauth.ts'
-import { confirmations, finalParams, liveHosts, maintenanceResult, ownerGrant, refreshParked, revokeHostEverywhere, runOperation, type Caller } from '../ops.ts'
+import { confirmations, finalParams, liveHosts, maintenanceResult, ownerGrantFor, refreshParked, revokeHostEverywhere, runOperation, type Caller } from '../ops.ts'
 import { PUSH_TYPES, type ClientWithGrants, type GrantLevel, type PushType } from '../types.ts'
 import { isPushEndpoint, isSubscriptionKey } from '../webpush.ts'
 import { safeNext } from '../next.ts'
@@ -538,7 +538,8 @@ ${task.attention && task.attention.length > 0 ? h`<section><h2>要対応</h2><ul
 ${task.result ? h`<section><h2>最後の返答</h2><div class="untrusted pre card">${task.result.reply ?? '（なし）'}</div>
 ${task.result.changes && task.result.changes.length > 0 ? h`<h2>変更ファイル</h2><ul class="list mono">${task.result.changes.map(change => h`<li>${change.status} ${change.path}</li>`)}</ul>` : ''}
 ${task.result.deliverables && task.result.deliverables.length > 0 ? h`<h2>成果物</h2><ul class="list">${task.result.deliverables.map(item => h`<li class="untrusted">${item.title}</li>`)}</ul>` : ''}</section>` : ''}
-${task.state === 'parked' ? h`<p class="muted">ホストがオフラインのため保留しています。ホストが 1 時間以内に接続すると届けます。</p>` : ''}`
+${task.state === 'parked' && task.error ? h`<p class="muted">ハブはこのタスクを送りましたが、結果はまだ届いていません。ホストが再接続したあと、このページを開き直すとホスト側の記録に合わせます。</p>` : ''}
+${task.state === 'parked' && !task.error ? h`<p class="muted">ホストがオフラインのため保留しています。ホストが 1 時間以内に接続すると届けます。</p>` : ''}`
   return view('タスク', 'home', body)
 }
 
@@ -857,7 +858,7 @@ async function confirmedOperation(env: Env, request: Request): Promise<Response>
     const host = confirmations(env, hostId)
     const pending = await host.view(body.pendingId)
     if (!pending || pending.operation !== operation) return json({ error: { code: 'not_found', message: 'No such request.' } }, { status: 404 })
-    const grant = pending.clientId === OWNER_CLIENT_ID ? ownerGrant() : (await hubStub(env).clientStanding(pending.clientId, hostId)).grant
+    const grant = pending.clientId === OWNER_CLIENT_ID ? ownerGrantFor(operation, pending.params) : (await hubStub(env).clientStanding(pending.clientId, hostId)).grant
     const ran = await host.run(body.pendingId, { requestId, confirmation, grant, origin: hubOrigin(request, env) })
     return ran.ok ? json({ ok: true, result: ran.result }) : json({ error: ran.error }, { status: 400 })
   }
