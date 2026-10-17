@@ -6,9 +6,9 @@
  * to stdout one message per line. Nothing but JSON-RPC goes to stdout.
  */
 import { createInterface } from 'node:readline'
-import { ENDPOINTS } from '@dsh-remora/protocol'
+import { ENDPOINTS, findOperationByTool } from '@dsh-remora/protocol'
 import type { Ctx } from './ctx.ts'
-import { CliError } from './errors.ts'
+import { CliError, insufficientScopeError } from './errors.ts'
 import type { Hub } from './hub.ts'
 
 /** Tried first by `mcp probe`: no handshake, `_meta` + header checks. */
@@ -17,6 +17,9 @@ export const MCP_MODERN_VERSION = '2026-07-28'
 export const MCP_LEGACY_VERSION = '2025-06-18'
 /** @deprecated kept for callers of round 1 */
 export const MCP_CLIENT_PROTOCOL_VERSION = MCP_LEGACY_VERSION
+/** Covers the hub relay plus a full 25-second long poll and network overhead. */
+export const MCP_REQUEST_TIMEOUT_MS = 60_000
+const MCP_PROBE_TIMEOUT_MS = 30_000
 const META_VERSION = 'io.modelcontextprotocol/protocolVersion'
 
 type Json = Record<string, unknown>
@@ -54,8 +57,8 @@ function modernHeaders(message: unknown): Record<string, string> | null {
   return headers
 }
 
-function rpcError(id: string | number | null, code: number, message: string): Json {
-  return { jsonrpc: '2.0', id, error: { code, message } }
+function rpcError(id: string | number | null, code: number, message: string, data?: unknown): Json {
+  return { jsonrpc: '2.0', id, error: { code, message, ...(data === undefined ? {} : { data }) } }
 }
 
 /** Parse an SSE body, calling `onData` for each event's data. */
@@ -105,14 +108,35 @@ export class McpForwarder {
   readonly hub: Hub
   protocolVersion: string | null = null
   sessionId: string | null = null
+  private readonly inFlight = new Map<string | number, AbortController>()
   constructor(hub: Hub) { this.hub = hub }
 
-  async send(message: unknown, emit: (reply: unknown) => void): Promise<void> {
+  /** Cancellation only stops waiting for this transport; it never cancels a DSH task. */
+  async send(message: unknown, emit: (reply: unknown) => void, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<void> {
+    const rpc = message as Json | null
+    if (rpc?.method === 'notifications/cancelled') {
+      const id = (rpc.params as Json | undefined)?.requestId
+      if (typeof id === 'string' || typeof id === 'number') this.inFlight.get(id)?.abort()
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), options.timeoutMs ?? MCP_REQUEST_TIMEOUT_MS)
+    const signal = options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal
+    const ids = requestIds(message)
+    for (const id of ids) this.inFlight.set(id, controller)
+    try {
+      await this.forward(message, emit, signal)
+    } finally {
+      clearTimeout(timer)
+      for (const id of ids) if (this.inFlight.get(id) === controller) this.inFlight.delete(id)
+    }
+  }
+
+  private async forward(message: unknown, emit: (reply: unknown) => void, signal: AbortSignal): Promise<void> {
     const ids = requestIds(message)
     const requested = new Set(ids)
     const pending = new Set(ids)
-    const fail = (text: string) => {
-      for (const id of pending) { pending.delete(id); emit(rpcError(id, -32000, text)) }
+    const fail = (text: string, data?: unknown) => {
+      for (const id of pending) { pending.delete(id); emit(rpcError(id, -32000, text, data)) }
     }
     const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }
     if (this.protocolVersion) headers['mcp-protocol-version'] = this.protocolVersion
@@ -120,10 +144,10 @@ export class McpForwarder {
     Object.assign(headers, modernHeaders(message) ?? {})
     let response: Response
     try {
-      response = await this.hub.authorizedFetch('mcp', this.hub.url + ENDPOINTS.mcp, { method: 'POST', headers, body: JSON.stringify(message) })
+      response = await this.hub.authorizedFetch('mcp', this.hub.url + ENDPOINTS.mcp, { method: 'POST', headers, body: JSON.stringify(message), signal })
     } catch (error) {
       const hint = error instanceof CliError && error.detail.hint ? ` ${error.detail.hint}` : ''
-      fail(`Remora: ${(error as Error).message}${hint}`)
+      fail(signal.aborted ? transportAbort(signal) : `Remora: ${(error as Error).message}${hint}`)
       return
     }
     const session = response.headers.get('mcp-session-id')
@@ -146,13 +170,26 @@ export class McpForwarder {
     try {
       if (!response.ok) {
         let detail = ''
+        const challenge = response.headers.get('www-authenticate')
+        let body: unknown
         try {
-          const body = await response.json() as { jsonrpc?: unknown; error?: { message?: unknown } | string, error_description?: unknown }
+          body = await response.json()
+          const parsed = body as { jsonrpc?: unknown; error?: { message?: unknown } | string, error_description?: unknown }
           // A JSON-RPC error with an HTTP status (e.g. 400 unsupported version) goes to the client as is.
-          if (body?.jsonrpc === '2.0' && ids.length > 0) { watch(body); fail('Remora: ハブが応答を返しませんでした'); return }
-          const e = body?.error
+          if (parsed?.jsonrpc === '2.0' && ids.length > 0) { watch(parsed); fail('Remora: ハブが応答を返しませんでした'); return }
+          const e = parsed?.error
           detail = typeof e === 'string' ? e : typeof e?.message === 'string' ? e.message : ''
-        } catch { /* not JSON */ }
+        } catch {
+          if (signal.aborted) throw signal.reason
+          // Non-JSON HTTP errors still carry status and possibly an OAuth challenge.
+        }
+        const params = (message as Json | null)?.params as Json | undefined
+        const needed = typeof params?.name === 'string' ? findOperationByTool(params.name)?.scope : undefined
+        const scopeError = insufficientScopeError(body, challenge, needed)
+        if (scopeError) {
+          fail(`Remora: ${scopeError.message} ${scopeError.detail.hint}`, { status: response.status, error: 'insufficient_scope', wwwAuthenticate: challenge, ...((body as Json | null)?.error_description ? { error_description: (body as Json).error_description } : {}) })
+          return
+        }
         fail(`Remora: ハブがエラーを返しました（HTTP ${response.status}${detail ? `: ${detail}` : ''}）${response.status === 401 ? '。remora login でログインし直してください' : ''}`)
         return
       }
@@ -186,9 +223,15 @@ export class McpForwarder {
     } catch {
       // A response may fail after its headers, or after only part of a batch.
       // Report only unanswered requests; notifications never get an error reply.
-      fail('Remora: ハブとの接続が応答の途中で切れました')
+      fail(signal.aborted ? transportAbort(signal) : 'Remora: ハブとの接続が応答の途中で切れました')
     }
   }
+}
+
+function transportAbort(signal: AbortSignal): string {
+  return signal.reason?.name === 'TimeoutError'
+    ? 'Remora: ハブの応答がありません（タイムアウト）。操作が実行済みの可能性があります。状態を確認してから再試行してください。'
+    : 'Remora: 応答の待機を取り消しました。DSH の操作は続いている可能性があります。'
 }
 
 /** Run the stdio bridge until stdin closes. */
@@ -231,7 +274,8 @@ export interface ProbeResult {
  * refuses it, fall back to the 2025-06-18 `initialize` handshake. Then list
  * every tool (following cursors).
  */
-export async function probe(hub: Hub): Promise<ProbeResult> {
+export async function probe(hub: Hub, options: { timeoutMs?: number } = {}): Promise<ProbeResult> {
+  const signal = AbortSignal.timeout(options.timeoutMs ?? MCP_PROBE_TIMEOUT_MS)
   const forwarder = new McpForwarder(hub)
   let nextId = 1
   let modern = false
@@ -239,10 +283,10 @@ export async function probe(hub: Hub): Promise<ProbeResult> {
     const id = nextId++
     const replies: unknown[] = []
     const withMeta = modern ? { ...params, _meta: { ...(params._meta as Json | undefined), [META_VERSION]: MCP_MODERN_VERSION } } : params
-    await forwarder.send({ jsonrpc: '2.0', id, method, params: withMeta }, reply => { replies.push(...(Array.isArray(reply) ? reply : [reply])) })
+    await forwarder.send({ jsonrpc: '2.0', id, method, params: withMeta }, reply => { replies.push(...(Array.isArray(reply) ? reply : [reply])) }, { signal })
     const reply = replies.find(r => (r as Json | null)?.id === id) as Json | undefined
     if (!reply) throw new CliError(`${method} の応答がありません。`)
-    if (reply.error) throw new CliError(`${method} が失敗しました: ${String((reply.error as Json).message)}`)
+    if (reply.error) throw new CliError(`${method} が失敗しました: ${String((reply.error as Json).message)}`, undefined, { code: String((reply.error as Json).code) })
     return reply.result as Json
   }
   let serverInfo: unknown
@@ -251,14 +295,15 @@ export async function probe(hub: Hub): Promise<ProbeResult> {
   try {
     const discovered = await call('server/discover', {})
     const versions = discovered.supportedVersions
-    if (Array.isArray(versions) && !versions.includes(MCP_MODERN_VERSION)) throw new CliError('2026-07-28 is not supported')
+    if (Array.isArray(versions) && !versions.includes(MCP_MODERN_VERSION)) throw new CliError('2026-07-28 is not supported', undefined, { code: '-32022' })
     serverInfo = ((discovered._meta ?? {}) as Json)['io.modelcontextprotocol/serverInfo'] ?? discovered.serverInfo
     protocolVersion = MCP_MODERN_VERSION
-  } catch {
+  } catch (error) {
+    if (signal.aborted || !(error instanceof CliError) || !['-32022', '-32601'].includes(error.detail.code ?? '')) throw error
     modern = false
     const init = await call('initialize', { protocolVersion: MCP_LEGACY_VERSION, capabilities: {}, clientInfo: { name: 'remora-cli', version: '0' } })
     if (typeof init.protocolVersion === 'string') forwarder.protocolVersion = init.protocolVersion
-    await forwarder.send({ jsonrpc: '2.0', method: 'notifications/initialized' }, () => {})
+    await forwarder.send({ jsonrpc: '2.0', method: 'notifications/initialized' }, () => {}, { signal })
     serverInfo = init.serverInfo
     protocolVersion = init.protocolVersion
   }

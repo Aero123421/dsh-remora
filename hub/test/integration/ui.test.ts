@@ -37,6 +37,9 @@ describe('owner pages', () => {
     expect(home).toContain('test-pc')
     expect(home).toContain('リモート全権')
     expect(home).toContain('無料枠')
+    expect(home).toContain('実行時間・保存容量などは含みません')
+    expect(home).toContain('Free プランは無料枠の上限で利用が止まります')
+    expect(home).toContain('Paid プランでは超過分が課金')
 
     const hostPage = await (await owner.browser.fetch(`/hosts/${host.hostId}`)).text()
     expect(hostPage).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
@@ -61,7 +64,8 @@ describe('owner pages', () => {
     const attention = await (await owner.browser.fetch('/attention')).text()
     expect(attention).toContain('Which file?')
     expect(attention).toContain('data-confirm-op="approval.respond"')
-    expect(attention).toContain('パスキーで署名する内容')
+    expect(attention).toContain('<details class="confirm-preview"><summary>パスキーで署名する内容</summary>')
+    expect(attention).not.toContain('<details class="confirm-preview" open')
     expect(attention).toContain('tool-ask-user を timed に切り替える')
     const answered = await owner.browser.postForm('/attention/respond', { hostId: host.hostId, sessionId: 's1', attentionId: 'q1', optionId: 'a' })
     expect(answered.headers.get('location')).toBe('/attention?msg=sent')
@@ -119,5 +123,54 @@ describe('owner pages', () => {
       expect(meter.workerRequests).toBeGreaterThan(0)
       expect(meter.durableObjectRequests).toBeGreaterThan(0)
     }, 10_000)
+  })
+
+  it('preserves escaped prompt and schedule drafts after validation and host operation failures', async () => {
+    const owner = await setupOwner()
+    const host = await FakeHost.create()
+    await host.pair(owner, 'draft-pc')
+    const requests: Extract<HubFrame, { t: 'request' }>[] = []
+    host.respond = frame => {
+      requests.push(frame)
+      if (frame.op === 'session.get') return { ok: true, result: { session: { sessionId: 's1', title: 'Draft test', workspaceId: 'w1', parentSessionId: null, pinned: false, archived: false, running: false, updatedAt: now, agentPreset: 'standard', model: null }, context: null, recentTurns: [], queueLength: 0, attention: [], hasLiveClient: false, untrusted: true } }
+      if (frame.op === 'schedules.list') return { ok: true, result: { schedules: [] } }
+      return { ok: false, error: { code: 'unavailable', message: 'Please try again later' } }
+    }
+    await host.connect({ ceiling: { level: 'request' }, operations: ['session.get', 'task.start', 'task.steer', 'schedules.list', 'schedule.create'] })
+    await host.next('ready')
+    const base = `/hosts/${host.hostId}/sessions/s1`
+    const prompt = '</textarea><script>draft()</script> & keep this'
+    const draft = await owner.browser.postForm(`${base}/prompt`, { prompt, skills: '/review /test', idempotencyKey: 'retry-prompt' })
+    expect(draft.status).toBe(200)
+    const page = await draft.text()
+    expect(page).toContain('&lt;/textarea&gt;&lt;script&gt;draft()&lt;/script&gt; &amp; keep this</textarea>')
+    expect(page).not.toContain('<script>draft()')
+    expect(page).toContain('value="/review /test"')
+    expect(page).toContain('value="retry-prompt"')
+    expect(page).toContain('Please try again later')
+    const steer = await owner.browser.postForm(`${base}/steer`, { prompt: 'keep my extra instruction', idempotencyKey: 'retry-steer' })
+    expect(await steer.text()).toContain('keep my extra instruction</textarea>')
+    const fields = { title: 'Saved <title>', prompt, kind: 'weekly', time: 'bad time', minutes: '13', timeZone: 'Europe/London', weekday: ['1', '5'], at: '2030-10-17T09:30', cron: '0 9 * * 1-5', idempotencyKey: 'retry-schedule' }
+    const post = (data: typeof fields) => owner.browser.fetch(`${base}/schedule-create`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(Object.entries(data).flatMap(([key, value]) => (Array.isArray(value) ? value : [value]).map(value => [key, value]))).toString() })
+    const invalid = await post(fields)
+    const invalidPage = await invalid.text()
+    expect(invalidPage).toContain('value="Saved &lt;title&gt;"')
+    expect(invalidPage).toContain('value="weekly" selected')
+    expect(invalidPage).toContain('value="bad time"')
+    expect(invalidPage).toContain('name="weekday" value="1" checked')
+    expect(invalidPage).toContain('name="weekday" value="5" checked')
+    expect(invalidPage).toContain('value="Europe/London"')
+    expect(invalidPage).toContain('value="2030-10-17T09:30"')
+    expect(invalidPage).toContain('value="0 9 * * 1-5"')
+    expect(invalidPage).toContain('value="retry-schedule"')
+    expect(requests.some(frame => frame.op === 'schedule.create')).toBe(false)
+    const failed = await post({ ...fields, time: '09:30' })
+    const failedPage = await failed.text()
+    expect(failedPage).toContain('Please try again later')
+    expect(failedPage).toContain('value="Saved &lt;title&gt;"')
+    expect(failedPage).toContain('value="retry-schedule"')
+    expect(failedPage).toContain('&lt;/textarea&gt;&lt;script&gt;draft()&lt;/script&gt; &amp; keep this</textarea>')
+    expect(requests.some(frame => frame.op === 'schedule.create')).toBe(true)
+    host.socket?.close(1000, 'done')
   })
 })

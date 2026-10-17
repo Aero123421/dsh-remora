@@ -7,6 +7,7 @@
  * WebAuthn ceremonies are verified in the Worker; this object stores what
  * they produce and hands out single-use challenges.
  */
+import { WAIT_HEADER, WAIT_PATH, isWaitSocket, mintWait, readWait, openWait, notifyWaiters, waitResult } from './ledger-wait.ts'
 import { DurableObject } from 'cloudflare:workers'
 import { AUDIT_SCHEMA, appendAudit, listAudit, type AuditEntry, type AuditRow } from './audit.ts'
 import { CHALLENGE_TTL_MS, DEVICE_CODE_TTL_MS, DEVICE_POLL_INTERVAL_S, FULL_ACCESS_MS, RECOVERY_CODE_COUNT, REAUTH_WINDOW_MS, SESSION_IDLE_MS, SESSION_MAX_MS } from './config.ts'
@@ -582,6 +583,7 @@ export class HubDO extends DurableObject<Env> {
     const approvals = this.sql.exec<{ id: string }>("SELECT id FROM approvals WHERE client_id = ? AND state IN ('pending', 'done')", clientId).toArray()
     this.sql.exec("UPDATE approvals SET state = 'denied', decided_at = ?, updated_at = ? WHERE client_id = ? AND state IN ('pending', 'done')", now, now, clientId)
     for (const { id } of approvals) this.wakeApproval(id)
+    await Promise.all((await this.listHosts()).map(host => this.env.HOST.get(this.env.HOST.idFromName(host.hostId)).wakeClientWaits(clientId)))
     await this.audit({ actor: 'owner', actorName: 'オーナー', operation: 'client.revoke', hostId: null, outcome: 'ok', layer: null, reason: clientId })
   }
 
@@ -601,6 +603,7 @@ export class HubDO extends DurableObject<Env> {
        ON CONFLICT (client_id, host_id) DO UPDATE SET level = excluded.level, full_access_expires_at = excluded.full_access_expires_at`,
       clientId, hostId, level, expires,
     )
+    await this.env.HOST.get(this.env.HOST.idFromName(hostId)).wakeClientWaits(clientId)
     await this.audit({ actor: 'owner', actorName: 'オーナー', operation: `grant.set.${level}`, hostId, outcome: 'ok', layer: null, reason: clientId })
     return { ok: true }
   }
@@ -852,8 +855,6 @@ export class HubDO extends DurableObject<Env> {
 
   // --- hub maintenance parked for the owner (OWNER_APPROVED_OPERATIONS) ------------
 
-  private readonly approvalWaiters = new Map<string, Set<() => void>>()
-
   private approvalRow(id: string): ApprovalRecord | null {
     const row = this.sql.exec<{ id: string; client_id: string; client_name: string; op: string; state: string; created_at: number; expires_at: number; decided_at: number | null }>(
       'SELECT id, client_id, client_name, op, state, created_at, expires_at, decided_at FROM approvals WHERE id = ?', id,
@@ -872,8 +873,38 @@ export class HubDO extends DurableObject<Env> {
   }
 
   private wakeApproval(id: string): void {
-    for (const wake of this.approvalWaiters.get(id) ?? []) wake()
-    this.approvalWaiters.delete(id)
+    notifyWaiters(this.ctx, id)
+  }
+
+  async prepareApprovalWait(id: string, clientId: string | undefined, timeoutMs: number): Promise<string> {
+    let secret = this.meta('ledger_wait_key')
+    if (!secret) { secret = randomToken(32); this.setMeta('ledger_wait_key', secret) }
+    return mintWait(secret, { id, clientId, timeoutMs })
+  }
+
+  override async fetch(request: Request): Promise<Response> {
+    if (request.method !== 'GET' || new URL(request.url).pathname !== WAIT_PATH || request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return new Response('not found', { status: 404 })
+    const cap = await readWait<{ id: string; clientId?: string; timeoutMs: number }>(this.meta('ledger_wait_key'), request.headers.get(WAIT_HEADER))
+    if (!cap) return new Response('invalid wait capability', { status: 403 })
+    const { id, clientId, timeoutMs } = cap.input
+    const timeout = Math.max(0, Math.min(TASK_WAIT_MAX_MS, timeoutMs))
+    const subscription = openWait(this.ctx, { kind: 'ledger-wait', key: id, clientId: clientId ?? '__owner__', nonce: cap.nonce, expiresAt: Date.now() + timeout + 5000 })
+    if (!subscription) return Response.json({ waitError: 'rate_limited' })
+    const row = await this.approvalFor(id, clientId)
+    waitResult(subscription.server, row, row?.state === 'pending' && timeout > 0, Math.min(timeout, Math.max(0, (row?.expiresAt ?? Infinity) - Date.now()) + 50))
+    return subscription.response
+  }
+
+  override async webSocketMessage(ws: WebSocket): Promise<void> {
+    if (isWaitSocket(ws)) ws.close(1008, 'notifications only')
+  }
+
+  override async webSocketClose(ws: WebSocket, code: number): Promise<void> {
+    try { ws.close(code === 1005 || code === 1006 ? 1000 : code, 'closing') } catch { /* already closed */ }
+  }
+
+  override async webSocketError(ws: WebSocket): Promise<void> {
+    try { ws.close(1011, 'error') } catch { /* already closed */ }
   }
 
   /** Park a client's call. Refuses when the client already has too many waiting. */
@@ -892,28 +923,11 @@ export class HubDO extends DurableObject<Env> {
     return this.approvalRow(id) as ApprovalRecord
   }
 
-  /** One request; with `clientId`, only that client's own. Waits up to `timeoutMs` while it is pending. */
-  async approvalFor(id: string, clientId?: string, timeoutMs = 0): Promise<ApprovalRecord | null> {
+  /** One immediate ledger read; the outer Worker owns any long-poll timeout. */
+  async approvalFor(id: string, clientId?: string): Promise<ApprovalRecord | null> {
     this.settleApprovals()
-    const visible = (row: ApprovalRecord | null) => (row && (clientId === undefined || row.clientId === clientId) ? row : null)
-    const row = visible(this.approvalRow(id))
-    if (!row || row.state !== 'pending' || timeoutMs <= 0) return row
-    const wait = Math.min(TASK_WAIT_MAX_MS, timeoutMs, Math.max(0, row.expiresAt - Date.now()) + 50)
-    await new Promise<void>(resolve => {
-      const timer = setTimeout(() => {
-        this.approvalWaiters.get(id)?.delete(wake)
-        resolve()
-      }, wait)
-      const wake = () => {
-        clearTimeout(timer)
-        resolve()
-      }
-      const set = this.approvalWaiters.get(id) ?? new Set()
-      set.add(wake)
-      this.approvalWaiters.set(id, set)
-    })
-    this.settleApprovals()
-    return visible(this.approvalRow(id))
+    const row = this.approvalRow(id)
+    return row && (clientId === undefined || row.clientId === clientId) ? row : null
   }
 
   /** Count one delivery of an approved request's result. False once it is spent or too old. */

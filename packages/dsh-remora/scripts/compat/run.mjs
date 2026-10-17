@@ -7,13 +7,14 @@
 // DSH_UPSTREAM_COMMIT=<40-hex sha> fetches that commit instead of upstream.json.
 // DSH_UPSTREAM_DIR=<checkout> skips the git fetch and uses a local checkout.
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { cacheRoot, compileOfficial, ensureUpstream, packageRoot, pinned, upstreamCommit, upstreamRoot } from './upstream.mjs'
+import { cacheRoot, compileOfficial, ensureUpstream, packageRoot, upstreamIdentity } from './upstream.mjs'
 
 await ensureUpstream()
+console.log(`DSH ${await upstreamIdentity()}: Remora adapter compat`)
 const bundle = join(cacheRoot, 'compat-host.mjs')
 await compileOfficial(join(packageRoot, 'scripts/compat/host-entry.ts'), bundle, {
   '@dsh-compat/mock-adapter': 'packages/core/agent-loop/tests/mock-adapter.ts',
@@ -188,11 +189,6 @@ const taskStates = taskId => emitted.filter(e => e.kind === 'task' && e.taskId =
 const userMessages = sessionId => ctx.sessions.get(sessionId)?.snapshotEvents().filter(e => e.type === 'user/message').length ?? 0
 
 let sessionId
-let runningVersion = pinned.version
-try {
-  runningVersion = JSON.parse(await readFile(join(upstreamRoot, 'apps/cli/package.json'), 'utf8')).version ?? runningVersion
-} catch { /* the pin label remains */ }
-console.log(`DSH ${runningVersion} (${upstreamCommit.slice(0, 7)}): Remora adapter compat`)
 
 await step('remote access admits an in-process session read', async () => {
   assert.equal(ctx.get('remoteAccess').allows({ kind: 'session', id: 'compat-session' }), true)

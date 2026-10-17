@@ -63,7 +63,7 @@ const when: JsonSchema = {
 const answer = obj({
   optionId: str('Id of the chosen option.', 200),
   text: str('Free-text answer.', 20_000),
-  approve: bool('Approve (true) or reject (false). Plan reviews only.'),
+  approve: bool('Approve (true) or reject (false). For plan reviews and DSH approvals.'),
 })
 
 export const INPUT_SCHEMAS: Readonly<Record<OperationId, ObjectSchema>> = {

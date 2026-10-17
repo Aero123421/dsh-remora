@@ -185,7 +185,8 @@ table.grants select { width: auto; min-width: 160px; }
 .command { unicode-bidi: isolate; direction: ltr; white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(0, 0, 0, 0.35); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 0; }
 .hits .snippet { margin: 4px 0 0; }
 .weekdays { display: flex; flex-wrap: wrap; gap: 4px 12px; }
-.confirm-preview { margin-top: 10px; }
+.confirm-preview { margin-top: 10px; min-width: 0; }
+.confirm-preview .codes { overflow-wrap: anywhere; }
 [hidden] { display: none !important; }
 
 @media (max-width: 560px) {

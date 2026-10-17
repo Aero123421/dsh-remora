@@ -52,7 +52,11 @@
     const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}), credentials: 'same-origin' })
     let data = {}
     try { data = await response.json() } catch { /* empty body */ }
-    if (!response.ok) throw new Error((data.error && data.error.message) || `HTTP ${response.status}`)
+    if (!response.ok) {
+      const error = new Error((data.error && data.error.message) || `HTTP ${response.status}`)
+      error.code = data.error && data.error.code
+      throw error
+    }
     return data
   }
 
@@ -79,7 +83,14 @@
   }
 
   const register = async (prefix, extra) => {
-    const { challengeId, options } = await post(`${prefix}/options`, extra)
+    let prepared
+    try { prepared = await post(`${prefix}/options`, extra) } catch (error) {
+      // Only the server decides whether login/recovery is still fresh enough.
+      if (prefix !== '/auth/passkeys' || error.code !== 'reauth_required') throw error
+      await reauth()
+      prepared = await post(`${prefix}/options`, extra)
+    }
+    const { challengeId, options } = prepared
     const credential = await navigator.credentials.create({ publicKey: creationOptions(options) })
     return post(`${prefix}/verify`, { challengeId, response: credentialJson(credential), label: (extra && extra.label) || '' })
   }
@@ -136,6 +147,9 @@
         const submitter = event.submitter
         if (form.dataset.reauthed === '1' || (submitter && submitter.hasAttribute('data-no-reauth'))) return
         event.preventDefault()
+        const select = form.querySelector('select[data-autosubmit]')
+        const controls = [...form.querySelectorAll('button, select')]
+        for (const control of controls) control.disabled = true
         try {
           await reauth()
           form.dataset.reauthed = '1'
@@ -146,9 +160,12 @@
             hidden.value = submitter.value
             form.appendChild(hidden)
           }
+          for (const control of controls) control.disabled = false
           form.submit()
         } catch (error) {
-          say(form, explain(error), 'error')
+          for (const control of controls) control.disabled = false
+          if (select) select.value = [...select.options].find(option => option.defaultSelected)?.value || select.options[0].value
+          say(form, explain(error) + (select ? ' 変更は保存されていません。範囲を選び直して保存してください。' : ''), 'error')
         }
       })
     }
@@ -157,7 +174,6 @@
       form.addEventListener('submit', async event => {
         event.preventDefault()
         try {
-          await reauth()
           await register('/auth/passkeys', { label: String(new FormData(form).get('label') || '') })
           location.assign('/settings?msg=passkey-added#passkeys')
         } catch (error) {

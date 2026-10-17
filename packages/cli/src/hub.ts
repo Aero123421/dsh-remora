@@ -10,6 +10,19 @@ import { withTokenLock } from './token-lock.ts'
 export type Audience = 'api' | 'mcp'
 export type OpId = keyof OperationParams & keyof OperationResults
 
+/** Stop this caller waiting without interrupting shared refresh-token rotation/persistence. */
+async function awaitToken(pending: Promise<string>, signal?: AbortSignal | null): Promise<string> {
+  if (!signal) return pending
+  let aborted!: () => void
+  const cancellation = new Promise<never>((_resolve, reject) => {
+    aborted = () => reject(signal.reason)
+    if (signal.aborted) aborted()
+    else signal.addEventListener('abort', aborted, { once: true })
+  })
+  try { return await Promise.race([pending, cancellation]) }
+  finally { signal.removeEventListener('abort', aborted) }
+}
+
 /** Refresh this long before the access token expires. */
 const EXPIRY_MARGIN_MS = 60_000
 
@@ -75,7 +88,9 @@ export class Hub {
 
   /** fetch with the bearer token; on 401 refresh once and retry. */
   async authorizedFetch(audience: Audience, url: string, init: RequestInit): Promise<Response> {
+    init.signal?.throwIfAborted()
     const attempt = async (token: string) => {
+      init.signal?.throwIfAborted()
       try {
         return await this.ctx.fetch(url, { ...init, headers: { ...(init.headers as Record<string, string>), authorization: `Bearer ${token}` } })
       } catch (error) {
@@ -84,11 +99,11 @@ export class Hub {
         throw new CliError(`ハブに接続できません（${this.url}）: ${cause?.code ?? (error as Error).message}`, EXIT.unavailable, { code: 'network' })
       }
     }
-    const token = await this.token(audience)
+    const token = await awaitToken(this.token(audience), init.signal)
     let response = await attempt(token)
     if (response.status === 401 && !this.staticToken && this.tokens?.refreshToken) {
       await response.body?.cancel().catch(() => {})
-      response = await attempt(await this.token(audience, true, token))
+      response = await attempt(await awaitToken(this.token(audience, true, token), init.signal))
     }
     return response
   }

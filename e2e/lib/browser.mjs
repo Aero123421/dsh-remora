@@ -105,6 +105,7 @@ export async function addVirtualAuthenticator(page) {
   return {
     authenticatorId,
     credentials: async () => (await cdp.send('WebAuthn.getCredentials', { authenticatorId })).credentials,
+    clearCredentials: () => cdp.send('WebAuthn.clearCredentials', { authenticatorId }),
     detach: () => cdp.detach().catch(() => {}),
   }
 }

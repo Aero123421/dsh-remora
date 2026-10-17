@@ -54,7 +54,7 @@ HMR のあるプロファイルでは、導入済みパッケージへの `insta
 
 候補の `peerDependencies` の `@deepseek-ai/dsh` は、下限と、`0.3.0-0` を含まない上限が両方ある範囲だけ導入できます。`*`、`x`、`>=0`、空文字、`<99`、`^0` は互換性不明として拒否します。`>=0.2.1-alpha.2 <0.3.0-0` と、それより狭い `>=0.2.1-alpha.2 <0.2.2-0` は範囲として受けます。実行中の DSH の版が取れないときも確認を省かず、導入しません。このプラグイン自身の peer は `>=0.2.1-alpha.2 <0.2.2-0` のままです。
 
-CI のジョブ `Adapter compat (latest DSH alpha)` は、`dsh-v*-alpha.*` で最も新しいタグのコミットに `DSH_UPSTREAM_COMMIT` を渡して `pnpm --filter dsh-remora test:compat` を実行します。ローカルの `test:compat` は `upstream.json` のコミットです。
+CI のジョブ `Adapter compat (latest supported DSH)` は、プラグインの peer 範囲に入る最新の公開 `dsh-v*` タグ（RC を含む）のコミットに `DSH_UPSTREAM_COMMIT` を渡して `pnpm --filter dsh-remora test:compat` を実行します。ローカルの `test:compat` は `upstream.json` のコミットです。`DSH_UPSTREAM_DIR` を指定した場合、診断には実チェックアウトのコミットと変更の有無を表示します。
 
 ## v0.1.2 の追加検証（2026-10-13）
 

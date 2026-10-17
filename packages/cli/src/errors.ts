@@ -104,6 +104,17 @@ export function missingScope(scope: string): CliError {
   })
 }
 
+/** Preserve OAuth step-up advice when HTTP authentication cannot reach a stdio client. */
+export function insufficientScopeError(body: unknown, challenge: string | null, requiredScope?: string): CliError | null {
+  const oauth = body as { error?: unknown; error_description?: unknown } | null
+  if (oauth?.error !== 'insufficient_scope' && !/\berror="insufficient_scope"/.test(challenge ?? '')) return null
+  const scopes = /\bscope="([^"]*)"/.exec(challenge ?? '')?.[1]?.split(/\s+/).filter(Boolean) ?? []
+  const scope = requiredScope ?? (scopes.includes('dsh.admin') ? 'dsh.admin' : scopes.includes('dsh.content') ? 'dsh.content' : scopes.join(' '))
+  const error = missingScope(scope || '<required scope>')
+  if (typeof oauth?.error_description === 'string' && oauth.error_description) error.message = `${oauth.error_description}。${error.message}`
+  return error
+}
+
 /** Turn the body of a non-2xx HTTP API response into a CliError. */
 export function fromHttpError(status: number, body: unknown): CliError {
   const error = (body as { error?: Partial<RemoraError> } | null)?.error

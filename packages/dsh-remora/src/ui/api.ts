@@ -71,13 +71,26 @@ function snapshotStore(ctx: ClientContext): SnapshotStore<RemoraSnapshot> {
 /** The snapshot, refreshed every `intervalMs` while the page is visible. */
 export function useSnapshot(ctx: ClientContext, intervalMs: number) {
   const store = snapshotStore(ctx)
-  const { snapshot, failed } = useSyncExternalStore(store.subscribe, store.getSnapshot)
+  const { snapshot, failed, lastChecked } = useSyncExternalStore(store.subscribe, store.getSnapshot)
   useEffect(() => {
-    const release = store.retain()
-    const timer = setInterval(() => { if (document.visibilityState === 'visible') void store.reload() }, intervalMs)
-    return () => { clearInterval(timer); release() }
+    const release = store.retain(document.visibilityState === 'visible')
+    let timer: ReturnType<typeof setInterval> | undefined
+    const update = () => {
+      if (timer !== undefined) clearInterval(timer)
+      timer = undefined
+      if (document.visibilityState !== 'visible') return
+      void store.reload()
+      timer = setInterval(() => { void store.reload() }, intervalMs)
+    }
+    update()
+    document.addEventListener('visibilitychange', update)
+    return () => {
+      document.removeEventListener('visibilitychange', update)
+      if (timer !== undefined) clearInterval(timer)
+      release()
+    }
   }, [store, intervalMs])
-  return { snapshot, store, failed, reload: store.reload }
+  return { snapshot, store, failed, lastChecked, reload: store.reload }
 }
 
 /** Run a settings action; the returned snapshot replaces the current one. */

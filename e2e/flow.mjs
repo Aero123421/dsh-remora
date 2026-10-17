@@ -132,6 +132,7 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
       throw new Error(`no recovery codes after registration${status ? `: ${await status.innerText()}` : ''}`)
     }
     const recovery = (await codes.innerText()).split('\n').filter(Boolean)
+    state.recoveryCode = recovery[0]
     await shot(page, artifacts, 'flow-hub-recovery-codes')
     await (await mustBePresent(page, HUB.recoveryAcknowledge, 'the "saved them, continue" link')).click()
     await mustBePresent(page, HUB.signedIn, 'the signed-in navigation after setup', 20_000)
@@ -141,7 +142,30 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
     return `${credentials.length} passkey(s) on the virtual authenticator (rpId ${credentials[0].rpId}), ${recovery.length} recovery codes shown once; ${path}`
   })
 
-  await r.step('host.pair', 'DSH host pairs: code from the Remora tab, approved on /pair with passkey re-auth, tab shows Connected', { needs: ['hub.owner', 'browser.remora-tab'], timeoutMs: 150_000, onFailure: failShot('pair', 'dsh') }, async () => {
+  await r.step('hub.recovery', 'After losing every passkey, a recovery code permits a new passkey and that key can log in', { needs: ['hub.owner'], timeoutMs: 90_000, onFailure: failShot('recovery') }, async () => {
+    const page = state.hubPage
+    await page.goto(`${state.hub.origin}/settings`)
+    await page.locator('form[action="/auth/logout"] button').click()
+    await page.waitForURL(/\/login/)
+    await state.authenticator.clearCredentials()
+    if ((await state.authenticator.credentials()).length !== 0) throw new Error('the old virtual credential was not removed')
+    await page.locator('details.recovery summary').click()
+    await page.locator('form[action="/auth/recovery"] input[name="code"]').fill(state.recoveryCode)
+    await page.locator('form[action="/auth/recovery"] button').click()
+    await page.waitForURL(/\/settings\?recovered=1/)
+    await page.locator('form[data-add-passkey] input[name="label"]').fill('Recovered E2E key')
+    await page.locator('form[data-add-passkey] button[type="submit"]').click()
+    await page.waitForURL(/\/settings\?msg=passkey-added/)
+    if ((await state.authenticator.credentials()).length !== 1) throw new Error('recovery did not create exactly one new credential')
+    await page.locator('form[action="/auth/logout"] button').click()
+    await page.waitForURL(/\/login/)
+    await page.locator('[data-login]').click()
+    await mustBePresent(page, HUB.signedIn, 'signed-in navigation after login with the recovered key', 20_000)
+    state.recoveryCode = undefined
+    return 'all old device credentials removed; recovery created a new passkey; new passkey login succeeded'
+  })
+
+  await r.step('host.pair', 'DSH host pairs: code from the Remora tab, approved on /pair with passkey re-auth, tab shows Connected', { needs: ['hub.recovery', 'browser.remora-tab'], timeoutMs: 150_000, onFailure: failShot('pair', 'dsh') }, async () => {
     const page = dshSession.page
     const { section } = await ensureRemoraTab(page)
     await openRemoraSubTab(section, REMORA.tabs.connection)
@@ -198,12 +222,13 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
     await page.goto(`${state.hub.origin}${HUB_PATHS.tokens}`)
     const form = await requirePresent(page, HUB.tokenForm, `no personal-token form at ${HUB_PATHS.tokens}`)
     const name = `remora-e2e-${randomBytes(3).toString('hex')}`
+    state.tokenName = name
     await (await mustBePresent(form, HUB.tokenName, 'the token name field')).fill(name)
     for (const scope of SCOPES.split(' ')) await HUB.tokenScope(scope)(form).check()
     await (await mustBePresent(form, HUB.tokenCreate, 'the issue button')).click()
     const value = await mustBePresent(page, HUB.tokenValue, 'the new token value', 20_000)
     state.token = (await value.innerText()).trim()
-    if (state.token.length < 20) throw new Error(`token looks wrong: "${state.token}"`)
+    if (state.token.length < 20) throw new Error('the issued token is shorter than expected')
     state.api = hubApi(state.hub.origin, state.token)
     // The hub offers "request" once the host's status frame carried the raised ceiling.
     let select
@@ -226,7 +251,30 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
     return `token "${name}" (${state.token.length} chars), grant request on ${state.hostId}; ${path}`
   })
 
-  await r.step('task.complete', 'task.start on a DSH session → task.wait → completed with the mock model\'s reply', { needs: ['token.mint'], timeoutMs: 180_000, onFailure: failShot('task', 'dsh') }, async () => {
+  await r.step('grant.cancel', 'Canceling passkey confirmation restores the saved grant without changing server permissions', { needs: ['token.mint'], timeoutMs: 30_000, onFailure: failShot('grant-cancel') }, async () => {
+    const page = state.hubPage
+    await page.goto(`${state.hub.origin}${HUB_PATHS.connections}`)
+    const card = HUB.clientCard(state.tokenName)(page).first()
+    const select = await mustBePresent(card, HUB.grantSelect, 'the saved request grant')
+    await page.evaluate(() => {
+      navigator.credentials.get = async () => { throw new DOMException('E2E canceled authentication', 'NotAllowedError') }
+    })
+    try {
+      await select.selectOption('view')
+      await card.locator('[data-status]').filter({ visible: true }).first().waitFor()
+      if (await select.inputValue() !== 'request') throw new Error('cancel left an unsaved grant displayed')
+      const { body } = await state.api('hosts.list')
+      if (body.hosts?.find(item => item.hostId === state.hostId)?.grant?.level !== 'request') throw new Error('cancel changed the server grant')
+    } finally {
+      // Restore the native credentials method even if this assertion failed.
+      await page.reload()
+    }
+    const saved = await mustBePresent(HUB.clientCard(state.tokenName)(page).first(), HUB.grantSelect, 'the persisted grant after cancel')
+    if (await saved.inputValue() !== 'request') throw new Error('saved grant changed after reload')
+    return 'canceled request→view; display restored to request; server and reloaded form still request'
+  })
+
+  await r.step('task.complete', 'task.start on a DSH session → task.wait → completed with the mock model\'s reply', { needs: ['token.mint', 'grant.cancel'], timeoutMs: 180_000, onFailure: failShot('task', 'dsh') }, async () => {
     const { body: hosts } = await state.api('hosts.list')
     const host = hosts.hosts?.find(item => item.hostId === state.hostId)
     if (!host?.online) throw new Error(`host is not online in hosts.list: ${JSON.stringify(hosts)}`)

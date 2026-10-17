@@ -16,10 +16,9 @@ test('tool names follow the MCP naming rule and the dsh_ prefix', () => {
   }
 })
 
-test('read-only tools never need more than view, and destructive ones need full or a confirmation', () => {
+test('read-only tools never need more than view and never claim destructive updates', () => {
   for (const op of all) {
     if (op.readOnly) assert.equal(op.level, 'view', op.id)
-    if (op.destructive) assert.ok(op.level === 'full' || CONFIRMATION_UNLESS_ALLOWED.has(op.id), op.id)
     assert.ok(!(op.readOnly && op.destructive), op.id)
   }
 })
@@ -51,4 +50,15 @@ test('lookups and request ids', () => {
   assert.equal(findOperationByTool('dsh_task_start')?.id, 'task.start')
   assert.equal(findOperationByTool('nope'), undefined)
   assert.equal(remoraRequestId('claude', 't1'), 'remora:claude:t1')
+})
+
+// These hints describe possible effects, independently of authorization policy.
+test('agent prompts, commands, approvals and scheduled prompts expose their possible effects', () => {
+  for (const id of ['task.start', 'attention.respond', 'task.steer', 'task.resubmit', 'goal.manage', 'command.run', 'approval.respond', 'schedule.create', 'terminal.run']) {
+    const op = all.find(op => op.id === id)
+    assert.equal(op?.openWorld, true, id)
+    assert.equal(op?.destructive, true, id)
+  }
+  assert.equal(all.find(op => op.id === 'workspace.create')?.openWorld, true, 'git clone may contact an external repository')
+  for (const op of all.filter(op => op.readOnly)) assert.equal(op.openWorld, false, op.id)
 })

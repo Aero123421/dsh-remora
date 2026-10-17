@@ -30,6 +30,7 @@
 .rmr-level:hover { background: var(--dsw-alias-interactive-bg-hover); }
 .rmr-level[aria-checked="true"] { border-color: var(--dsw-alias-label-primary); box-shadow: inset 0 0 0 0.5px var(--dsw-alias-label-primary); }
 .rmr-level[data-level="full"][aria-checked="true"] { border-color: var(--dsw-alias-state-error-primary); box-shadow: inset 0 0 0 0.5px var(--dsw-alias-state-error-primary); }
+.rmr-level:focus-visible { outline: 2px solid var(--dsw-alias-label-primary); outline-offset: 2px; }
 .rmr-level:disabled { cursor: default; opacity: 0.6; }
 .rmr-level-name { font-weight: 600; }
 .rmr-group-title { padding: 14px 0 2px; color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 18px; }
@@ -52,10 +53,11 @@
 .rmr [role="tablist"] > [role="tab"] { min-width: 0; min-height: 28px; height: auto; padding: 4px 8px; white-space: normal; overflow-wrap: anywhere; }
 /* Navigation labels have different widths. Put the selection surface on the
  * button itself so it stays aligned when the navigation scrolls. */
-.rmr-tabs-scroll { width: 100%; min-width: 0; overflow-x: auto; }
-.rmr .rmr-tabs { grid-auto-columns: max-content; min-width: max-content; max-width: none; }
+/* Keep every destination visible even in the narrow settings column. */
+.rmr-tabs-scroll { width: 100%; min-width: 0; }
+.rmr .rmr-tabs { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; max-width: 100%; }
 .rmr .rmr-tabs > [aria-hidden="true"] { display: none; }
-.rmr .rmr-tabs > [role="tab"] { min-width: max-content; height: 28px; padding: 0 16px; white-space: nowrap; overflow-wrap: normal; }
+.rmr .rmr-tabs > [role="tab"] { flex: 1 0 auto; min-width: 0; max-width: 100%; min-height: 28px; height: auto; padding: 4px 12px; white-space: normal; }
 .rmr .rmr-tabs > [role="tab"][aria-selected="true"] { background: var(--dsw-alias-bg-layer-1); box-shadow: var(--dsw-elevation-soft); }
 @container remora (max-width: 360px) {
   .rmr-levels { grid-template-columns: minmax(0, 1fr); }
@@ -73,4 +75,4 @@
 .rmr-dot[data-tone="connected"] { background: #1fa89a; }
 .rmr-dot[data-tone="full"] { background: var(--dsw-alias-state-error-primary); }
 .rmr-dot[data-tone="stopped"] { background: var(--dsw-alias-state-warn-primary); }
-.rmr-popover { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 50; display: flex; flex-direction: column; gap: 8px; width: 240px; padding: 12px; border-radius: 12px; border: 0.5px solid var(--dsw-alias-border-l3); background: var(--dsw-alias-bg-layer-3, var(--dsw-alias-bg-base)); color: var(--dsw-alias-label-primary); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16); font-size: 12px; line-height: 18px; }
+.rmr-popover { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 50; display: flex; flex-direction: column; gap: 8px; width: 240px; max-width: calc(100vw - 32px); padding: 12px; box-sizing: border-box; border-radius: 12px; border: 0.5px solid var(--dsw-alias-border-l3); background: var(--dsw-alias-bg-layer-3, var(--dsw-alias-bg-base)); color: var(--dsw-alias-label-primary); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16); font-size: 12px; line-height: 18px; }

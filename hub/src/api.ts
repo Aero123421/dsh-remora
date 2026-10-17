@@ -32,6 +32,6 @@ export async function handleApi(request: Request, env: Env, _ctx: ExecutionConte
     return errorResponse({ code: 'invalid_request', message: 'The body must be a JSON object of operation parameters.' })
   }
   if (typeof params !== 'object' || params === null || Array.isArray(params)) return errorResponse({ code: 'invalid_request', message: 'The body must be a JSON object of operation parameters.' })
-  const outcome = await runOperation(env, { clientId: caller.props.clientId, clientName: caller.props.clientName, scopes: caller.auth.scope, kind: 'client' }, op, params, { origin: hubOrigin(request, env) })
+  const outcome = await runOperation(env, { clientId: caller.props.clientId, clientName: caller.props.clientName, scopes: caller.auth.scope, kind: 'client' }, op, params, { origin: hubOrigin(request, env), signal: request.signal })
   return outcome.ok ? json(outcome.result ?? {}) : errorResponse(outcome.error)
 }

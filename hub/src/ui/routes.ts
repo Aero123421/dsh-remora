@@ -270,7 +270,8 @@ ${recent.length === 0 ? h`<p class="muted">まだありません。</p>` : h`<ul
 <section class="card"><h2>無料枠（今日・UTC）</h2>
 ${meters.map(([label, used, limit]) => h`<div class="meter ${used / limit >= FREE_TIER_WARN ? 'warn' : ''}"><div class="row"><span>${label}</span><span>${used.toLocaleString('ja-JP')} / ${limit.toLocaleString('ja-JP')}</span></div><progress max="${limit}" value="${Math.min(used, limit)}">${pct(used / limit)}</progress></div>`)}
 ${meters.some(([, used, limit]) => used / limit >= FREE_TIER_WARN) ? flash('無料枠の 80% を超えました。ホスト側の進行状況の送信間隔を延ばすか、使い方を見直してください。', 'error') : ''}
-<p class="muted">ハブ自身が数えた概算です。正確な値は Cloudflare のダッシュボードで確認してください。</p></section>`
+<p class="muted">表示はリクエスト数と KV 書き込みの概算です。実行時間・保存容量などは含みません。使用量と料金は Cloudflare のダッシュボードで確認してください。</p>
+<p class="muted">Free プランは無料枠の上限で利用が止まります。Paid プランでは超過分が課金されることがあり、この表示は料金の上限を保証しません。</p></section>`
   return view('ホーム', 'home', body)
 }
 
@@ -364,7 +365,10 @@ function terminalSection(hostId: string, live: HostLive, workspaces: WorkspaceSu
   return h`<details class="card"><summary>ターミナル</summary>${body}</details>`
 }
 
-async function sessionPage(env: Env, url: URL, hostId: string, sessionId: string): Promise<Response> {
+interface SessionDraft { action: string; form: URLSearchParams; error: Raw }
+
+async function sessionPage(env: Env, url: URL, hostId: string, sessionId: string, draft?: SessionDraft): Promise<Response> {
+  const input = (action: string, name: string) => draft?.action === action ? draft.form.get(name) ?? '' : ''
   const host = await hubStub(env).getHost(hostId)
   if (!host || host.revokedAt) return notFound()
   const [got, live] = await Promise.all([runOperation(env, OWNER, 'session.get', { hostId, sessionId }), hostStub(env, hostId).summary()])
@@ -393,17 +397,17 @@ ${result.recentTurns.length === 0 ? h`<p class="muted">まだありません。<
   }
   const actions = h`<section class="card"><h2>依頼する</h2>
 <form method="post" action="${base}/prompt" class="stack">
-  <input type="hidden" name="idempotencyKey" value="${randomToken(12)}">
-  <textarea name="prompt" rows="4" maxlength="100000" required placeholder="エージェントにしてほしいこと"></textarea>
-  <input name="skills" placeholder="スキル（任意・空白区切り、例: review test）">
+  <input type="hidden" name="idempotencyKey" value="${input('prompt', 'idempotencyKey') || randomToken(12)}">
+  <textarea name="prompt" rows="4" maxlength="100000" required placeholder="エージェントにしてほしいこと">${input('prompt', 'prompt')}</textarea>
+  <input name="skills" value="${input('prompt', 'skills')}" placeholder="スキル（任意・空白区切り、例: review test）">
   <button class="primary" type="submit">送信</button>
 </form></section>
 <section class="card"><h2>実行中のタスク</h2>
 ${running.length === 0 ? h`<p class="muted">このセッションでハブから投げた実行中のタスクはありません。</p>` : h`<ul class="list">${running.map(task => h`<li><a href="/tasks/${task.taskId}">${STATE_LABEL[task.state]}</a>
   <form method="post" action="${base}/cancel" class="inline"><input type="hidden" name="taskId" value="${task.taskId}"><button type="submit" class="small">取り消し・中断</button></form></li>`)}</ul>`}
 <form method="post" action="${base}/steer" class="stack">
-  <input type="hidden" name="idempotencyKey" value="${randomToken(12)}">
-  <textarea name="prompt" rows="2" maxlength="100000" required placeholder="追加の指示"></textarea>
+  <input type="hidden" name="idempotencyKey" value="${input('steer', 'idempotencyKey') || randomToken(12)}">
+  <textarea name="prompt" rows="2" maxlength="100000" required placeholder="追加の指示">${input('steer', 'prompt')}</textarea>
   <button type="submit">追加指示を送る</button>
 </form></section>
 <section class="card"><h2>セッションの操作</h2>
@@ -419,8 +423,8 @@ ${live.operations.includes('session.fork') ? h`<form method="post" action="${bas
   <button type="submit">フォークする</button>
   <p class="muted">指定したターンの終わりまでの会話を写した新しいセッションを、同じワークスペースに作ります。元のセッションは変わりません。</p>
 </form>` : ''}</section>`
-  const schedules = live.online && live.operations.includes('schedules.list') ? await schedulesSection(env, hostId, sessionId, base, live) : raw('')
-  const body = h`${message(url)}<p class="crumbs"><a href="/">ホーム</a> / <a href="/hosts/${hostId}">${host.name}</a> / セッション</p>${detail}${actions}${jobs}${schedules}`
+  const schedules = (live.online && live.operations.includes('schedules.list')) || draft?.action === 'schedule-create' ? await schedulesSection(env, hostId, sessionId, base, live, draft?.action === 'schedule-create' ? draft.form : undefined) : raw('')
+  const body = h`${message(url)}${draft?.error}<p class="crumbs"><a href="/">ホーム</a> / <a href="/hosts/${hostId}">${host.name}</a> / セッション</p>${detail}${actions}${jobs}${schedules}`
   return view('セッション', 'home', body)
 }
 
@@ -438,7 +442,8 @@ function jobsSection(base: string, live: HostLive, jobs: SessionGetResult['jobs'
 const WEEKDAY_LABEL = ['', '月', '火', '水', '木', '金', '土', '日']
 
 /** Scheduled prompts of the session, a form to add one, and delete buttons. */
-async function schedulesSection(env: Env, hostId: string, sessionId: string, base: string, live: HostLive): Promise<Raw> {
+async function schedulesSection(env: Env, hostId: string, sessionId: string, base: string, live: HostLive, draft?: URLSearchParams): Promise<Raw> {
+  const input = (name: string, fallback = '') => draft?.get(name) ?? fallback
   const listed = await runOperation(env, OWNER, 'schedules.list', { hostId, sessionId })
   const schedules = listed.ok ? (listed.result as { schedules: ScheduleInfo[] }).schedules : []
   const canDelete = live.operations.includes('schedule.delete')
@@ -446,18 +451,17 @@ async function schedulesSection(env: Env, hostId: string, sessionId: string, bas
   <span class="muted">${schedule.nextAt ? `次回 ${dateTime(schedule.nextAt)}` : ''}${schedule.lastDeliveredAt ? ` ・ 前回 ${dateTime(schedule.lastDeliveredAt)}` : ''}${schedule.createdBy ? ` ・ ${schedule.createdBy} が Remora 経由で作成` : ''}</span>
   ${schedule.prompt ? h`<p class="untrusted pre muted">${schedule.prompt}</p>` : ''}
   ${canDelete ? h`<form method="post" action="${base}/schedule-delete" class="inline"><input type="hidden" name="scheduleId" value="${schedule.scheduleId}"><button type="submit" class="small">削除</button></form>` : ''}</li>`
-  const form = live.operations.includes('schedule.create') ? h`<form method="post" action="${base}/schedule-create" class="stack">
+  const form = live.operations.includes('schedule.create') || draft ? h`<form method="post" action="${base}/schedule-create" class="stack">
   <h3>スケジュールを追加</h3>
-  <input type="hidden" name="idempotencyKey" value="${randomToken(12)}">
-  <input name="title" maxlength="120" required placeholder="名前（例: 朝の CI 確認）">
-  <textarea name="prompt" rows="3" maxlength="20000" required placeholder="時間になったらエージェントに送る依頼"></textarea>
+  <input type="hidden" name="idempotencyKey" value="${input('idempotencyKey') || randomToken(12)}">
+  <input name="title" value="${input('title')}" maxlength="120" required placeholder="名前（例: 朝の CI 確認）">
+  <textarea name="prompt" rows="3" maxlength="20000" required placeholder="時間になったらエージェントに送る依頼">${input('prompt')}</textarea>
   <label>いつ<select name="kind">
-    <option value="daily">毎日</option><option value="weekly">毎週</option><option value="every">一定の間隔で</option>
-    <option value="after">○分後に 1 回</option><option value="at">日時を決めて 1 回</option><option value="cron">cron 式</option>
+    ${[['daily', '毎日'], ['weekly', '毎週'], ['every', '一定の間隔で'], ['after', '○分後に 1 回'], ['at', '日時を決めて 1 回'], ['cron', 'cron 式']].map(([value, label]) => h`<option value="${value}"${raw(input('kind', 'daily') === value ? ' selected' : '')}>${label}</option>`)}
   </select></label>
-  <div class="row3"><input name="time" placeholder="時刻 HH:mm（毎日・毎週）" pattern="[0-2][0-9]:[0-5][0-9]"><input name="minutes" type="number" min="1" placeholder="分（間隔・○分後）"><input name="timeZone" value="Asia/Tokyo" placeholder="タイムゾーン"></div>
-  <div class="weekdays">${[1, 2, 3, 4, 5, 6, 7].map(day => h`<label class="check"><input type="checkbox" name="weekday" value="${day}"> ${WEEKDAY_LABEL[day]}</label>`)}</div>
-  <div class="row3"><input name="at" type="datetime-local" aria-label="日時（1 回だけのとき）"><input name="cron" placeholder="cron 式（例: 0 9 * * 1-5）"></div>
+  <div class="row3"><input name="time" value="${input('time')}" placeholder="時刻 HH:mm（毎日・毎週）" pattern="[0-2][0-9]:[0-5][0-9]"><input name="minutes" value="${input('minutes')}" type="number" min="1" placeholder="分（間隔・○分後）"><input name="timeZone" value="${input('timeZone', 'Asia/Tokyo')}" placeholder="タイムゾーン"></div>
+  <div class="weekdays">${[1, 2, 3, 4, 5, 6, 7].map(day => h`<label class="check"><input type="checkbox" name="weekday" value="${day}"${raw(draft?.getAll('weekday').includes(String(day)) ? ' checked' : '')}> ${WEEKDAY_LABEL[day]}</label>`)}</div>
+  <div class="row3"><input name="at" value="${input('at')}" type="datetime-local" aria-label="日時（1 回だけのとき）"><input name="cron" value="${input('cron')}" placeholder="cron 式（例: 0 9 * * 1-5）"></div>
   <button type="submit">追加</button>
   <p class="muted">選んだ「いつ」に関係する欄だけが使われます。時間になると DSH がこのセッションに依頼として送ります（その PC で DSH Web が動いているときだけ）。</p>
 </form>` : raw('')
@@ -506,7 +510,7 @@ async function sessionAction(env: Env, request: Request, hostId: string, session
       break
     case 'schedule-create': {
       const when = whenFromForm(form)
-      if (!when.ok) return view('入力を確かめてください', 'home', h`${flash(when.message, 'error')}<p><a class="button" href="${base}">戻る</a></p>`)
+      if (!when.ok) return sessionPage(env, new URL(base, request.url), hostId, sessionId, { action, form, error: flash(when.message, 'error') })
       outcome = await runOperation(env, OWNER, 'schedule.create', { hostId, sessionId, title: (form.get('title') ?? '').trim(), prompt: form.get('prompt') ?? '', when: when.when, idempotencyKey: form.get('idempotencyKey') || randomToken(12) })
       if (outcome.ok) return redirect(`${base}?msg=schedule-created`)
       break
@@ -519,6 +523,7 @@ async function sessionAction(env: Env, request: Request, hostId: string, session
       return notFound()
   }
   if (outcome.ok) return redirect(`${base}?msg=sent`)
+  if (['prompt', 'steer', 'schedule-create'].includes(action)) return sessionPage(env, new URL(base, request.url), hostId, sessionId, { action, form, error: errorFlash(outcome.error) })
   return view('失敗しました', 'home', h`${errorFlash(outcome.error)}<p><a class="button" href="${base}">戻る</a></p>`)
 }
 
@@ -570,8 +575,8 @@ function attentionCard(item: AttentionItem, host: CardHost, single = false): Raw
     ? h`<dl class="facts">
   <dt>求められている操作</dt><dd class="untrusted"><strong>${item.title}</strong></dd>
   ${item.detail ? h`<dt>理由</dt><dd class="untrusted pre">${item.detail}</dd>` : ''}
-  <dt>セッション</dt><dd><a class="mono" href="/hosts/${host.hostId}/sessions/${encodeURIComponent(item.sessionId)}">${item.sessionId}</a></dd>
-  <dt>ホスト</dt><dd>${host.name} <span class="muted mono">${host.hostId}</span></dd>
+  <dt>ホスト</dt><dd>${host.name}</dd>
+  <dt>セッション</dt><dd><a href="/hosts/${host.hostId}/sessions/${encodeURIComponent(item.sessionId)}">セッションを開く</a></dd>
 </dl>`
     : h`<p class="untrusted"><strong>${item.title}</strong></p>
   ${item.detail ? h`${item.kind === 'plan-review' ? h`<p class="who">プラン</p>` : ''}<div class="untrusted pre">${item.detail}</div>` : ''}`
@@ -585,9 +590,10 @@ function attentionCard(item: AttentionItem, host: CardHost, single = false): Raw
   } else if (route === 'passkey') {
     const params = { hostId: host.hostId, sessionId: item.sessionId, attentionId: item.attentionId }
     answer = host.canApprove
-      ? h`<div class="confirm-preview"><p>パスキーで署名する内容（DSH ホストが検証します）:</p>
+      ? h`<details class="confirm-preview"><summary>パスキーで署名する内容</summary>
+  <p class="muted">DSH ホストが検証します。</p>
   <dl class="facts"><dt>操作</dt><dd class="mono">approval.respond</dd><dt>ホスト</dt><dd class="mono">${host.hostId}</dd>
-  <dt>パラメータ</dt><dd><pre class="codes">${JSON.stringify({ ...params, answer: { approve: '許可なら true、拒否なら false' } }, null, 2)}</pre></dd></dl></div>
+  <dt>パラメータ</dt><dd><pre class="codes">${JSON.stringify({ ...params, answer: { approve: '許可なら true、拒否なら false' } }, null, 2)}</pre></dd></dl></details>
 <form data-confirm-op="approval.respond" data-host="${host.hostId}" data-params="${JSON.stringify(params)}" data-done="/attention?msg=sent" class="actions">
   <button class="primary" type="submit" data-approve="true" data-testid="hub-approval-allow">パスキーで確認して今回だけ許可</button>
   <button class="danger" type="submit" data-approve="false" data-testid="hub-approval-reject">パスキーで確認して拒否</button>
@@ -700,7 +706,7 @@ async function confirmPage(env: Env, url: URL, origin: string, hostId: string, c
   if (!item) return notFound()
   const params = item.params
   const crumbs = h`<p class="crumbs"><a href="/">ホーム</a> / <a href="/hosts/${hostId}">${host.name}</a> / パスキーでの確認</p>`
-  const requester = item.clientId === OWNER_CLIENT_ID ? 'ハブの画面（あなた）' : `${visibleText(item.clientName).text}（${item.clientId}）`
+  const requester = item.clientId === OWNER_CLIENT_ID ? 'ハブの画面（あなた）' : visibleText(item.clientName).text
   const command = typeof params.command === 'string' ? visibleText(params.command) : null
   let workspace: Raw = h`<span class="mono">${String(params.cwdWorkspaceId ?? '')}</span>`
   if (item.state === 'pending' && live.online && typeof params.cwdWorkspaceId === 'string') {
@@ -709,9 +715,9 @@ async function confirmPage(env: Env, url: URL, origin: string, hostId: string, c
     if (found) workspace = h`<span class="untrusted">${found.name}</span>${found.untrusted ? h` <span class="badge warn">未信頼</span>` : ''} <span class="muted mono">${found.path ?? ''}</span>`
   }
   const facts = h`<dl class="facts">
-  <dt>操作</dt><dd>${CONFIRM_LABEL[item.operation] ?? item.operation} <span class="muted mono">${item.operation}</span></dd>
+  <dt>操作</dt><dd>${CONFIRM_LABEL[item.operation] ?? item.operation}</dd>
   <dt>依頼したもの</dt><dd>${requester}</dd>
-  <dt>ホスト</dt><dd>${host.name} <span class="muted mono">${hostId}</span></dd>
+  <dt>ホスト</dt><dd>${host.name}</dd>
   ${command ? h`<dt>コマンド</dt><dd><pre class="command untrusted" dir="ltr" data-testid="hub-confirm-command">${command.text}</pre>${command.hidden ? h`<p class="flash error" data-testid="hub-confirm-hidden">見えない文字（制御文字・文字の向きを変える文字・幅のない文字）が含まれています。⟦U+…⟧ の位置にあります。意図したものでなければ実行しないでください。</p>` : ''}</dd>` : ''}
   ${params.cwdWorkspaceId !== undefined ? h`<dt>場所</dt><dd>${workspace}</dd>` : ''}
   ${typeof params.timeoutMs === 'number' ? h`<dt>タイムアウト</dt><dd>${Math.round(params.timeoutMs / 1000)} 秒</dd>` : ''}
@@ -732,8 +738,10 @@ ${live.online ? reauthForm(`${confirmPath(hostId, item.confirmationId)}/approve`
       }
       outcome = !live.online
         ? h`<p class="muted">ホストがオフラインのため、今は実行できません。期限までにホストがつながれば実行できます。</p>`
-        : h`<div class="confirm-preview"><p>パスキーで署名する内容（DSH ホストが検証します）:</p>
-<pre class="codes">${asciiJson(finalParams(item.operation, params, hostId), 2)}</pre></div>
+        : h`<details class="confirm-preview"><summary>パスキーで署名する内容</summary>
+<p class="muted">DSH ホストが検証します。</p>
+<dl class="facts"><dt>操作</dt><dd class="mono">${item.operation}</dd><dt>クライアント ID</dt><dd class="mono">${item.clientId}</dd></dl>
+<pre class="codes">${asciiJson(finalParams(item.operation, params, hostId), 2)}</pre></details>
 <form data-confirm-op="${item.operation}" data-host="${hostId}" data-params="${asciiJson(params)}" data-pending="${item.confirmationId}" data-done="${confirmPath(hostId, item.confirmationId)}" class="actions">
   <button class="danger" type="submit" data-testid="hub-confirm-run">パスキーで確認して実行</button>
   <p data-status hidden></p>
@@ -913,7 +921,7 @@ async function connectionsPage(env: Env, url: URL, origin: string): Promise<Resp
       <form method="post" action="/connections/grant"${raw(' data-reauth')}>
         <input type="hidden" name="clientId" value="${client.clientId}"><input type="hidden" name="hostId" value="${summary.hostId}">
         <select name="level" data-autosubmit aria-label="付与範囲" data-testid="hub-grant-level">${levelsFor(summary).map(level => h`<option value="${level}"${raw(level === current ? ' selected' : '')}>${LEVEL_LABEL[level]}</option>`)}</select>
-        <noscript><button type="submit" class="small">保存</button></noscript>
+        <button type="submit" class="small">保存</button><p data-status role="status" hidden></p>
       </form>
       ${current === 'full' ? h`<span class="badge danger">${expired ? '全権は失効（依頼できる扱い）' : `全権 ${relativeTime(setting?.fullAccessExpiresAt)}に失効`}</span>` : ''}
     </td></tr>`

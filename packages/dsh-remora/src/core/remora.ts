@@ -41,10 +41,10 @@ import { ceilingAllows, fullAccessActive, wideningReasons } from './permissions.
 import { RpcError } from './rpc-error.ts'
 import { PlacementError, SettingsScopePolicy, newPlacement, validatePlacement, type ForbiddenRoots } from './scope.ts'
 import {
-  ALL_OPERATION_IDS, FULL_ACCESS_TTL_MS, MAX_REMOTE_ANSWER_WAIT_MS, adoptNewOperations, confirmationsSpec, pairingSpec, settingsSpec, tasksSpec,
+  ALL_OPERATION_IDS, FULL_ACCESS_TTL_MS, MAX_REMOTE_ANSWER_WAIT_MS, adoptNewOperations, confirmationsSpec, defaultSettings, pairingSpec, settingsSpec, tasksSpec,
   type ConfirmationsDocument, type PairingState, type RemoraSettings, type SessionException,
 } from './settings.ts'
-import { JsonDocument, remoraDataDir, resolveDshHome } from './storage.ts'
+import { JsonDocument, StorageError, remoraDataDir, resolveDshHome, type DocumentSpec } from './storage.ts'
 import { FileWorkspaceCreationStore, workspaceCreationsSpec } from './workspace-creations.ts'
 import { FileRemoteScheduleStore, remoteSchedulesSpec } from './remote-schedules.ts'
 import { FileTaskStore } from './tasks.ts'
@@ -195,6 +195,7 @@ export class RemoraCore {
   private updateInstalling: Promise<UpdateInstallation> | null = null
   private lastUnpair: { at: number; hub: 'removed' | 'refused' | 'unreachable' | 'not-paired' } | null = null
   private fatal: string | null = null
+  private initializing = 'startup'
   private disposed = false
   private closing: Promise<void> | null = null
   private stateWatcher: FSWatcher | null = null
@@ -214,8 +215,11 @@ export class RemoraCore {
     this.dataDir = options.dataDir ?? remoraDataDir(typeof homePath === 'function' ? homePath as (...segments: string[]) => string : undefined)
     this.nativeCacheStale = staleNativeDirs.has(this.dataDir)
     this.ready = this.init().catch(error => {
-      this.fatal = (error as Error).message
-      ctx.logger.warn('Remora: could not start', error)
+      // Parser exceptions can contain fragments of credential-bearing files.
+      const code = error instanceof StorageError ? error.code : 'initialization-failed'
+      const recovery = code === 'newer-version' ? 'Update Remora and restart DSH; keep the stored files.' : 'Stop DSH, back up the Remora data folder, and check or restore the affected file before restarting.'
+      this.fatal = `${this.initializing}: ${code}. ${recovery}`
+      ctx.logger.warn('Remora: could not start', this.fatal)
     })
   }
 
@@ -224,15 +228,20 @@ export class RemoraCore {
   private async init(): Promise<void> {
     const dir = this.dataDir
     const defaultName = hostname().slice(0, 100) || 'DSH'
-    this.settingsDoc = await JsonDocument.open(dir, settingsSpec(defaultName))
-    this.pairingDoc = await JsonDocument.open(dir, pairingSpec)
-    this.confirmationsDoc = await JsonDocument.open(dir, confirmationsSpec)
-    const tasksDoc = await JsonDocument.open(dir, tasksSpec)
-    const creationsDoc = await JsonDocument.open(dir, workspaceCreationsSpec)
-    this.remoteSchedules = new FileRemoteScheduleStore(await JsonDocument.open(dir, remoteSchedulesSpec))
+    const document = <T>(folder: string, spec: DocumentSpec<T>) => {
+      this.initializing = spec.file
+      return JsonDocument.open(folder, spec)
+    }
+    this.settingsDoc = await document(dir, settingsSpec(defaultName))
+    this.pairingDoc = await document(dir, pairingSpec)
+    this.confirmationsDoc = await document(dir, confirmationsSpec)
+    const tasksDoc = await document(dir, tasksSpec)
+    const creationsDoc = await document(dir, workspaceCreationsSpec)
+    this.remoteSchedules = new FileRemoteScheduleStore(await document(dir, remoteSchedulesSpec))
+    this.initializing = 'audit.jsonl'
     this.auditLog = await AuditLog.open(dir, { now: () => this.clock.now() })
     if (this.updateDir) {
-      this.updateReceipt = await JsonDocument.open(this.updateDir, updateReceiptSpec)
+      this.updateReceipt = await document(this.updateDir, updateReceiptSpec)
       this.updateInstallation = this.updateReceipt.value
       // The manager may be waiting for this replacement Host to mount: do not await its own installation here.
       if (this.updateInstallation && ['installing', 'unknown'].includes(this.updateInstallation.phase)) {
@@ -241,6 +250,7 @@ export class RemoraCore {
         await this.reconcileUpdate().catch(error => this.ctx.logger.warn('Remora: update reconciliation failed', error))
       }
     }
+    this.initializing = 'host services'
     await this.settingsDoc.update(adoptNewOperations)
     const credentials = this.ctx.get('credentials') as CredentialsLike | undefined
     this.keyStore = new HostKeyStore(dir, credentials && typeof credentials.readRecord === 'function' ? credentials : undefined)
@@ -847,7 +857,7 @@ export class RemoraCore {
   /** Refresh settings and pairing changed by another process sharing this DSH home. */
   async syncState(): Promise<void> {
     await this.ready
-    if (this.disposed || !this.settingsDoc || !this.pairingDoc) return
+    if (this.disposed || this.fatal || !this.settingsDoc || !this.pairingDoc) return
     await this.updateState(async () => {
       const previous = this.settingsDoc.value
       const previousPairing = this.pairingDoc.value
@@ -1074,6 +1084,10 @@ export class RemoraCore {
 
   // --- reads ----------------------------------------------------------------------
 
+  assertReady(): void {
+    if (this.fatal) throw new RpcError('storage-failed', this.fatal)
+  }
+
   private operationIds(): string[] {
     const served = this.features().available.filter(id => !NOT_ADVERTISED.has(id))
     // Served by the connection itself (rotate-key frames), whatever DSH offers.
@@ -1177,17 +1191,34 @@ export class RemoraCore {
   }
 
   private async readUpdateReceipt(): Promise<UpdateInstallation | null> {
-    if (!this.updateDir) return null
+    if (!this.updateDir || !this.updateReceipt) return null
+    if (this.updateInstalling) return this.updateInstallation
+    const ownership = new InstanceLock(this.updateDir, 'update-operation.lock')
+    if (!(await ownership.acquire())) {
+      // Another Host owns the work. A download is still live; manager receipts
+      // may be observed across HMR, without acquiring that Host's ownership.
+      const current = await this.updateReceipt.refresh()
+      if (this.updateInstalling) return this.updateInstallation
+      this.updateInstallation = current
+      if (current && ['installing', 'unknown'].includes(current.phase)) return this.recoverUpdateReceipt(true)
+      return current
+    }
+    try { return await this.recoverUpdateReceipt() } finally { await ownership.release() }
+  }
+
+  /** Recovery owns the profile, or only observes manager results while its owner lives. */
+  private async recoverUpdateReceipt(ownerAlive = false): Promise<UpdateInstallation | null> {
     const operation = await this.updateReceipt.refresh()
-    if (!operation || this.updateInstalling) return this.updateInstallation
+    if (this.updateInstalling) return this.updateInstallation
+    if (!operation) return this.updateInstallation = null
     const manager = this.pluginManager()
     let next = operation
-    if (operation.phase === 'downloading') next = { ...operation, phase: 'failed', error: 'interrupted-before-install' }
+    if (operation.phase === 'downloading' && !ownerAlive) next = { ...operation, phase: 'failed', error: 'interrupted-before-install' }
     if (operation.phase === 'installing' || operation.phase === 'unknown') {
       const trackingId = operation.restoreRequestId ?? operation.requestId
       const result = trackingId && manager?.waitForInstall ? await manager.waitForInstall(trackingId) : null
-      if (operation.restoreRequestId) next = result ? await restoreInstallationResult(manager, result, operation) : { ...operation, phase: 'unknown' }
-      else next = result ? installationResult(result, operation) : { ...operation, phase: 'unknown' }
+      if (operation.restoreRequestId) next = result ? await restoreInstallationResult(manager, result, operation) : ownerAlive ? operation : { ...operation, phase: 'unknown' }
+      else next = result ? installationResult(result, operation) : ownerAlive ? operation : { ...operation, phase: 'unknown' }
     }
     const bundle = manager ? (await manager.listBundles()).find(item => item.name === 'dsh-remora') : undefined
     // A lost result alone is never success. Confirm with both installed and executing versions.
@@ -1195,9 +1226,9 @@ export class RemoraCore {
         ['applied', 'restart-required', 'unknown'].includes(next.phase)) next = { ...next, phase: 'confirmed', installedVersion: bundle.version }
     if (this.updateInstalling) return this.updateInstallation
     this.updateInstallation = await this.updateReceipt.update(current => {
-      if (!current || current.requestId !== operation.requestId || current.phase === 'confirmed') return current
+      if (!current || current.requestId !== operation.requestId || current.restoreRequestId !== operation.restoreRequestId || current.phase === 'confirmed') return current
       // The old Host can save its completion while this Host waits for the manager.
-      if (current && !['downloading', 'installing', 'unknown'].includes(current.phase) && next.phase === 'unknown') return current
+      if (!['downloading', 'installing', 'unknown'].includes(current.phase) && ['downloading', 'installing', 'unknown'].includes(next.phase)) return current
       return next
     })
     return this.updateInstallation
@@ -1206,98 +1237,124 @@ export class RemoraCore {
   async installUpdate(local: boolean, expectedVersion: unknown): Promise<UpdateInstallation> {
     this.requireLocal(local, ['plugin-update'])
     if (this.disposed) throw new RpcError('unloading')
-    // An unresolved operation owns its receipt even if a newer release is published.
-    if (this.updateInstallation && ['downloading', 'installing', 'unknown'].includes(this.updateInstallation.phase)) {
-      if (expectedVersion !== this.updateInstallation.version) throw new RpcError('update-in-progress')
-      return this.updateInstalling ?? this.updateInstallation
-    }
-    const check = this.updateCheck
-    if (!check?.latest || !check.newer) throw new RpcError('no-update')
-    if (expectedVersion !== check.latest.version) throw new RpcError('update-candidate-changed')
+    if (this.fatal) throw new RpcError('storage-failed', this.fatal)
     if (this.updateInstalling) {
       if (this.updateInstallation?.version !== expectedVersion) throw new RpcError('update-in-progress')
       return this.updateInstalling
     }
+    if (this.updateReceipt) this.updateInstallation = await this.updateReceipt.refresh()
+    if (this.updateInstalling) {
+      if (this.updateInstallation?.version !== expectedVersion) throw new RpcError('update-in-progress')
+      return this.updateInstalling
+    }
+    // This also preserves unknown manager outcomes when the release check is stale.
+    if (this.updateInstallation && ['downloading', 'installing', 'unknown'].includes(this.updateInstallation.phase)) {
+      if (expectedVersion !== this.updateInstallation.version) throw new RpcError('update-in-progress')
+      return this.updateInstallation
+    }
+    const check = this.updateCheck
+    if (!check?.latest || !check.newer) throw new RpcError('no-update')
+    if (expectedVersion !== check.latest.version) throw new RpcError('update-candidate-changed')
     if (this.updateInstallation?.version === check.latest.version && ['applied', 'restart-required', 'confirmed', 'unknown', 'installing'].includes(this.updateInstallation.phase)) {
       return this.updateInstallation
     }
     const manager = this.pluginManager()
     if (!manager) throw new RpcError('install-unavailable')
     const release = check.latest
-    this.updateInstallation = { attempt: (this.updateInstallation?.attempt ?? 0) + 1, version: release.version, requestId: newInstallRequestId(), phase: 'downloading' }
+    const requestId = newInstallRequestId()
+    this.updateInstallation = { attempt: (this.updateInstallation?.attempt ?? 0) + 1, version: release.version, requestId, phase: 'downloading' }
     const pending = (async (): Promise<UpdateInstallation> => {
-      let managerStarted = false
-      try {
-        await this.updateReceipt.update(() => this.updateInstallation)
-        // Read the current selection immediately before installation, not at check time.
-        const bundle = (await manager.listBundles()).find(item => item.name === 'dsh-remora')
-        if (this.disposed) throw new RpcError('unloading')
-        if (!bundle || typeof bundle.enabled !== 'boolean') throw new UpdateError('unknown-bundle', 'cannot read the current bundle selection')
-        if (!bundle.installed || bundle.readOnlyReason) throw new UpdateError('read-only', 'bundle is not writable')
-        if (!bundle.version) throw new UpdateError('unknown-installed-version', 'cannot read installed version')
-        if (compareVersions(release.version, bundle.version) <= 0) throw new UpdateError('installed-version-current', 'candidate is not newer than installed bundle')
-        const source = bundle.source
-        if (!await this.isReleaseSource(source, bundle.version)) {
-          throw new UpdateError('manual-source', 'update this installation from its original source')
-        }
-        const fresh = await checkForUpdate(PLUGIN_VERSION, this.httpFetch(), this.clock.now(), this.dshVersion)
-        if (fresh.installUnavailable) throw new UpdateError(fresh.installUnavailable, 'candidate compatibility is unavailable')
-        if (fresh.error) throw new UpdateError(fresh.error, 'release recheck failed')
-        if (fresh.latest?.id !== release.id || fresh.latest.version !== release.version || fresh.latest.tarball?.url !== release.tarball?.url || fresh.latest.sums !== release.sums) {
-          throw new UpdateError('candidate-changed', 'release changed since the check')
-        }
-        const path = await downloadVerified(release, this.dataDir, this.httpFetch(), this.dshVersion)
-        if (this.disposed) throw new RpcError('unloading')
-        // Downloads can take time: preserve the latest selection and reject a newly read-only bundle.
-        const before = (await manager.listBundles()).find(item => item.name === 'dsh-remora')
-        if (!before?.installed || before.readOnlyReason || before.source !== source) throw new UpdateError('read-only', 'bundle changed during download')
-        if (this.disposed) throw new RpcError('unloading')
-        this.updateInstallation = { ...this.updateInstallation!, phase: 'installing' }
-        await this.updateReceipt.update(() => this.updateInstallation)
-        if (this.disposed) throw new RpcError('unloading')
-        const finalBundle = (await manager.listBundles()).find(item => item.name === 'dsh-remora')
-        if (this.disposed) throw new RpcError('unloading')
-        if (!finalBundle?.installed || finalBundle.readOnlyReason || finalBundle.source !== source) throw new UpdateError('read-only', 'bundle changed during receipt save')
-        if (!finalBundle.version) throw new UpdateError('unknown-installed-version', 'cannot read installed version')
-        const previousVersion = finalBundle.version
-        if (compareVersions(release.version, previousVersion) <= 0) throw new UpdateError('installed-version-current', 'candidate is not newer than installed bundle')
-        managerStarted = true
-        // Do not consult `this.disposed` after this returns. On HMR, removal stops this plugin
-        // before `removeBundle` resolves; the host manager still accepts the following install.
-        if (typeof source !== 'string') throw new UpdateError('manual-source', 'update this installation from its original source')
-        const result = await installVerifiedBundle(manager, path, { enabled: finalBundle.enabled, requestId: this.updateInstallation.requestId! }, {
-          spec: source,
-          enabled: finalBundle.enabled,
-          version: previousVersion,
-          rememberRequest: async requestId => {
-            this.updateInstallation = { ...this.updateInstallation!, phase: 'installing', restoreRequestId: requestId, restoreVersion: previousVersion }
-            await this.updateReceipt.update(current => {
-              if (!current || current.requestId !== this.updateInstallation?.requestId) return current
-              return this.updateInstallation
-            })
-          },
-          log: error => { this.ctx.logger.warn('Remora: could not save the restore request id', error) },
-        })
-        this.updateInstallation = installationResult(result, this.updateInstallation)
-      } catch (error) {
-        this.updateInstallation = {
-          ...this.updateInstallation!, phase: managerStarted ? 'unknown' : 'failed',
-          error: error instanceof UpdateError || error instanceof RpcError ? error.code : 'install-failed',
-        }
-        this.ctx.logger.warn('Remora: plugin update failed', error)
+      const ownership = new InstanceLock(this.updateDir!, 'update-operation.lock')
+      const acquired = await ownership.acquire()
+      if (!acquired) {
+        const current = this.updateInstallation = await this.updateReceipt.refresh()
+        if (!current || current.version !== expectedVersion) throw new RpcError('update-in-progress')
+        return current
       }
-      const result = this.updateInstallation!
-      await this.updateReceipt.update(current => {
-        if (!current || current.requestId !== result.requestId || current.phase === 'confirmed') return current
-        if (result.phase === 'unknown' && !['downloading', 'installing', 'unknown'].includes(current.phase)) return current
+      try {
+        // Claim the receipt atomically as well as owning the long-running work.
+        // Unresolved manager outcomes and installed candidates survive other Hosts.
+        this.updateInstallation = await this.updateReceipt.update(current => {
+          if (current && (['installing', 'unknown'].includes(current.phase) ||
+              (current.version === release.version && ['applied', 'restart-required', 'confirmed'].includes(current.phase)))) return current
+          return { attempt: (current?.attempt ?? 0) + 1, version: release.version, requestId, phase: 'downloading' }
+        })
+        if (this.updateInstallation?.requestId !== requestId) {
+          if (!this.updateInstallation || this.updateInstallation.version !== expectedVersion) throw new RpcError('update-in-progress')
+          return this.updateInstallation
+        }
+        let managerStarted = false
+        try {
+          // Read the current selection immediately before installation, not at check time.
+          const bundle = (await manager.listBundles()).find(item => item.name === 'dsh-remora')
+          if (this.disposed) throw new RpcError('unloading')
+          if (!bundle || typeof bundle.enabled !== 'boolean') throw new UpdateError('unknown-bundle', 'cannot read the current bundle selection')
+          if (!bundle.installed || bundle.readOnlyReason) throw new UpdateError('read-only', 'bundle is not writable')
+          if (!bundle.version) throw new UpdateError('unknown-installed-version', 'cannot read installed version')
+          if (compareVersions(release.version, bundle.version) <= 0) throw new UpdateError('installed-version-current', 'candidate is not newer than installed bundle')
+          const source = bundle.source
+          if (!await this.isReleaseSource(source, bundle.version)) {
+            throw new UpdateError('manual-source', 'update this installation from its original source')
+          }
+          const fresh = await checkForUpdate(PLUGIN_VERSION, this.httpFetch(), this.clock.now(), this.dshVersion)
+          if (fresh.installUnavailable) throw new UpdateError(fresh.installUnavailable, 'candidate compatibility is unavailable')
+          if (fresh.error) throw new UpdateError(fresh.error, 'release recheck failed')
+          if (fresh.latest?.id !== release.id || fresh.latest.version !== release.version || fresh.latest.tarball?.url !== release.tarball?.url || fresh.latest.sums !== release.sums) {
+            throw new UpdateError('candidate-changed', 'release changed since the check')
+          }
+          const path = await downloadVerified(release, this.dataDir, this.httpFetch(), this.dshVersion)
+          if (this.disposed) throw new RpcError('unloading')
+          // Downloads can take time: preserve the latest selection and reject a newly read-only bundle.
+          const before = (await manager.listBundles()).find(item => item.name === 'dsh-remora')
+          if (!before?.installed || before.readOnlyReason || before.source !== source) throw new UpdateError('read-only', 'bundle changed during download')
+          if (this.disposed) throw new RpcError('unloading')
+          this.updateInstallation = { ...this.updateInstallation!, phase: 'installing' }
+          await this.updateReceipt.update(() => this.updateInstallation)
+          if (this.disposed) throw new RpcError('unloading')
+          const finalBundle = (await manager.listBundles()).find(item => item.name === 'dsh-remora')
+          if (this.disposed) throw new RpcError('unloading')
+          if (!finalBundle?.installed || finalBundle.readOnlyReason || finalBundle.source !== source) throw new UpdateError('read-only', 'bundle changed during receipt save')
+          if (!finalBundle.version) throw new UpdateError('unknown-installed-version', 'cannot read installed version')
+          const previousVersion = finalBundle.version
+          if (compareVersions(release.version, previousVersion) <= 0) throw new UpdateError('installed-version-current', 'candidate is not newer than installed bundle')
+          managerStarted = true
+          // Do not consult `this.disposed` after this returns. On HMR, removal stops this plugin
+          // before `removeBundle` resolves; the host manager still accepts the following install.
+          if (typeof source !== 'string') throw new UpdateError('manual-source', 'update this installation from its original source')
+          const result = await installVerifiedBundle(manager, path, { enabled: finalBundle.enabled, requestId: this.updateInstallation.requestId! }, {
+            spec: source,
+            enabled: finalBundle.enabled,
+            version: previousVersion,
+            rememberRequest: async requestId => {
+              this.updateInstallation = { ...this.updateInstallation!, phase: 'installing', restoreRequestId: requestId, restoreVersion: previousVersion }
+              await this.updateReceipt.update(current => {
+                if (!current || current.requestId !== this.updateInstallation?.requestId) return current
+                return this.updateInstallation
+              })
+            },
+            log: error => { this.ctx.logger.warn('Remora: could not save the restore request id', error) },
+          })
+          this.updateInstallation = installationResult(result, this.updateInstallation)
+        } catch (error) {
+          this.updateInstallation = {
+            ...this.updateInstallation!, phase: managerStarted ? 'unknown' : 'failed',
+            error: error instanceof UpdateError || error instanceof RpcError ? error.code : 'install-failed',
+          }
+          this.ctx.logger.warn('Remora: plugin update failed', error)
+        }
+        const result = this.updateInstallation!
+        await this.updateReceipt.update(current => {
+          if (!current || current.requestId !== result.requestId || current.phase === 'confirmed') return current
+          if (result.phase === 'unknown' && !['downloading', 'installing', 'unknown'].includes(current.phase)) return current
+          return result
+        })
+        await this.auditLog.append({
+          kind: 'settings', action: `update:${release.version}`,
+          outcome: result.phase === 'applied' || result.phase === 'restart-required' ? 'ok' : 'error',
+          reason: [result.phase, result.stage, result.error].filter(Boolean).join(':'), local,
+        })
         return result
-      })
-      await this.auditLog.append({
-        kind: 'settings', action: `update:${release.version}`,
-        outcome: result.phase === 'applied' || result.phase === 'restart-required' ? 'ok' : 'error',
-        reason: [result.phase, result.stage, result.error].filter(Boolean).join(':'), local,
-      })
-      return result
+      } finally { await ownership.release() }
     })()
     this.updateInstalling = pending
     try { return await pending } finally { this.updateInstalling = null }
@@ -1307,11 +1364,8 @@ export class RemoraCore {
     const now = this.clock.now()
     const env = process.env
     const proxy = { configured: Boolean(env.HTTPS_PROXY ?? env.https_proxy ?? env.HTTP_PROXY ?? env.http_proxy), envProxy: env.NODE_USE_ENV_PROXY === '1' }
-    if (this.fatal !== null && !this.settingsDoc) {
-      throw new RpcError('storage-failed', this.fatal)
-    }
-    const settings = this.settingsDoc.value
-    const pairing = this.pairingDoc.value
+    const settings = this.settingsDoc?.value ?? defaultSettings()
+    const pairing = this.pairingDoc?.value ?? pairingSpec.initial()
     const allowed = ceilingAllows(settings.ceiling, now)
     const available = new Set(this.features().available)
     const pending = pairing.pendingCredentials
@@ -1322,7 +1376,7 @@ export class RemoraCore {
       dshVersion: this.dshVersion,
       local,
       now,
-      ready: true,
+      ready: this.fatal === null && Boolean(this.link),
       fatal: this.fatal,
       hub: {
         url: settings.hubUrl,
@@ -1333,10 +1387,10 @@ export class RemoraCore {
         pairedAt: pairing.paired?.pairedAt ?? null,
         ownerCredentials: pairing.paired?.owner.length ?? 0,
         revoked: pairing.revoked,
-        link: this.link.status,
+        link: this.link?.status ?? { state: 'stopped', since: now, lastError: 'storage-failed', attempts: 0, retryAt: null, connectedAt: null },
         lock: this.lockState,
       },
-      pairing: this.pairing.view,
+      pairing: this.pairing?.view ?? { phase: 'idle' },
       lastUnpair: this.lastUnpair,
       pendingCredentials: pending ? {
         receivedAt: pending.receivedAt,
@@ -1344,22 +1398,22 @@ export class RemoraCore {
         removed: pinnedIds.filter(id => !pending.credentials.some(c => c.credentialId === id)),
         total: pending.credentials.length,
       } : null,
-      keyStorage: this.keyStore.location,
+      keyStorage: this.keyStore?.location ?? 'file',
       dataDir: this.dataDir,
       settings,
       fullAccess: { active: fullAccessActive(settings.ceiling, now), expiresAt: settings.ceiling.fullAccessExpiresAt ?? null },
-      invalidPlacements: settings.scope.placements.filter(p => !this.scope.isPlacementValid(p.placementId)).map(p => p.placementId),
+      invalidPlacements: settings.scope.placements.filter(p => !this.scope?.isPlacementValid(p.placementId)).map(p => p.placementId),
       operations: OPERATIONS.map(op => ({
         id: op.id, level: op.level, scope: op.scope, phase: op.phase, destructive: op.destructive,
-        allowed: allowed.has(op.id), available: available.has(op.id),
+        allowed: this.fatal === null && allowed.has(op.id), available: this.fatal === null && available.has(op.id),
       })),
       features: this.features(),
       proxy,
-      auditIntact: this.auditLog.intact,
+      auditIntact: this.auditLog?.intact ?? false,
       update: this.updateCheck,
       updateHostInstance: this.updateHostInstance,
       updateInstallation: this.updateInstallation,
-      canInstallUpdate: this.pluginManager() !== null,
+      canInstallUpdate: this.fatal === null && this.pluginManager() !== null,
       questionModes: readQuestionModes(service => this.ctx.get(service)),
     }
   }

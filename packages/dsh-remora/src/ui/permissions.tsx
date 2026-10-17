@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Button, Modal, Switch, Tag } from 'remora-official-primitives'
 import type { CopyKey } from '../locales.ts'
 import type { OperationRow } from '../state.ts'
@@ -35,6 +35,7 @@ export function PermissionsSection({ snapshot, t, run, busy }: SectionProps) {
   const custom = customMode || hasOverrides
   const fullActive = snapshot.fullAccess.active
   const selected: Level | 'custom' = custom ? 'custom' : level
+  const radios = useRef<(HTMLButtonElement | null)[]>([])
 
   const choose = (next: Level | 'custom') => {
     if (next === 'custom') { setCustomMode(true); return }
@@ -61,8 +62,15 @@ export function PermissionsSection({ snapshot, t, run, busy }: SectionProps) {
       <span className="rmr-muted">{t('perm.hint')}</span>
     </div>
     <div className="rmr-levels" role="radiogroup" aria-label={t('perm.title')}>
-      {levels.map(item => <button key={item} type="button" role="radio" className="rmr-level" data-level={item} data-testid={`remora-ceiling-${item}`} aria-checked={selected === item} disabled={busy}
-        onClick={() => choose(item)}>
+      {levels.map((item, index) => <button key={item} ref={node => { radios.current[index] = node }} type="button" role="radio" tabIndex={selected === item ? 0 : -1} className="rmr-level" data-level={item} data-testid={`remora-ceiling-${item}`} aria-checked={selected === item} disabled={busy}
+        onClick={() => choose(item)} onKeyDown={event => {
+          const direction = event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1 : 0
+          const next = event.key === 'Home' ? 0 : event.key === 'End' ? levels.length - 1 : direction ? (index + direction + levels.length) % levels.length : -1
+          if (next < 0) return
+          event.preventDefault()
+          radios.current[next]?.focus()
+          choose(levels[next]!)
+        }}>
         <span className="rmr-level-name">{t(`perm.level.${item}`)}</span>
         <span className="rmr-muted">{t(`perm.desc.${item}`)}</span>
       </button>)}
