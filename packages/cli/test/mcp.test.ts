@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { rm } from 'node:fs/promises'
 import { main } from '../src/main.ts'
 import { Hub } from '../src/hub.ts'
-import { McpForwarder, runMcpBridge } from '../src/mcp.ts'
+import { MCP_REQUEST_TIMEOUT_MS, McpForwarder, probe, runMcpBridge } from '../src/mcp.ts'
 import { FakeHub, seedLogin, testCtx } from './helpers.ts'
 
 const lines = (...messages: unknown[]) => messages.map(m => (typeof m === 'string' ? m : JSON.stringify(m))).join('\n') + '\n'
@@ -169,4 +169,125 @@ test('MCP notification-only request gets no response on body reset', async t => 
   await new McpForwarder(new Hub(fixture.ctx, 'https://hub.example.com', null, null, 'fixture-access'))
     .send({ jsonrpc: '2.0', method: 'notifications/initialized' }, reply => { replies.push(reply) })
   assert.deepEqual(replies, [])
+})
+
+for (const [name, scope, flag] of [['dsh_session_read', 'dsh.content', '--content'], ['dsh_terminal_run', 'dsh.admin', '--admin']] as const) {
+  test(`MCP stdio preserves OAuth scope step-up for ${name}`, async t => {
+    const challenge = `Bearer error="insufficient_scope", scope="dsh.read dsh.tasks ${scope}"`
+    const description = `${name} needs the ${scope} scope`
+    const fixture = await testCtx({ fetch: async () => Response.json({ error: 'insufficient_scope', error_description: description }, { status: 403, headers: { 'www-authenticate': challenge } }) })
+    t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+    const replies: any[] = []
+    await new McpForwarder(new Hub(fixture.ctx, 'https://hub.example.com', null, null, 'fixture-access'))
+      .send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } }, reply => replies.push(reply))
+    assert.equal(replies.length, 1)
+    assert.ok(replies[0].error.message.includes(description))
+    assert.ok(replies[0].error.message.includes(`remora login ${flag}`))
+    assert.deepEqual(replies[0].error.data, { status: 403, error: 'insufficient_scope', wwwAuthenticate: challenge, error_description: description })
+  })
+}
+
+function hangUntilAborted(signal: AbortSignal): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    if (signal.aborted) reject(signal.reason)
+    else signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+  })
+}
+
+test('MCP times out a stalled fetch once without replaying a mutation', async t => {
+  let calls = 0
+  let requestSignal: AbortSignal | null = null
+  const fixture = await testCtx({ fetch: async (_url, init) => {
+    calls++
+    requestSignal = init!.signal!
+    return hangUntilAborted(requestSignal)
+  } })
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+  const replies: any[] = []
+  await new McpForwarder(new Hub(fixture.ctx, 'https://hub.example.com', null, null, 'fixture-access'))
+    .send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'dsh_command_run', arguments: { command: '/compact' } } }, reply => replies.push(reply), { timeoutMs: 15 })
+  assert.equal(calls, 1)
+  assert.equal((requestSignal as AbortSignal | null)?.aborted, true)
+  assert.equal(replies.length, 1)
+  assert.match(replies[0].error.message, /タイムアウト/)
+  assert.match(replies[0].error.message, /実行済みの可能性/)
+  assert.ok(MCP_REQUEST_TIMEOUT_MS > 25_000, 'a valid maximum long poll fits within the default deadline')
+})
+
+for (const contentType of ['application/json', 'text/event-stream']) {
+  test(`MCP timeout also covers a stalled ${contentType} response body`, async t => {
+    const fixture = await testCtx({ fetch: async (_url, init) => new Response(new ReadableStream({
+      start(controller) { init!.signal!.addEventListener('abort', () => controller.error(init!.signal!.reason), { once: true }) },
+    }), { headers: { 'content-type': contentType } }) })
+    t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+    const replies: any[] = []
+    await new McpForwarder(new Hub(fixture.ctx, 'https://hub.example.com', null, null, 'fixture-access'))
+      .send({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, reply => replies.push(reply), { timeoutMs: 15 })
+    assert.equal(replies.length, 1)
+    assert.match(replies[0].error.message, /タイムアウト/)
+  })
+}
+
+test('MCP cancellation stops waiting without replaying or cancelling a DSH task', async t => {
+  const calls: string[] = []
+  let ready!: () => void
+  const started = new Promise<void>(resolve => { ready = resolve })
+  const fixture = await testCtx({ fetch: async (_url, init) => {
+    const message = JSON.parse(init!.body as string)
+    calls.push(message.method)
+    if (message.method === 'notifications/cancelled') return new Response(null, { status: 202 })
+    ready()
+    return hangUntilAborted(init!.signal!)
+  } })
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+  const replies: any[] = []
+  const forwarder = new McpForwarder(new Hub(fixture.ctx, 'https://hub.example.com', null, null, 'fixture-access'))
+  const pending = forwarder.send({ jsonrpc: '2.0', id: 'request', method: 'tools/call', params: { name: 'dsh_task_start' } }, reply => replies.push(reply))
+  await started
+  await forwarder.send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'request' } }, reply => replies.push(reply))
+  await pending
+  assert.deepEqual(calls, ['tools/call', 'notifications/cancelled'])
+  assert.equal(replies.length, 1)
+  assert.equal(replies[0].id, 'request')
+  assert.match(replies[0].error.message, /待機を取り消し/)
+})
+
+test('MCP probe deadline ends a stalled discovery without a fallback request', async t => {
+  let calls = 0
+  const fixture = await testCtx({ fetch: async (_url, init) => { calls++; return hangUntilAborted(init!.signal!) } })
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+  await assert.rejects(probe(new Hub(fixture.ctx, 'https://hub.example.com', null, null, 'fixture-access'), { timeoutMs: 15 }), /タイムアウト/)
+  assert.equal(calls, 1)
+})
+
+
+test('MCP deadline stops waiting for token ownership and never sends the mutation later', async t => {
+  let finishToken!: (token: string) => void
+  const blockedToken = new Promise<string>(resolve => { finishToken = resolve })
+  let calls = 0
+  const fixture = await testCtx({ fetch: async () => { calls++; return Response.json({}) } })
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+  const hub = new Hub(fixture.ctx, 'https://hub.example.com', null, null)
+  // Model a different process holding the token lock (or the refresh persistence).
+  hub.token = () => blockedToken
+  const replies: any[] = []
+  await new McpForwarder(hub).send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'dsh_command_run' } }, reply => replies.push(reply), { timeoutMs: 15 })
+  assert.equal(replies.length, 1)
+  assert.match(replies[0].error.message, /タイムアウト/)
+  assert.equal(calls, 0)
+  finishToken('rotated-token')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(calls, 0, 'completing shared refresh does not launch the timed out operation')
+})
+
+test('MCP probe deadline leaves a blocked refresh free to finish or reject safely', async t => {
+  let rejectToken!: (error: Error) => void
+  const blockedToken = new Promise<string>((_resolve, reject) => { rejectToken = reject })
+  const fixture = await testCtx({ fetch: async () => { throw new Error('must not fetch an operation') } })
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }))
+  const hub = new Hub(fixture.ctx, 'https://hub.example.com', null, null)
+  hub.token = () => blockedToken
+  await assert.rejects(probe(hub, { timeoutMs: 15 }), /タイムアウト/)
+  rejectToken(new Error('refresh failed after the caller stopped waiting'))
+  await new Promise(resolve => setImmediate(resolve))
 })

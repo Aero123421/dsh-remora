@@ -99,3 +99,15 @@ test('audit chains: a changed, removed or reordered row breaks the chain', async
   assert.ok(OWNER_APPROVED_OPERATIONS.has('audit.export') && OWNER_APPROVED_OPERATIONS.has('host.rotate-key'))
   for (const id of OWNER_APPROVED_OPERATIONS) assert.equal(findOperation(id)?.tool, undefined, `${id} is not an MCP tool`)
 })
+
+
+test('approval response schema describes the supported boolean decision', () => {
+  const answer = INPUT_SCHEMAS['approval.respond'].properties.answer
+  assert.ok(answer && 'type' in answer && answer.type === 'object')
+  const approve = answer.properties.approve
+  assert.ok(approve)
+  assert.match(approve.description ?? '', /DSH approvals/)
+  assert.doesNotMatch(approve.description ?? '', /Plan reviews only/)
+  assert.deepEqual(validateParams('approval.respond', { sessionId: 's1', attentionId: 'a1', answer: { approve: true } }), [])
+  assert.deepEqual(validateParams('approval.respond', { sessionId: 's1', attentionId: 'a1', answer: { approve: false } }), [])
+})

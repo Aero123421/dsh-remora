@@ -1,8 +1,7 @@
 # E2E: real DSH from npm + the Remora plugin tarball (+ the hub under
 # wrangler dev for the flow). See docs/e2e.md.
 #   - pull requests touching the plugin, protocol, hub or harness
-#   - nightly: the pinned DSH (upstream.json) and the newest published DSH,
-#     which tells us when the plugin's peer range should be widened
+#   - nightly and releases: minimum + latest published DSH within the peer range
 #   - called by the release workflow before publishing
 name: E2E
 on:
@@ -14,6 +13,7 @@ on:
       - 'e2e/**'
       - 'upstream.json'
       - '.github/workflows/e2e.yml'
+      - '.github/workflows/release.yml'
   schedule:
     - cron: '23 3 * * *'
   workflow_dispatch:
@@ -24,7 +24,7 @@ on:
         type: choice
         options: [all, browser, flow]
       dsh-version:
-        description: 'DSH version, npm dist-tag or "newest" (empty = upstream.json)'
+        description: 'Exact supported DSH version (empty = minimum + latest supported)'
         default: ''
         type: string
       strict:
@@ -46,17 +46,44 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  versions:
+    name: Select supported DSH releases
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.dsh.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --filter dsh-remora
+      - name: Resolve supported published releases
+        id: dsh
+        env:
+          REMORA_CI_DSH_VERSION: ${{ inputs.dsh-version || '' }}
+          MINIMUM_ONLY: ${{ github.event_name == 'pull_request' && '--minimum-only' || '' }}
+        run: node packages/dsh-remora/scripts/compat/latest-supported.mjs --matrix $MINIMUM_ONLY
+
   e2e:
-    name: E2E (DSH ${{ matrix.dsh || 'pinned' }})
+    name: E2E (DSH ${{ matrix.dsh }})
+    needs: versions
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    continue-on-error: ${{ matrix.dsh == 'newest' }}
     strategy:
       fail-fast: false
       matrix:
-        # The newest published DSH only on the nightly run.
-        dsh: ${{ github.event_name == 'schedule' && fromJSON('["", "newest"]') || fromJSON('[""]') }}
+        # PRs run the minimum once; releases/nightly gate both supported endpoints.
+        dsh: ${{ fromJSON(needs.versions.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -74,7 +101,7 @@ jobs:
       - name: Run
         env:
           ONLY: ${{ inputs.only || 'all' }}
-          DSH_VERSION: ${{ matrix.dsh || inputs.dsh-version || '' }}
+          DSH_VERSION: ${{ matrix.dsh }}
           STRICT: ${{ (github.event_name == 'pull_request' || github.event_name == 'schedule' || inputs.strict) && '--strict' || '' }}
         run: |
           args="--only=${ONLY}"
@@ -87,6 +114,6 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: e2e-${{ matrix.dsh || 'pinned' }}-${{ github.run_attempt }}
+          name: e2e-${{ matrix.dsh }}-${{ github.run_attempt }}
           path: artifacts/e2e/
           retention-days: 14

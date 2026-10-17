@@ -1,5 +1,6 @@
 import { env } from 'cloudflare:workers'
 import { describe, expect, it } from 'vitest'
+import { executeHostOperation } from '../../src/ops.ts'
 import type { ExecuteCall } from '../../src/host-do.ts'
 import { unpairMessage, type HubFrame, type TaskInfo } from '../../src/vendor/protocol/index.ts'
 import { FakeHost, ORIGIN, eventually, hubFetch, reauth, setupOwner, sleep } from './helpers.ts'
@@ -149,7 +150,7 @@ describe('pairing and the host connection', () => {
       expect(taskOf(got).state).toBe('running')
     })
     const started = Date.now()
-    const waiting = stub.execute(call('task.wait', { taskId: task.taskId, timeoutMs: 10_000 }))
+    const waiting = executeHostOperation(env, host.hostId, call('task.wait', { taskId: task.taskId, timeoutMs: 10_000 }))
     await sleep(200)
     states.set(task.taskId, 'completed')
     host.sendEvent([{ kind: 'task', taskId: task.taskId, state: 'completed', updatedAt: Date.now() }])

@@ -19,6 +19,8 @@ jobs:
           node-version: '22'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Release selection and upstream sync regressions
+        run: node --test packages/dsh-remora/scripts/compat/*.test.mjs hub/scripts/*.test.mjs
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
@@ -32,7 +34,7 @@ jobs:
           if-no-files-found: error
 
   compat:
-    name: Adapter compat (latest DSH alpha)
+    name: Adapter compat (latest supported DSH)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -45,9 +47,9 @@ jobs:
           node-version: '22'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: Newest dsh-v*-alpha.* tag
+      - name: Latest public DSH tag within the plugin peer range
         id: dsh
-        run: node packages/dsh-remora/scripts/compat/latest-alpha.mjs
+        run: node packages/dsh-remora/scripts/compat/latest-supported.mjs
       - name: Run the adapter against that commit
         env:
           DSH_UPSTREAM_COMMIT: ${{ steps.dsh.outputs.commit }}

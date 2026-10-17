@@ -3,7 +3,7 @@ import { runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
 import { OWNER_CLIENT_ID } from '../../src/config.ts'
 import type { ExecuteCall, ExecuteResult, HostDO } from '../../src/host-do.ts'
-import { runOperation } from '../../src/ops.ts'
+import { executeHostOperation, runOperation } from '../../src/ops.ts'
 import type { HubFrame } from '../../src/vendor/protocol/index.ts'
 import { FakeHost, eventually, setupOwner } from './helpers.ts'
 
@@ -80,7 +80,7 @@ describe('task ledger recovery', () => {
       reads++
       return { ok: true, result: { taskId, sessionId: 's1', state: reads === 1 ? 'running' : 'completed', result: reads === 1 ? undefined : { reply: 'no event' } } }
     }
-    const outcome = await hostObject(host.hostId).execute(call('task.wait', { taskId, timeoutMs: 1 }))
+    const outcome = await executeHostOperation(env, host.hostId, call('task.wait', { taskId, timeoutMs: 1 }))
     expect(outcome).toMatchObject({ ok: true, result: { state: 'completed', result: { reply: 'no event' } } })
     expect(reads).toBe(2)
     host.socket?.close(1000, 'done')

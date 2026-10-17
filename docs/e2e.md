@@ -116,9 +116,11 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 | --- | --- |
 | `hub.start` | `wrangler dev` で空の状態のハブが 8788 番で起動し、`/healthz` が答え、認証なしの `/api/v1` は 401 |
 | `hub.owner` | `/` の初期設定で `SETUP_TOKEN` を入れ、仮想認証器（CDP の `WebAuthn.addVirtualAuthenticator`）でオーナーのパスキーを登録し、リカバリーコードが 1 回だけ出て、ログイン状態になる |
+| `hub.recovery` | 仮想認証器の既存キーをすべて消し、リカバリーコードでログインして新しいキーを登録。そのキーだけで再ログインできる |
 | `host.pair` | Remora タブの「接続」でハブの URL を入れて確認コードを出し、ハブの `/pair?code=…` でパスキーの再確認つきで承認すると、タブが「Connected」になる |
 | `host.permit` | Remora タブで上限を「依頼できる」にし、「範囲」で既定のワークスペースを許可する |
 | `token.mint` | ハブの設定画面で個人トークン（`dsh.read`・`dsh.content`・`dsh.tasks`）をパスキーの再確認つきで発行し、「接続」画面でそのホストに「依頼できる」を付与する（ハブが DSH の上限を知るまで待つ） |
+| `grant.cancel` | 権限を「見るだけ」へ変える確認を取り消し、表示・サーバー側・再読込後の権限が保存済みの「依頼できる」のままであることを確認する |
 | `task.complete` | `hosts.list` → `sessions.list` → `task.start`（同じ `idempotencyKey` で 2 回送って同じタスクになること）→ `task.wait` で `completed`、返答がモックの `REMORA-MOCK-REPLY <nonce>` で、モックがそのプロンプトを受け取っている |
 | `task.attention` | `ask_user_question`（timed モード）で `needs_attention`、`attention.list` に出て、`attention.respond` で答えると続きのターンが `REMORA-MOCK-ANSWERED <nonce> Teal` を返して `completed` |
 | `answer.web-open` | DSH Web を開いたまま、答えが来るまで止まる質問を出す。Remora も受け付け（`answerVia: remote`、DSH Web が画面で待つ間は締め切り無し）、`attention.respond` で Navy と答えると続きが `REMORA-MOCK-ANSWERED <nonce> … Navy …` で `completed` |
@@ -160,7 +162,7 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 
 ## CI
 
-- `.github/workflows/e2e.yml`: プラグイン・protocol・ハブ・ハーネスに触れる PR と毎晩の実行は `--strict`（毎晩は固定の版と `newest`。`newest` の失敗はジョブを落とさない）。ほかに手動実行、リリースからの呼び出し。`artifacts/e2e/` をアップロードし、`summary.md` をジョブの概要に出します。
+- `.github/workflows/e2e.yml`: 関連する PR では最低対応版を `--strict` で検証します。毎晩とリリースでは最低対応版と peer 範囲内の最新公開版（RC を含む）を検証し、どちらの失敗も検証失敗にします。手動実行でも対応版を選べます。`artifacts/e2e/` をアップロードし、`summary.md` をジョブの概要に出します。
 - `.github/workflows/release.yml`: `v*` タグで、版の一致（`scripts/check-version.mjs`）、型検査・テスト・ハブのバンドル、E2E（全ステップ、`--strict`）、プラグインの tarball、5 プラットフォームの CLI（`packages/cli/scripts/build-binaries.mjs` をネイティブのランナーで実行）、インストールスクリプト、全アセットの `SHA256SUMS`、`actions/attest-build-provenance` による来歴の証明、GitHub Release の作成。
 
 ## 既知の制約

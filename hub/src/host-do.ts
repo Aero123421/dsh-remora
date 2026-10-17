@@ -9,6 +9,7 @@
  * only to fail early and to explain denials.
  */
 import { answerPath, answerUrl, pushText } from './attention.ts'
+import { WAIT_HEADER, WAIT_PATH, isWaitSocket, mintWait, readWait, openWait, notifyWaiters, waitResult } from './ledger-wait.ts'
 import { stampHostId } from './stamp.ts'
 import type { PushEvent } from './types.ts'
 import { DurableObject } from 'cloudflare:workers'
@@ -48,6 +49,7 @@ interface Attachment {
   issuedAt: number
   origin: string
   connectionId: string
+  messagesSinceFlush?: number
   hello?: HelloFrame
 }
 
@@ -200,8 +202,6 @@ const err = (code: RemoraError['code'], message: string, extra: Partial<RemoraEr
 export class HostDO extends DurableObject<Env> {
   private readonly sql: SqlStorage
   private readonly pending = new Map<string, (frame: ResponseFrame | null) => void>()
-  private readonly waiters = new Map<string, Set<() => void>>()
-  private messagesSinceFlush = 0
   /** Parked deliveries this instance has sent and not yet seen answered. */
   private readonly inFlight = new Set<string>()
   /**
@@ -314,7 +314,7 @@ export class HostDO extends DurableObject<Env> {
     this.setInfo('revoked', '1')
     this.setInfo('offline_since', null)
     this.setInfo('public_key', null)
-    for (const ws of this.ctx.getWebSockets()) {
+    for (const ws of this.ctx.getWebSockets().filter(socket => !isWaitSocket(socket))) {
       send(ws, { t: 'close', reason: 'revoked' })
       ws.close(4003, 'revoked')
     }
@@ -323,13 +323,48 @@ export class HostDO extends DurableObject<Env> {
       "UPDATE tasks SET state = 'failed', params = NULL, frame = NULL, error = ?, updated_at = ? WHERE state IN ('parked', 'accepted', 'running', 'needs_attention')",
       JSON.stringify(err('gone', 'The host was unpaired from the hub.')), now,
     )
-    for (const [taskId] of this.waiters) this.notify(taskId)
+    notifyWaiters(this.ctx)
     await this.audit('host', 'host.revoked', 'ok')
   }
 
   // --- WebSocket handshake ---------------------------------------------------------------
 
+  /** RPC-only capability issuer. No public route can mint these tokens. */
+  async prepareLedgerWait(call: ExecuteCall): Promise<string> {
+    if (call.op !== 'task.wait' && call.op !== 'confirmation.get') throw new Error('Not a ledger wait')
+    if (!this.schemaReady) return ''
+    let secret = this.info('ledger_wait_key')
+    if (!secret) { secret = randomToken(32); this.setInfo('ledger_wait_key', secret) }
+    return mintWait(secret, call)
+  }
+
+  private async ledgerWait(request: Request): Promise<Response> {
+    const cap = await readWait<ExecuteCall>(this.info('ledger_wait_key'), request.headers.get(WAIT_HEADER))
+    if (!cap || (cap.input.op !== 'task.wait' && cap.input.op !== 'confirmation.get')) return new Response('invalid wait capability', { status: 403 })
+    const call = cap.input
+    const timeout = Math.max(0, Math.min(TASK_WAIT_MAX_MS, typeof call.params.timeoutMs === 'number' ? call.params.timeoutMs : call.op === 'task.wait' ? TASK_WAIT_MAX_MS : 0))
+    const key = call.op === 'task.wait' ? String(call.params.taskId ?? '') : `c:${String(call.params.confirmationId ?? '')}`
+    const subscription = openWait(this.ctx, { kind: 'ledger-wait', key, clientId: call.actor.clientId, nonce: cap.nonce, expiresAt: Date.now() + timeout + RELAY_TIMEOUT_MS + 5000 })
+    if (!subscription) return Response.json({ ok: false, error: err('rate_limited', 'Too many concurrent waits; collect an existing wait before starting another.') })
+    try {
+      const outcome = await this.executeChecked({ ...call, params: { ...call.params, timeoutMs: 0 } }, true)
+      const waiting = timeout > 0 && pendingLedgerResult(call, outcome)
+      const confirmation = call.op === 'confirmation.get' ? this.confirmationRow(String(call.params.confirmationId)) : undefined
+      const deadline = confirmation ? (confirmation.state === 'pending' ? confirmation.expires_at : confirmation.deadline_at ?? Infinity) : Infinity
+      waitResult(subscription.server, outcome, waiting, Math.min(timeout, Math.max(0, deadline - Date.now()) + 50))
+      return subscription.response
+    } catch (error) {
+      subscription.server.close(1011, 'query failed')
+      throw error
+    }
+  }
+
   override async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === WAIT_PATH) {
+      if (request.method !== 'GET') return new Response('method not allowed', { status: 405 })
+      if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return new Response('expected a WebSocket upgrade', { status: 426 })
+      return this.ledgerWait(request)
+    }
     if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return new Response('expected a WebSocket upgrade', { status: 426 })
     const hostId = this.hostId
     if (!hostId || this.info('revoked') === '1' || !this.info('public_key')) return new Response('unknown host', { status: 404 })
@@ -338,7 +373,7 @@ export class HostDO extends DurableObject<Env> {
     const now = Date.now()
     for (const ws of this.ctx.getWebSockets()) {
       const attachment = ws.deserializeAttachment() as Attachment | null
-      if (attachment && attachment.stage !== 'ready' && attachment.issuedAt < now - AUTH_WINDOW_MS) ws.close(4001, 'handshake timed out')
+      if (attachment && !isWaitSocket(ws) && attachment.stage !== 'ready' && attachment.issuedAt < now - AUTH_WINDOW_MS) ws.close(4001, 'handshake timed out')
     }
     const { 0: client, 1: server } = new WebSocketPair()
     this.ctx.acceptWebSocket(server)
@@ -349,7 +384,8 @@ export class HostDO extends DurableObject<Env> {
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    this.countMessage()
+    if (isWaitSocket(ws)) { ws.close(1008, 'notifications only'); return }
+    this.countMessage(ws)
     if (typeof message !== 'string') { ws.close(1003, 'text frames only'); return }
     let frame
     try { frame = parseHostFrame(message) } catch { ws.close(1007, 'invalid frame'); return }
@@ -467,7 +503,9 @@ export class HostDO extends DurableObject<Env> {
     } catch {
       // already closed
     }
+    if (isWaitSocket(ws)) return
     const wasReady = (ws.deserializeAttachment() as Attachment | null)?.stage === 'ready'
+    if (wasReady) notifyWaiters(this.ctx)
     if (wasReady && this.readySockets().filter(other => other !== ws).length === 0) {
       this.setInfo('last_seen_at', String(Date.now()))
       if (this.info('revoked') !== '1' && this.info('offline_since') === null && this.info('offline_notified') !== '1') {
@@ -486,14 +524,16 @@ export class HostDO extends DurableObject<Env> {
     }
   }
 
-  private countMessage(): void {
-    // Incoming WebSocket messages are billed at 20 per Durable Object request.
-    this.messagesSinceFlush++
-    if (this.messagesSinceFlush >= 200) {
-      const durable = Math.round(this.messagesSinceFlush / 20)
-      this.messagesSinceFlush = 0
+  private countMessage(ws: WebSocket): void {
+    // Attachments survive hibernation without a SQLite write per message.
+    const attachment = ws.deserializeAttachment() as Attachment
+    let messagesSinceFlush = (attachment.messagesSinceFlush ?? 0) + 1
+    if (messagesSinceFlush >= 200) {
+      const durable = Math.floor(messagesSinceFlush / 20)
+      messagesSinceFlush %= 20
       this.ctx.waitUntil(this.hub().meterAdd({ worker: 0, durable, kv: 0 }).catch(() => undefined))
     }
+    ws.serializeAttachment({ ...attachment, messagesSinceFlush } satisfies Attachment)
   }
 
   // --- events from the host ---------------------------------------------------------------
@@ -532,6 +572,7 @@ export class HostDO extends DurableObject<Env> {
         return
       }
       case 'host-status':
+        notifyWaiters(this.ctx)
         this.setInfo('ceiling', JSON.stringify(event.ceiling))
         this.setInfo('kill_switch', event.killSwitch ? '1' : '0')
         this.setInfo('operations', JSON.stringify(event.operations))
@@ -539,11 +580,16 @@ export class HostDO extends DurableObject<Env> {
     }
   }
 
+  async wakeClientWaits(clientId: string): Promise<void> {
+    for (const socket of this.ctx.getWebSockets('ledger-wait')) {
+      const attachment = socket.deserializeAttachment() as { clientId: string }
+      if (attachment.clientId !== clientId) continue
+      try { socket.send(JSON.stringify({ type: 'changed' })); socket.close(1000, 'policy changed') } catch { /* already closing */ }
+    }
+  }
+
   private notify(taskId: string): void {
-    const set = this.waiters.get(taskId)
-    if (!set) return
-    this.waiters.delete(taskId)
-    for (const wake of set) wake()
+    notifyWaiters(this.ctx, taskId)
   }
 
   private async onResponse(frame: ResponseFrame): Promise<void> {
@@ -747,16 +793,25 @@ export class HostDO extends DurableObject<Env> {
    * Every call is audited without its content.
    */
   async execute(call: ExecuteCall): Promise<ExecuteResult> {
+    return this.executeChecked(call)
+  }
+
+  private async executeChecked(call: ExecuteCall, deferPendingAudit = false): Promise<ExecuteResult> {
     if (!this.schemaReady) return { ok: false, error: err('gone', 'This host is not paired with the hub.', { fix: 'hub:/' }) }
-    const result = await this.executeInner(call)
+    const result = this.currentExecuteResult(call, await this.executeInner(call))
     const denial = result.ok ? null : result.error.denial
-    await this.audit(call.actor, call.op, result.ok ? 'ok' : result.error.code === 'denied' ? 'denied' : 'error', {
+    // A pending subscription is audited by its final read. Immediate results
+    // and denials still record exactly one logical operation.
+    if (!deferPendingAudit || !pendingLedgerResult(call, result)) await this.audit(call.actor, call.op, result.ok ? 'ok' : result.error.code === 'denied' ? 'denied' : 'error', {
       layer: denial?.layer,
       reason: result.ok ? null : denial?.reason ?? result.error.code,
     })
+    // An audit write may yield to a policy change; recheck after it too.
+    return this.currentExecuteResult(call, result)
+  }
+
+  private currentExecuteResult(call: ExecuteCall, result: ExecuteResult): ExecuteResult {
     if (!result.ok) return result
-    // The host may lower its ceiling, stop access or unpair while a relay or
-    // ledger wait is outstanding. Check again after the final audit await.
     if (this.info('revoked') === '1') return { ok: false, error: err('gone', 'This host is no longer paired with the hub.') }
     const current = decide({ operation: call.op, ceiling: this.ceiling() ?? { level: 'view' }, hubGrant: call.grant, tokenScopes: call.scopes, now: Date.now() })
     if (!current.allowed) return { ok: false, error: denied(current.layer, current.reason, call.op) }
@@ -818,6 +873,7 @@ export class HostDO extends DurableObject<Env> {
 
   // --- host key rotation (host.rotate-key) ---------------------------------------------------
 
+  private rotationReconnect: (() => void) | null = null
   private rotation: { nonce: string; resolve: (frame: RotateKeyProofFrame | null) => void } | null = null
 
   /** The host authenticated with the key it proved: it replaces the paired key on the hub. */
@@ -830,7 +886,7 @@ export class HostDO extends DurableObject<Env> {
     this.setInfo('public_key', publicKey)
     this.setInfo('next_public_key', null)
     await this.audit('host', 'host.rotate-key.finished', 'ok')
-    this.notify('key-rotated')
+    this.rotationReconnect?.()
     return true
   }
 
@@ -865,7 +921,10 @@ export class HostDO extends DurableObject<Env> {
     }
     this.setInfo('next_public_key', proof.publicKey)
     send(ws, { t: 'rotate-key-commit', nonce, publicKey: proof.publicKey })
-    if (this.info('public_key') !== proof.publicKey) await this.waitFor('key-rotated', ROTATE_RECONNECT_MS)
+    if (this.info('public_key') !== proof.publicKey) await new Promise<void>(resolve => {
+      const timer = setTimeout(resolve, ROTATE_RECONNECT_MS)
+      this.rotationReconnect = () => { clearTimeout(timer); resolve() }
+    }).finally(() => { this.rotationReconnect = null })
     if (this.info('public_key') !== proof.publicKey) {
       return { ok: false, error: err('unavailable', 'The DSH host has not reconnected with its new key yet. It keeps working with its old key until it does; the rotation finishes on its first connection with the new key.') }
     }
@@ -956,33 +1015,9 @@ export class HostDO extends DurableObject<Env> {
     const id = String(call.params.confirmationId ?? '')
     const visible = (row: ConfirmationRow | undefined) => row !== undefined && (call.actor.clientId === OWNER_CLIENT_ID || row.client_id === call.actor.clientId)
     this.settleOverdue()
-    let row = this.confirmationRow(id)
+    const row = this.confirmationRow(id)
     if (!visible(row)) return { ok: false, error: err('not_found', 'No confirmation with this id is known to the hub for this client.') }
-    const requested = typeof call.params.timeoutMs === 'number' ? call.params.timeoutMs : 0
-    const timeout = Math.max(0, Math.min(TASK_WAIT_MAX_MS, requested))
-    if ((row!.state === 'pending' || row!.state === 'running') && timeout > 0) {
-      await this.waitFor(`c:${id}`, Math.min(timeout, Math.max(0, (row!.state === 'pending' ? row!.expires_at : row!.deadline_at ?? Infinity) - Date.now()) + 50))
-      this.settleOverdue()
-      row = this.confirmationRow(id)
-      if (!row) return { ok: false, error: err('not_found', 'The confirmation was removed while waiting.') }
-    }
     return { ok: true, result: this.confirmationInfo(row as ConfirmationRow, call.origin) }
-  }
-
-  private waitFor(key: string, timeoutMs: number): Promise<void> {
-    return new Promise<void>(resolve => {
-      const timer = setTimeout(() => {
-        this.waiters.get(key)?.delete(wake)
-        resolve()
-      }, timeoutMs)
-      const wake = () => {
-        clearTimeout(timer)
-        resolve()
-      }
-      const set = this.waiters.get(key) ?? new Set()
-      set.add(wake)
-      this.waiters.set(key, set)
-    })
   }
 
   /** One confirmation for the owner's review page. */
@@ -1206,21 +1241,9 @@ export class HostDO extends DurableObject<Env> {
 
   private async taskQuery(call: ExecuteCall): Promise<TaskQueryResult> {
     const taskId = String(call.params.taskId ?? '')
-    let row = this.taskRow(taskId)
+    const row = this.taskRow(taskId)
     if (!row) return { ok: false, error: err('not_found', 'No task with this id is known to the hub.') }
-    const initial = await this.readTask(call, row)
-    if (!initial.ok) return initial
-    if (call.op === 'task.wait') {
-      const requested = typeof call.params.timeoutMs === 'number' ? call.params.timeoutMs : TASK_WAIT_MAX_MS
-      const timeout = Math.max(0, Math.min(TASK_WAIT_MAX_MS, requested))
-      if (!settled(initial.result.state) && timeout > 0) {
-        await this.waitFor(taskId, timeout)
-        row = this.taskRow(taskId)
-        if (!row) return { ok: false, error: err('not_found', 'The task was removed while waiting.') }
-        return this.readTask(call, row)
-      }
-    }
-    return initial
+    return this.readTask(call, row)
   }
 
   // --- alarms -------------------------------------------------------------------------------------
@@ -1401,6 +1424,13 @@ export class HostDO extends DurableObject<Env> {
     if (!this.schemaReady) return []
     return listAudit(this.sql, limit)
   }
+}
+
+/** Whether a successful ledger read still needs a notification or timeout. */
+function pendingLedgerResult(call: ExecuteCall, outcome: ExecuteResult): boolean {
+  if (!outcome.ok) return false
+  const state = (outcome.result as { state: TaskState | ConfirmationState }).state
+  return call.op === 'task.wait' ? !settled(state as TaskState) : call.op === 'confirmation.get' && (state === 'pending' || state === 'running')
 }
 
 function settled(state: TaskState): boolean {

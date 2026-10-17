@@ -80,10 +80,7 @@ describe('in-flight authorization', () => {
     host.respond = frame => ({ ok: true, result: { taskId: frame.taskId, sessionId: 's', state: 'running' } })
     const task = resultOf<TaskInfo>(await runOperation(env, caller, 'task.start', startParams(host.hostId, 'wait-revoke')))
     const pending = runOperation(env, caller, 'task.wait', { taskId: task.taskId, timeoutMs: 10_000 })
-    await eventually(async () => expect(await runInDurableObject(hostObject(host.hostId), instance => {
-      const waits = (instance as unknown as { waiters: Map<string, Set<unknown>> }).waiters
-      return waits.get(task.taskId)?.size ?? 0
-    })).toBe(1))
+    await eventually(async () => expect(await runInDurableObject(hostObject(host.hostId), (_instance, state) => state.getWebSockets('ledger-wait').length)).toBe(1))
     await hub().revokeClient(caller.clientId)
     host.respond = frame => ({ ok: true, result: { taskId: frame.taskId, sessionId: 's', state: 'completed', result: { reply: 'private reply' } } })
     host.sendEvent([{ kind: 'task', taskId: task.taskId, sessionId: 's', state: 'completed', updatedAt: Date.now() }])
@@ -96,10 +93,7 @@ describe('in-flight authorization', () => {
     const asked = resultOf<ConfirmationInfo>(await runOperation(env, caller, 'hub.export', {}))
     const id = asked.confirmationId
     const pending = runOperation(env, caller, 'confirmation.get', { confirmationId: id, timeoutMs: 10_000 })
-    await eventually(async () => expect(await runInDurableObject(hub(), instance => {
-      const waits = (instance as unknown as { approvalWaiters: Map<string, Set<unknown>> }).approvalWaiters
-      return waits.get(id)?.size ?? 0
-    })).toBe(1))
+    await eventually(async () => expect(await runInDurableObject(hub(), (_instance, state) => state.getWebSockets('ledger-wait').length)).toBe(1))
     await hub().revokeClient(caller.clientId)
     expect(await hub().decideApproval(id, true)).toBe(false)
     expect(await pending).toMatchObject({ ok: false, error: { code: 'denied' } })

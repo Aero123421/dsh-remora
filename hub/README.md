@@ -33,7 +33,11 @@ Remora のハブです。自分の Cloudflare アカウントの無料枠で動�
 
 ボタンを押すと、このフォルダが自分の GitHub に複製され、Cloudflare にデプロイされます。途中で `SETUP_TOKEN` を聞かれたら、長いランダムな文字列を入れてください。最初のパスキーを登録すると使えなくなる、一度きりの合言葉です。
 
-使うもの（すべて無料枠）: Workers、Durable Objects（SQLite）、KV（OAuth のトークンだけ）、静的アセット（アイコン）。
+使うもの（無料枠のあるサービス）: Workers、Durable Objects（SQLite）、KV（OAuth のトークンだけ）、静的アセット（アイコン）。
+
+追加課金を避ける場合は **Workers Free** で運用してください。有料契約への切り替えは必要ありません。無料枠を超えると対象の操作が失敗することがあります。すでに Workers Paid のアカウントで使う場合は、その契約の料金が適用されます。この設定ファイルや画面の使用量メーターは、アカウントを無料契約に固定するものではありません。
+
+画面の使用量はリクエスト等の概算です。Durable Objects の実行時間・SQL の読み書きと保存量・KV の読み取りなど、表示に含まれない上限もあります。Cloudflare のダッシュボードで実使用量と契約を確認してください。同じアカウントの別アプリも枠を使います。現在の枠は [Workers](https://developers.cloudflare.com/workers/platform/pricing/)、[Durable Objects](https://developers.cloudflare.com/durable-objects/platform/pricing/)、[KV](https://developers.cloudflare.com/kv/platform/pricing/) の公式資料で確認できます。
 
 ## 更新
 

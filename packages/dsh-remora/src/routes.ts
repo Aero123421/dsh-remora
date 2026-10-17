@@ -163,7 +163,12 @@ export function createMethods(core: RemoraCore): Record<string, Method> {
     'update-check': async payload => core.checkUpdate(field(payload, 'force') === true),
     'update-install': async (payload, { local }) => core.installUpdate(local, field(payload, 'version')),
   }
-  return Object.fromEntries(Object.entries(methods).map(([name, method]) => [name, withReady(method)]))
+  return Object.fromEntries(Object.entries(methods).map(([name, method]) => [name, withReady((payload, info) => {
+    // A partially initialized Host still serves its safe startup diagnostic.
+    // Other actions cannot run against stores/services that never opened.
+    if (!['state', 'audit', 'clients'].includes(name)) core.assertReady()
+    return method(payload, info)
+  })]))
 }
 
 const json = (value: unknown, status = 200) =>

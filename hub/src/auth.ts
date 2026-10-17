@@ -214,9 +214,10 @@ export async function handleAuth(request: Request, env: Env, path: string): Prom
       return json({ ok: true })
     }
     case '/auth/passkeys/options':
-      if (!session.fresh) return fail(403, 'confirm with a passkey first')
+      if (!session.fresh) return json({ error: { code: 'reauth_required', message: 'confirm with a passkey first' } }, { status: 403 })
       return json(await registrationOptions(env, origin, 'add-passkey'))
     case '/auth/passkeys/verify': {
+      if (!session.fresh) return fail(403, 'confirm with a passkey first')
       const passkey = await verifyRegistration(env, origin, body.challengeId, body.response, 'add-passkey', body.label)
       if (!passkey || !(await hub.addPasskey(passkey))) return fail(400, 'passkey registration failed')
       return json({ ok: true })

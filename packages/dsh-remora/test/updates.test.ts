@@ -8,7 +8,8 @@ import { checkForUpdate, compareVersions, downloadVerified, expectedHash, MAX_TA
 import { apply } from '../src/index.ts'
 import type { JsonDocument as StoredDocument } from '../src/core/storage.ts'
 import { PLUGIN_VERSION } from '../src/dsh.ts'
-import { fakeHost, rpc, tempDir, until } from './helpers.ts'
+import { fakeHost, makePasskey, rpc, tempDir, until } from './helpers.ts'
+import { FakeHub } from './fake-hub.ts'
 
 test('semver comparison handles pre-releases', () => {
   assert.ok(compareVersions('0.1.0', '0.0.9') > 0)
@@ -1188,4 +1189,80 @@ test('external upgrade during receipt I/O is rechecked immediately before manage
     assert.equal(result.error, 'installed-version-current')
     assert.equal(installs, 0)
   } finally { receipt.update = save; await h.cleanup() }
+})
+
+test('a secondary Host with an actual occupied hub lock observes the update without starting another install', async () => {
+  const downloaded = gate<void>()
+  let downloads = 0
+  let installs = 0
+  const base = github(`${sha}  dsh-remora-0.2.0.tgz\n`)
+  const fetchImpl = async (url: string) => {
+    if (url.endsWith('.tgz')) { downloads++; await downloaded.promise }
+    return base(url)
+  }
+  const manager: UpdatePluginManager = { listBundles: async () => [installedBundle], installBundle: async () => { installs++; return success() } }
+  const h = await updateCore(manager, fetchImpl)
+  const hub = new FakeHub({ port: 0, owner: [makePasskey('ed25519').credential] })
+  let secondary: ReturnType<typeof apply> | undefined
+  let pending: Promise<UpdateInstallation> | undefined
+  try {
+    await hub.listen()
+    await h.core.startPairing(hub.origin, true)
+    await until(() => h.core.internals.link.connected, 5_000)
+    const secondHost = fakeHost({ profileContext: { dir: h.core.dataDir }, pluginManager: manager })
+    secondary = apply(secondHost.ctx, undefined, { dataDir: h.core.dataDir, dshVersion: '0.2.1-alpha.2', githubFetch: fetchImpl })
+    await secondary.ready
+    assert.equal(h.core.snapshot(true).hub.lock, 'held')
+    assert.equal(secondary.snapshot(true).hub.lock, 'other')
+    await secondary.checkUpdate(true)
+    pending = h.core.installUpdate(true, '0.2.0')
+    await until(() => downloads === 1)
+    const observed = await secondary.reconcileUpdate()
+    assert.equal(observed?.phase, 'downloading')
+    const duplicate = await rpc<UpdateInstallation>(secondHost.routes, 'update-install', { version: '0.2.0' })
+    assert.equal(duplicate.ok, true)
+    if (duplicate.ok) assert.equal(duplicate.value.requestId, observed?.requestId)
+    downloaded.resolve()
+    assert.equal((await pending).phase, 'restart-required')
+    assert.equal(downloads, 1)
+    assert.equal(installs, 1)
+    assert.equal((await secondary.reconcileUpdate())?.phase, 'restart-required')
+  } finally {
+    downloaded.resolve()
+    await pending?.catch(() => undefined)
+    await secondary?.dispose()
+    await hub.close()
+    await h.cleanup()
+  }
+})
+
+test('a live-owner observer cannot rewind a completed receipt to installing while checking the bundle list', async () => {
+  const completed = gate<BundleChangeResult>()
+  const observed = gate<void>()
+  let installs = 0
+  let listing = false
+  const h = await updateCore({ listBundles: async () => [installedBundle], installBundle: async () => { installs++; return completed.promise } })
+  const pending = h.core.installUpdate(true, '0.2.0')
+  let replacement: ReturnType<typeof apply> | undefined
+  try {
+    await until(() => installs === 1)
+    const observer: UpdatePluginManager = {
+      listBundles: async () => { listing = true; await observed.promise; return [installedBundle] },
+      installBundle: async () => { throw new Error('observer must not install') },
+    }
+    replacement = apply(fakeHost({ pluginManager: observer, profileContext: { dir: h.core.dataDir } }).ctx, undefined, { dataDir: h.core.dataDir, dshVersion: '0.2.1-alpha.2' })
+    await replacement.ready
+    await until(() => listing)
+    completed.resolve(success())
+    assert.equal((await pending).phase, 'restart-required')
+    observed.resolve()
+    assert.equal((await replacement.reconcileUpdate())?.phase, 'restart-required')
+    assert.equal(installs, 1)
+  } finally {
+    completed.resolve(success())
+    observed.resolve()
+    await pending.catch(() => undefined)
+    await replacement?.dispose()
+    await h.cleanup()
+  }
 })

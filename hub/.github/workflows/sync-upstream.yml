@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
   pull-requests: write
+concurrency:
+  group: remora-upstream-sync
+  cancel-in-progress: false
 jobs:
   sync:
     if: github.repository != 'Aero123421/dsh-remora'
@@ -18,44 +21,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
-      - name: Compare with the latest upstream release
-        id: release
-        run: |
-          latest=$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)
-          current="v$(node -p "require('./package.json').version")"
-          echo "latest=$latest" >> "$GITHUB_OUTPUT"
-          echo "current=$current" >> "$GITHUB_OUTPUT"
-          if [ "$latest" = "$current" ]; then echo "up-to-date=true" >> "$GITHUB_OUTPUT"; fi
-      - name: Copy the hub from the new release
-        if: steps.release.outputs.up-to-date != 'true'
-        id: copy
-        run: |
-          set -euo pipefail
-          git clone --quiet --depth 1 --branch "${{ steps.release.outputs.latest }}" "https://github.com/$UPSTREAM" "$RUNNER_TEMP/new"
-          git clone --quiet --depth 1 --branch "${{ steps.release.outputs.current }}" "https://github.com/$UPSTREAM" "$RUNNER_TEMP/old" || true
-          kept=false
-          if [ -f "$RUNNER_TEMP/old/hub/wrangler.jsonc" ] && ! cmp -s wrangler.jsonc "$RUNNER_TEMP/old/hub/wrangler.jsonc"; then
-            cp wrangler.jsonc "$RUNNER_TEMP/wrangler.local.jsonc"; kept=true
-          fi
-          rsync -a --delete --exclude .git "$RUNNER_TEMP/new/hub/" ./
-          if [ "$kept" = true ]; then cp "$RUNNER_TEMP/wrangler.local.jsonc" wrangler.jsonc; fi
-          echo "kept-wrangler=$kept" >> "$GITHUB_OUTPUT"
-      - name: Open a pull request
-        if: steps.release.outputs.up-to-date != 'true'
-        run: |
-          set -euo pipefail
-          branch="remora-sync/${{ steps.release.outputs.latest }}"
-          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then echo "PR branch already exists"; exit 0; fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git switch -c "$branch"
-          git add -A
-          git diff --cached --quiet && { echo "nothing to update"; exit 0; }
-          git commit -m "Update Remora hub to ${{ steps.release.outputs.latest }}"
-          git push origin "$branch"
-          note=''
-          if [ "${{ steps.copy.outputs.kept-wrangler }}" = true ]; then
-            note=$'\n\n⚠️ wrangler.jsonc was changed in this repository, so your version was kept. Compare it with the upstream file before merging.'
-          fi
-          gh pr create --title "Update Remora hub to ${{ steps.release.outputs.latest }}" \
-            --body "Release notes: https://github.com/$UPSTREAM/releases/tag/${{ steps.release.outputs.latest }}${note}"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Update the sync branch and ensure its pull request exists
+        run: node scripts/sync-upstream.mjs

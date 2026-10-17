@@ -2,6 +2,7 @@
 export interface SnapshotView<S> {
   snapshot: S | undefined
   failed: boolean
+  lastChecked: number | null
   busy: boolean
   actionError: unknown
 }
@@ -11,7 +12,7 @@ type Request = (method: string, payload: unknown, signal: AbortSignal) => Promis
 export class SnapshotStore<S> {
   #request: Request
   #isSnapshot: (value: unknown) => value is S
-  #view: SnapshotView<S> = { snapshot: undefined, failed: false, busy: false, actionError: null }
+  #view: SnapshotView<S> = { snapshot: undefined, failed: false, lastChecked: null, busy: false, actionError: null }
   #listeners = new Set<() => void>()
   #users = 0
   #generation = 0
@@ -38,9 +39,9 @@ export class SnapshotStore<S> {
   }
 
   /** The last consumer invalidates even transports that ignore cancellation. */
-  retain = (): (() => void) => {
+  retain = (refresh = true): (() => void) => {
     ++this.#users
-    void this.reload()
+    if (refresh) void this.reload()
     let released = false
     return () => {
       if (released) return
@@ -52,7 +53,7 @@ export class SnapshotStore<S> {
       for (const write of this.#writes) write.abort()
       this.#writes.clear()
       this.#pending = 0
-      this.#publish({ snapshot: undefined, failed: false, busy: false, actionError: null })
+      this.#publish({ snapshot: undefined, failed: false, lastChecked: null, busy: false, actionError: null })
     }
   }
 
@@ -67,7 +68,7 @@ export class SnapshotStore<S> {
       const value = await this.#request('state', {}, read.signal)
       if (current()) {
         if (!this.#isSnapshot(value)) throw new Error('invalid snapshot')
-        this.#publish({ snapshot: value, failed: false })
+        this.#publish({ snapshot: value, failed: false, lastChecked: Date.now() })
       }
     } catch {
       if (current()) this.#publish({ failed: true })
@@ -91,7 +92,7 @@ export class SnapshotStore<S> {
     try {
       const value = await this.#request(method, payload, write.signal)
       if (!current()) return false
-      if (this.#isSnapshot(value)) this.#publish({ snapshot: value, failed: false })
+      if (this.#isSnapshot(value)) this.#publish({ snapshot: value, failed: false, lastChecked: Date.now() })
       return true
     } catch (error) {
       if (current()) this.#publish({ actionError: error })

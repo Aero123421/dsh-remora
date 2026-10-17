@@ -1,7 +1,7 @@
 # Release: push a tag v<version> (the same version in packages/dsh-remora,
 # packages/cli and hub/) and this workflow
 #   1. checks versions, types, tests and the hub bundle,
-#   2. runs the E2E browser check against the pinned DSH,
+#   2. runs strict E2E against minimum and latest supported public DSH releases,
 #   3. packs the plugin tarball, bundles the CLI as remora.mjs (the primary,
 #      Node.js form) and builds the standalone binaries on native runners,
 #   4. publishes one GitHub Release with every asset, a single SHA256SUMS
@@ -41,6 +41,8 @@ jobs:
         id: version
         run: node scripts/check-version.mjs --tag "$GITHUB_REF_NAME"
       - run: pnpm install --frozen-lockfile
+      - name: Release selection and upstream sync regressions
+        run: node --test packages/dsh-remora/scripts/compat/*.test.mjs hub/scripts/*.test.mjs
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build

@@ -3,7 +3,7 @@
 `pnpm --filter dsh-remora test:compat` runs the Remora operation adapter
 (`src/adapter`) against the **real DSH services** at the commit pinned in
 `upstream.json` (0.2.1-alpha.3, `2fbf435`). `DSH_UPSTREAM_COMMIT=<40-hex sha>`
-fetches that commit instead (CI uses the newest `dsh-v*-alpha.*` tag).
+fetches that commit instead (CI uses the newest public `dsh-v*` tag within the plugin's peer range, including release candidates).
 `DSH_UPSTREAM_DIR=<checkout>` uses a local checkout and does not check the pin.
 
 1. `upstream.mjs` fetches that commit into `.cache/upstream` (shallow git
@@ -69,5 +69,5 @@ gateway calls are not composed.
 - The legacy-mode `ask_user_question` tool itself (it passes no call id; covered by unit tests and the E2E run), `exit_plan_mode` plan reviews (plan mode is not composed; unit tests only), DSH Web's card being withdrawn when an outside answer wins (no gateway here; unit tests and the E2E run), approvals asked by a real tool's permission prompt (the request is made directly), goals (`ctx.goals`), slash commands (`ctx.commands`), background jobs (`ctx.jobs`), workspace changes and deliverables (`workspaceChanges`, `present` tool), the skill catalog (`sessionSkillCatalog` needs `workingDirectory`, not composed), `selectModel` / `modelCatalog` against real providers, agent presets other than the default, subagent sessions, `workspace.create` with a real `git` (covered by unit tests with a fake git).
 - DSH Web presence (`hasLiveClient` is a heuristic; the gateway's `hasLiveClient()` that decides the answer deadline is not composed), multiple processes, Windows.
 - Background jobs (`ctx.jobs` is not composed: job.stop and the jobs on session.get are covered by unit tests), and the passkey check that guards terminal.run (core tests).
-- DSH versions other than the pin: set `DSH_UPSTREAM_COMMIT` to a full sha, or `DSH_UPSTREAM_DIR` to a checkout. CI does the former for the newest `dsh-v*-alpha.*` tag.
+- DSH versions other than the pin: set `DSH_UPSTREAM_COMMIT` to a full sha, or `DSH_UPSTREAM_DIR` to a checkout. CI does the former for the newest supported public tag, selected by `latest-supported.mjs`. Diagnostics report the actual checkout commit and dirty state.
 - Non-owner Remote calls. `remoteAccess.allows` is checked only for an in-process caller, where it admits every session. Gateway filtering of `session/search` for a guest peer is not composed.

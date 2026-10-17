@@ -3,10 +3,11 @@
  * validate, resolve the host, attach the caller's grant, pre-check, relay to
  * the host Durable Object (or answer hub operations here).
  */
+import { WAIT_HEADER, WAIT_PATH, awaitWaitResponse } from './ledger-wait.ts'
 import { stampAnswerUrls } from './attention.ts'
 import { ownerGrant, ownerGrantFor } from './owner-grant.ts'
 import { AUDIT_MAX_ROWS, FREE_TIER, OWNER_CLIENT_ID, RATE_LIMITS, dcrEnabled } from './config.ts'
-import type { ConfirmationView, ExecuteResult, HostLive } from './host-do.ts'
+import type { ConfirmationView, ExecuteCall, ExecuteResult, HostLive } from './host-do.ts'
 import { denied } from './host-do.ts'
 import { APPROVAL_RESULT_MS, type ApprovalRecord } from './hub-do.ts'
 import { HUB_VERSION } from './version.ts'
@@ -28,6 +29,8 @@ export interface Caller {
 
 export interface RunOptions {
   confirmation?: Confirmation
+  /** Cancels the transient notification socket when the HTTP request ends. */
+  signal?: AbortSignal
   requestId?: string
   /**
    * The hub origin. When set, every attention item in the result gets its
@@ -114,7 +117,16 @@ async function runOperationInner(env: Env, caller: Caller, op: string, rawParams
     const decision = decide({ operation: op, ceiling: { level: 'full' }, hubGrant: { level: 'view' }, tokenScopes: caller.scopes, now: Date.now() })
     if (!decision.allowed) return { ok: false, error: denied(decision.layer, decision.reason, op) }
     const timeoutMs = typeof params.timeoutMs === 'number' ? params.timeoutMs : 0
-    const row = await hubStub(env).approvalFor(params.confirmationId, caller.kind === 'owner' ? undefined : caller.clientId, timeoutMs)
+    const hub = hubStub(env)
+    const clientId = caller.kind === 'owner' ? undefined : caller.clientId
+    let row: ApprovalRecord | null
+    if (timeoutMs > 0) {
+      const capability = await hub.prepareApprovalWait(params.confirmationId, clientId, timeoutMs)
+      const response = await hub.fetch(new Request(`https://ledger.internal${WAIT_PATH}`, { headers: { upgrade: 'websocket', [WAIT_HEADER]: capability } }))
+      const first = await awaitWaitResponse<ApprovalRecord | { waitError: 'rate_limited' } | null>(response, options.signal)
+      if (first && 'waitError' in first) return err('rate_limited', 'Too many concurrent waits; collect an existing wait before starting another.')
+      row = first ?? await hub.approvalFor(params.confirmationId, clientId)
+    } else row = await hub.approvalFor(params.confirmationId, clientId)
     if (!row) return err('not_found', 'No confirmation with this id is known to the hub for this client.')
     return { ok: true, result: await approvalInfo(env, row, options.origin) }
   }
@@ -150,7 +162,7 @@ async function runOperationInner(env: Env, caller: Caller, op: string, rawParams
   const forwarded = finalParams(op, params, hostId)
   if (caller.kind === 'owner') grant = ownerGrantFor(op, forwarded)
   boundary.hostId = hostId
-  return hostStub(env, hostId).execute({
+  const call: ExecuteCall = {
     op,
     params: forwarded,
     actor: { clientId: caller.clientId, clientName: caller.clientName },
@@ -159,7 +171,20 @@ async function runOperationInner(env: Env, caller: Caller, op: string, rawParams
     ...(options.requestId ? { requestId: options.requestId } : {}),
     ...(options.confirmation ? { confirmation: options.confirmation } : {}),
     ...(options.origin ? { origin: options.origin } : {}),
-  })
+  }
+  return executeHostOperation(env, hostId, call, options.signal)
+}
+
+/** Long polls keep their timeout in this Worker while the HostDO can hibernate. */
+export async function executeHostOperation(env: Env, hostId: string, call: ExecuteCall, signal?: AbortSignal): Promise<ExecuteResult> {
+  const host = hostStub(env, hostId)
+  const waiting = (call.op === 'task.wait' && call.params.timeoutMs !== 0) || (call.op === 'confirmation.get' && typeof call.params.timeoutMs === 'number' && call.params.timeoutMs > 0)
+  if (!waiting) return host.execute(call)
+  const capability = await host.prepareLedgerWait(call)
+  if (!capability) return host.execute({ ...call, params: { ...call.params, timeoutMs: 0 } })
+  const response = await host.fetch(new Request(`https://ledger.internal${WAIT_PATH}`, { headers: { upgrade: 'websocket', [WAIT_HEADER]: capability } }))
+  const initial = await awaitWaitResponse<ExecuteResult>(response, signal)
+  return initial ?? host.execute({ ...call, params: { ...call.params, timeoutMs: 0 } })
 }
 
 function resolveHost(context: CallContext, params: Record<string, unknown>): { ok: true; hostId: string } | { ok: false; result: ExecuteResult } {

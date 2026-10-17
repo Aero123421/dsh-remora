@@ -193,3 +193,42 @@ test('a current read failure is shown and a successful action clears it', async 
   assert.equal(store.getSnapshot().actionError, null)
   release()
 })
+
+test('a failed refresh retains the previous view and last-check time until recovery', async () => {
+  const { store, take } = fixture()
+  const release = store.retain()
+  take('state').resolve({ workspaces: ['a'] })
+  await setImmediate()
+  const checked = store.getSnapshot().lastChecked
+  assert.equal(typeof checked, 'number')
+  const refreshing = store.reload()
+  take('state').reject(new Error('connection lost'))
+  await refreshing
+  assert.equal(store.getSnapshot().failed, true)
+  assert.deepEqual(store.getSnapshot().snapshot?.workspaces, ['a'])
+  assert.equal(store.getSnapshot().lastChecked, checked)
+  const retry = store.reload()
+  take('state').resolve({ workspaces: ['b'] })
+  await retry
+  assert.equal(store.getSnapshot().failed, false)
+  assert.deepEqual(store.getSnapshot().snapshot?.workspaces, ['b'])
+  release()
+  assert.equal(store.getSnapshot().lastChecked, null)
+})
+
+test('a hidden consumer waits for an explicit visibility refresh and preserves generation safety', async () => {
+  const { store, take, requests } = fixture()
+  const releaseHidden = store.retain(false)
+  assert.equal(requests.length, 0)
+  const visible = store.reload()
+  const oldRead = take('state')
+  releaseHidden()
+  const releaseVisible = store.retain()
+  take('state').resolve({ workspaces: ['current'] })
+  await setImmediate()
+  oldRead.reject(new Error('hidden page was disconnected'))
+  await visible
+  assert.equal(store.getSnapshot().failed, false)
+  assert.deepEqual(store.getSnapshot().snapshot?.workspaces, ['current'])
+  releaseVisible()
+})

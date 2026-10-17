@@ -21,6 +21,20 @@ if (override !== undefined && override !== '' && !/^[0-9a-f]{40}$/i.test(overrid
 export const upstreamCommit = override && override !== '' ? override.toLowerCase() : pinned.commit
 export const upstreamRoot = process.env.DSH_UPSTREAM_DIR ? resolve(process.env.DSH_UPSTREAM_DIR) : join(cacheRoot, 'upstream')
 
+/** Report the checkout actually exercised, including a local source override. */
+export async function upstreamIdentity(root = upstreamRoot) {
+  let version = 'unknown version'
+  try {
+    version = JSON.parse(await readFile(join(root, 'apps/cli/package.json'), 'utf8')).version ?? version
+  } catch { /* An unpacked source tree may omit the CLI manifest. */ }
+  const head = spawnSync('git', ['-C', root, 'rev-parse', '--show-toplevel', 'HEAD'], { encoding: 'utf8' })
+  const [gitRoot, commit] = head.stdout?.trim().split('\n') ?? []
+  // Do not accidentally label an unpacked source tree with the enclosing repo's HEAD.
+  if (head.status !== 0 || resolve(gitRoot || '.') !== resolve(root)) return `${version} (unversioned source: ${root})`
+  const changed = spawnSync('git', ['-C', root, 'status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8' })
+  return `${version} (${commit.slice(0, 7)}${changed.status !== 0 ? ', working tree unknown' : changed.stdout.trim() ? ', modified working tree' : ''}; ${root})`
+}
+
 function git(args) {
   const result = spawnSync('git', args, { stdio: 'inherit' })
   if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed`)

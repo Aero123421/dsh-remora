@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { Browser, SETUP_TOKEN, hubFetch, login, reauth, setupOwner } from './helpers.ts'
+import { env } from 'cloudflare:workers'
+import { runInDurableObject } from 'cloudflare:test'
+import { Browser, SETUP_TOKEN, SoftAuthenticator, hubFetch, login, reauth, setupOwner } from './helpers.ts'
 
 describe('owner authentication', () => {
   it('runs first-run setup once, then signs in with the passkey', async () => {
@@ -49,6 +51,30 @@ describe('owner authentication', () => {
     expect(first.headers.get('location')).toContain('/settings')
     const reuse = await new Browser().postForm('/auth/recovery', { code: owner.recoveryCodes[0] as string })
     expect(reuse.headers.get('location')).toContain('error=recovery')
+
+    // Recovery authenticates the owner without access to the lost passkey.
+    const replacement = new SoftAuthenticator()
+    const prepared = await recovery.postJson('/auth/passkeys/options', {})
+    expect(prepared.status).toBe(200)
+    const registration = await prepared.json() as { challengeId: string; options: Parameters<SoftAuthenticator['create']>[0] }
+    const response = await replacement.create(registration.options)
+    const added = await recovery.postJson('/auth/passkeys/verify', { challengeId: registration.challengeId, response, label: 'replacement' })
+    expect(added.status).toBe(200)
+    expect(await (await recovery.fetch('/settings')).text()).toContain('replacement')
+
+    // A page URL cannot make a stale session fresh, and an outstanding ceremony
+    // must still be fresh at verification time.
+    const pending = await (await recovery.postJson('/auth/passkeys/options', {})).json() as typeof registration
+    const hub = env.HUB.get(env.HUB.idFromName('hub'))
+    await runInDurableObject(hub, (_instance, state) => { state.storage.sql.exec('UPDATE sessions SET reauth_at = 0') })
+    expect((await recovery.fetch('/settings?recovered=1')).status).toBe(200)
+    const staleOptions = await recovery.postJson('/auth/passkeys/options', {})
+    expect(staleOptions.status).toBe(403)
+    expect(await staleOptions.json()).toMatchObject({ error: { code: 'reauth_required' } })
+    const staleVerify = await recovery.postJson('/auth/passkeys/verify', { challengeId: pending.challengeId, response: await new SoftAuthenticator().create(pending.options) })
+    expect(staleVerify.status).toBe(403)
+    const anonymous = await new Browser().postJson('/auth/passkeys/options', {})
+    expect(anonymous.status).toBe(403)
 
     // Logout ends the session.
     await owner.browser.postForm('/auth/logout', {})

@@ -247,7 +247,12 @@ describe('sessions: search, fork, jobs and schedules from the hub pages', () => 
     const token = await cliToken(owner, MCP, ['dsh.read', 'dsh.content', 'dsh.tasks'])
     await env.HUB.get(env.HUB.idFromName('hub')).setGrant('remora-cli', host.hostId, 'request', 'full')
     const tools = await hubFetch('/mcp', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'mcp-protocol-version': '2026-07-28', 'mcp-method': 'tools/list' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: { _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } } }) })
-    const names = ((await tools.json()) as { result: { tools: { name: string }[] } }).result.tools.map(tool => tool.name)
+    const definitions = ((await tools.json()) as { result: { tools: { name: string; annotations: { readOnlyHint: boolean; destructiveHint: boolean; openWorldHint: boolean } }[] } }).result.tools
+    const names = definitions.map(tool => tool.name)
+    for (const name of ['dsh_task_start', 'dsh_task_steer', 'dsh_task_resubmit', 'dsh_attention_respond', 'dsh_goal_manage', 'dsh_command_run', 'dsh_schedule_create', 'dsh_approval_respond', 'dsh_terminal_run']) {
+      expect(definitions.find(tool => tool.name === name)?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: true })
+    }
+    expect(definitions.find(tool => tool.name === 'dsh_status')?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, openWorldHint: false })
     for (const name of ['dsh_sessions_search', 'dsh_session_fork', 'dsh_job_stop', 'dsh_schedules_list', 'dsh_schedule_create', 'dsh_schedule_delete', 'dsh_terminal_run', 'dsh_confirmation_get']) expect(names).toContain(name)
     const searched = await mcpTool(token, 'dsh_sessions_search', { hostId: host.hostId, query: 'deploy' })
     expect(searched.isError).toBe(false)

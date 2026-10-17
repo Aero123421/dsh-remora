@@ -15,14 +15,43 @@ function installCopyKey(installation: UpdateInstallation): CopyKey {
   return `compat.install.${installation.phase}` as CopyKey
 }
 
-export function ActivitySection({ snapshot, t, ctx }: { snapshot: RemoraSnapshot; t: Translate; ctx: ClientContext }) {
-  const [clients, setClients] = useState<ClientSummary[]>([])
-  const [entries, setEntries] = useState<AuditEntry[]>([])
+/** Each list keeps its last result, but never presents a failed read as an empty list. */
+function useActivityQuery<T>(ctx: ClientContext, method: 'clients' | 'audit') {
+  const [state, setState] = useState<{ value: T | undefined; loading: boolean; failed: boolean }>({ value: undefined, loading: true, failed: false })
+  const request = useRef<AbortController | null>(null)
   const load = useCallback(() => {
-    call<{ clients: ClientSummary[] }>(ctx, 'clients').then(value => setClients(value.clients), () => {})
-    call<{ entries: AuditEntry[] }>(ctx, 'audit').then(value => setEntries(value.entries), () => {})
-  }, [ctx])
-  useEffect(load, [load])
+    request.current?.abort()
+    const controller = new AbortController()
+    request.current = controller
+    setState(previous => ({ ...previous, loading: true, failed: false }))
+    call<T>(ctx, method, {}, controller.signal).then(value => {
+      if (request.current === controller) setState({ value, loading: false, failed: false })
+    }, () => {
+      if (request.current === controller) setState(previous => ({ ...previous, loading: false, failed: true }))
+    })
+  }, [ctx, method])
+  useEffect(() => {
+    setState({ value: undefined, loading: true, failed: false })
+    load()
+    return () => {
+      request.current?.abort()
+      request.current = null
+    }
+  }, [load])
+  return { ...state, load }
+}
+
+function ActivityStatus({ query, t, empty }: { query: { value: unknown; loading: boolean; failed: boolean }; t: Translate; empty: boolean }) {
+  if (query.loading) return <p className="rmr-faint" role="status">{t(query.value ? 'refreshing' : 'loading')}</p>
+  if (query.failed) return <div className="rmr-error" role="alert"><p>{t('loadFailed')}</p>{query.value ? <p>{t('staleState')}</p> : null}</div>
+  return empty ? <p className="rmr-faint">{t('none')}</p> : null
+}
+
+export function ActivitySection({ snapshot, t, ctx }: { snapshot: RemoraSnapshot; t: Translate; ctx: ClientContext }) {
+  const clientsQuery = useActivityQuery<{ clients: ClientSummary[] }>(ctx, 'clients')
+  const auditQuery = useActivityQuery<{ entries: AuditEntry[] }>(ctx, 'audit')
+  const clients = clientsQuery.value?.clients ?? []
+  const entries = auditQuery.value?.entries ?? []
   const who = (entry: AuditEntry) => {
     if (entry.kind === 'request') return entry.clientName ?? entry.clientId ?? '?'
     const kind = t(entry.kind === 'settings' ? 'act.kind.settings' : 'act.kind.connection')
@@ -30,34 +59,37 @@ export function ActivitySection({ snapshot, t, ctx }: { snapshot: RemoraSnapshot
   }
   return <div className="rmr-section">
     <div className="rmr-section-head">
-      <div className="rmr-title-row"><h3>{t('act.clients')}</h3><Button variant="ghost" size="sm" onClick={load}>{t('retry')}</Button></div>
+      <div className="rmr-title-row"><h3>{t('act.clients')}</h3><Button variant="ghost" size="sm" disabled={clientsQuery.loading} onClick={clientsQuery.load}>{t('retry')}</Button></div>
       <span className="rmr-muted">{t('act.clientsHint')}</span>
     </div>
-    <div className="rmr-list">
-      {clients.length === 0 ? <span className="rmr-faint">{t('none')}</span> : null}
+    <div className="rmr-list" aria-busy={clientsQuery.loading}>
+      <ActivityStatus query={clientsQuery} t={t} empty={clients.length === 0} />
       {clients.map(client => <div key={client.clientId} className="rmr-item">
         <div className="rmr-item-text"><span>{client.clientName}</span><span className="rmr-faint rmr-mono">{client.clientId}</span></div>
         <span className="rmr-faint">{t('act.requests', { count: client.requests })}{client.denied > 0 ? ` · ${t('act.denied', { count: client.denied })}` : ''} · {t('act.lastSeen', { time: formatTime(client.lastAt) })}</span>
       </div>)}
     </div>
     <div className="rmr-section-head" style={{ paddingTop: 20 }}>
-      <h3>{t('act.audit')}</h3>
+      <div className="rmr-title-row"><h3>{t('act.audit')}</h3><Button variant="ghost" size="sm" disabled={auditQuery.loading} onClick={auditQuery.load}>{t('retry')}</Button></div>
       <span className="rmr-muted">{t('act.auditHint')}</span>
     </div>
     {snapshot.auditIntact ? null : <p className="rmr-notice" data-tone="danger">{t('act.auditBroken')}</p>}
-    {entries.length === 0 ? <span className="rmr-faint">{t('none')}</span> : <table className="rmr-table">
-      <tbody>
-        {entries.map(entry => <tr key={entry.seq}>
-          <td className="rmr-faint">{formatTime(entry.at)}</td>
-          <td>{who(entry)}</td>
-          <td className="rmr-mono">{entry.action}</td>
-          <td>
-            <Tag tone={OUTCOME_TONE[entry.outcome]}>{t(`act.outcome.${entry.outcome}`)}</Tag>
-            {entry.layer ? <span className="rmr-faint"> {t(`act.layer.${entry.layer}` as CopyKey)} · {entry.reason}</span> : entry.reason ? <span className="rmr-faint"> {entry.reason}</span> : null}
-          </td>
-        </tr>)}
-      </tbody>
-    </table>}
+    <div aria-busy={auditQuery.loading}>
+      <ActivityStatus query={auditQuery} t={t} empty={entries.length === 0} />
+      {entries.length > 0 ? <table className="rmr-table">
+        <tbody>
+          {entries.map(entry => <tr key={entry.seq}>
+            <td className="rmr-faint">{formatTime(entry.at)}</td>
+            <td>{who(entry)}</td>
+            <td className="rmr-mono">{entry.action}</td>
+            <td>
+              <Tag tone={OUTCOME_TONE[entry.outcome]}>{t(`act.outcome.${entry.outcome}`)}</Tag>
+              {entry.layer ? <span className="rmr-faint"> {t(`act.layer.${entry.layer}` as CopyKey)} · {entry.reason}</span> : entry.reason ? <span className="rmr-faint"> {entry.reason}</span> : null}
+            </td>
+          </tr>)}
+        </tbody>
+      </table> : null}
+    </div>
   </div>
 }
 
@@ -82,7 +114,9 @@ export function CompatSection({ snapshot, t, ctx, busy }: Pick<SectionProps, 'sn
     const requestGeneration = generation.current
     call<UpdateInstallation | null>(ctx, 'update-reconcile', {}).then(value => {
       if (generation.current === requestGeneration && value) { setInstallation(value); setMessage(null) }
-    }, () => {})
+    }, error => {
+      if (generation.current === requestGeneration) setMessage(errorText(t, error))
+    })
     return () => { generation.current++ }
   }, [ctx, snapshot.updateHostInstance])
   useEffect(() => {
