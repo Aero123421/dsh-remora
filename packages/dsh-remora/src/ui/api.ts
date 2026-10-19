@@ -28,7 +28,10 @@ export interface Locale {
   register(ns: string, locale: string, dict: LocaleDict): () => void
   /** Object form. A locale id that is already present throws. */
   register(ns: string, copy: LocaleCopy): () => void
-  /** Adds a language. Throws when `id` is already registered. The disposer removes only this definition. */
+  /**
+   * Host API for defining a language. Remora does not call this. `ja` is
+   * defined only by dsh-japanese.
+   */
   addLanguage(input: { id: string; label: string; fallback: string }): () => void
   bind(ns: string): (key: string, params?: Record<string, unknown>) => string
   subscribe(listener: () => void): () => void

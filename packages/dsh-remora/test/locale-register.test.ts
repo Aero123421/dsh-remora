@@ -110,75 +110,83 @@ function catalog(initial: Language[] = [
   }
 }
 
-test('the plugin alone makes ja selectable, and zh-CN reads English without a zh dictionary', () => {
+/** dsh-japanese stand-in: it owns the `ja` language and the shell's `ja` dictionaries. */
+function installJapanese(world: ReturnType<typeof catalog>) {
+  const removeLanguage = world.locale.addLanguage({ id: 'ja', label: '日本語', fallback: 'en' })
+  const removeCommon = world.locale.register('common', 'ja', { cancel: 'キャンセル' })
+  const removeSettings = world.locale.register('settings', 'ja', { trigger: '設定' })
+  world.locale.register('common', 'en', { cancel: 'Cancel' })
+  world.locale.register('settings', 'en', { trigger: 'Settings' })
+  return () => {
+    removeSettings()
+    removeCommon()
+    removeLanguage()
+  }
+}
+
+test('the plugin registers dictionaries and does not define ja', () => {
   const client = readFileSync(join(src, 'client.tsx'), 'utf8')
   const install = readFileSync(join(src, 'locale-install.ts'), 'utf8')
-  const testSource = readFileSync(fileURLToPath(import.meta.url), 'utf8')
   assert.match(client, /installLocale\(ctx\)/)
-  assert.doesNotMatch(testSource, /addLanguage\(\s*\{[^}]*id:\s*['"]ja['"]/)
+  assert.doesNotMatch(client, /\.addLanguage\s*\(/)
+  assert.doesNotMatch(install, /\.addLanguage\s*\(/)
   assert.doesNotMatch(install, /zh:\s*en/)
   const alone = catalog()
   assert.equal(alone.hasJa(), false)
   installLocale(alone.ctx)
-  const added = alone.locale.getSnapshot().locales.find(locale => locale.id === 'ja')
-  assert.deepEqual(added, { id: 'ja', label: '日本語', fallback: 'en' })
-  alone.setActive('ja')
-  assert.equal(alone.locale.bind(NS)('kill.title'), ja['kill.title'])
-  assert.equal(alone.locale.bind(NS)('kill.title'), '緊急停止')
+  assert.equal(alone.hasJa(), false)
+  assert.deepEqual(alone.locale.getSnapshot().locales.map(locale => locale.id), ['en', 'zh'])
+  alone.setActive('en')
+  assert.equal(alone.locale.bind(NS)('kill.title'), 'Kill switch')
   alone.setActive('zh')
   assert.equal(alone.locale.bind(NS)('kill.title'), en['kill.title'])
   assert.equal(alone.locale.bind(NS)('conn.notPaired'), en['conn.notPaired'])
   assert.notEqual(alone.locale.bind(NS)('kill.title'), 'kill.title')
   assert.notEqual(alone.locale.bind(NS)('conn.notPaired'), 'conn.notPaired')
+  alone.setActive('ja')
+  assert.equal(alone.locale.bind(NS)('kill.title'), en['kill.title'])
   const release = alone.locale.register(NS, 'zh', { 'kill.title': 'unused' })
   release()
+  alone.dispose()
+  assert.equal(alone.hasJa(), false)
 })
 
-test('turning Remora off leaves ja in place when dsh-japanese already defined it', () => {
-  const world = catalog([{ id: 'en', label: 'English' }, { id: 'zh', label: '简体中文', fallback: 'en' }, { id: 'ja', label: '日本語', fallback: 'en' }])
-  const japanese = { settings: '設定' }
-  world.locale.register('dsh.japanesePack', { en: { settings: 'Settings' }, zh: { settings: '设置' }, ja: japanese } satisfies LocaleCopy)
-  world.setActive('ja')
-  installLocale(world.ctx)
-  assert.equal(world.locale.bind(NS)('title'), 'Remora')
-  assert.equal(world.locale.bind('dsh.japanesePack')('settings'), '設定')
-  world.dispose()
-  assert.equal(world.hasJa(), true, 'ja defined by dsh-japanese stays after Remora is removed')
-  assert.equal(world.active(), 'ja')
-  assert.equal(world.locale.bind('dsh.japanesePack')('settings'), '設定')
-  assert.equal(world.locale.bind(NS)('kill.title'), 'kill.title', 'Remora dictionaries leave with the plugin')
-})
-
-test('turning Remora off removes ja when Remora was the plugin that defined it', () => {
+test('with dsh-japanese, Remora is Japanese, and removing Remora first leaves ja until dsh-japanese is removed', () => {
   const world = catalog()
-  installLocale(world.ctx)
+  const removeJapanese = installJapanese(world)
   world.setActive('ja')
-  assert.equal(world.locale.bind(NS)('conn.status'), ja['conn.status'])
-  world.dispose()
-  assert.equal(world.hasJa(), false)
-  assert.equal(world.active(), 'en')
-  assert.equal(world.locale.bind(NS)('conn.status'), 'conn.status')
-  assert.equal(world.locale.bind('common')('__dshRemoraJaProbe'), '__dshRemoraJaProbe')
-})
-
-test('turning Remora off keeps ja when Remora defined it and dsh-japanese then registered shell copy', () => {
-  const world = catalog()
   installLocale(world.ctx)
-  assert.equal(world.hasJa(), true)
-  const shell = {
-    en: { cancel: 'Cancel', trigger: 'Settings' },
-    zh: { cancel: '取消', trigger: '设置' },
-    ja: { cancel: 'キャンセル', trigger: '設定' },
-  }
-  world.locale.register('common', shell)
-  world.locale.register('settings', shell)
-  world.setActive('ja')
+  assert.equal(world.locale.bind(NS)('kill.title'), ja['kill.title'])
+  assert.equal(world.locale.bind('settings')('trigger'), '設定')
   world.dispose()
   assert.equal(world.hasJa(), true)
   assert.equal(world.active(), 'ja')
   assert.equal(world.locale.bind('common')('cancel'), 'キャンセル')
   assert.equal(world.locale.bind('settings')('trigger'), '設定')
-  assert.equal(world.locale.bind(NS)('kill.title'), 'kill.title')
+  removeJapanese()
+  assert.equal(world.hasJa(), false)
+  assert.equal(world.active(), 'en')
+  assert.equal(world.locale.bind('common')('cancel'), 'Cancel')
+  assert.equal(world.locale.bind('settings')('trigger'), 'Settings')
+  assert.notEqual(world.locale.bind('common')('cancel'), 'cancel')
+})
+
+test('removing dsh-japanese first leaves Remora in English, and removing Remora then leaves no ja', () => {
+  const world = catalog()
+  const removeJapanese = installJapanese(world)
+  world.setActive('ja')
+  installLocale(world.ctx)
+  assert.equal(world.locale.bind(NS)('kill.title'), '緊急停止')
+  removeJapanese()
+  assert.equal(world.hasJa(), false)
+  assert.equal(world.active(), 'en')
+  assert.equal(world.locale.bind(NS)('kill.title'), en['kill.title'])
+  assert.notEqual(world.locale.bind(NS)('kill.title'), 'kill.title')
+  assert.equal(world.locale.bind('common')('cancel'), 'Cancel')
+  world.dispose()
+  assert.equal(world.hasJa(), false)
+  assert.equal(world.locale.bind('common')('cancel'), 'Cancel')
+  assert.notEqual(world.locale.bind('settings')('trigger'), 'trigger')
 })
 
 test('every visible string has English and Japanese copy, so a missing language does not show the key', () => {
