@@ -106,12 +106,13 @@
   [data-shortcut-modal="settings"] > nav {
     box-sizing: border-box;
     flex-direction: row;
+    flex-wrap: wrap;
     align-items: center;
     width: 100%;
     max-width: 100%;
-    gap: 8px;
+    gap: 4px 8px;
     padding: 10px 10px 0;
-    overflow: hidden;
+    overflow: visible;
   }
   [data-shortcut-modal="settings"] > nav > :first-child {
     flex: none;
@@ -121,12 +122,11 @@
   [data-shortcut-modal="settings"] > nav > :last-child {
     flex: 1 1 auto;
     flex-direction: row;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
     align-items: center;
     min-width: 0;
     gap: 4px;
-    overflow-x: auto;
-    overflow-y: hidden;
+    overflow: visible;
   }
   [data-shortcut-modal="settings"] > nav button {
     flex: none;

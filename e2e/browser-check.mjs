@@ -19,6 +19,7 @@ function narrowColumnReport(section) {
       const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT)
       let textNode
       while ((textNode = walker.nextNode())) {
+        if (textNode.parentElement?.closest('.rmr-mono')) continue
         const text = textNode.textContent ?? ''
         const range = document.createRange()
         let lastTop = null
