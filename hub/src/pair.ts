@@ -7,7 +7,8 @@ import { getSession } from './auth.ts'
 import { RATE_LIMITS, hubOrigin } from './config.ts'
 import { clientIp, errorResponse, html, json, readForm, readJson, redirect, sameOrigin } from './http.ts'
 import { hostStub, hubStub } from './meter.ts'
-import { flash, h, page, type Raw } from './ui/layout.ts'
+import { flash, h, narrowHtml, pageHead, raw, uiFor, type Raw, type Ui } from './ui/layout.ts'
+import { pairSteps } from './ui/routes.ts'
 import { revokeHostEverywhere } from './ops.ts'
 import { isRawEd25519Key, newHostId, verifyEd25519 } from './util.ts'
 import { ENDPOINTS, PAIRING_POLL_INTERVAL_MS, formatUserCode, isSupportedProtocol, normalizeUserCode, type PairPollRequest, type PairStartRequest, type PairStartResponse, type UnpairRequest, unpairMessage } from './vendor/protocol/index.ts'
@@ -61,41 +62,47 @@ export async function pairPoll(request: Request, env: Env): Promise<Response> {
   return json(result)
 }
 
-function pairPage(body: Raw): Response {
-  return html(page({ title: 'ホストの追加', narrow: true, body, scripts: ['/js/webauthn.js'] }))
+function pairPage(ui: Ui, title: string, body: Raw): Response {
+  return html(narrowHtml(ui, title, body))
 }
 
 export async function pairApprovePage(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url)
+  const ui = uiFor(request)
+  const { t, i18n } = ui
   const session = await getSession(request, env)
   if (!session) return redirect(`/login?next=${encodeURIComponent(url.pathname + url.search)}`)
   const code = normalizeUserCode(url.searchParams.get('code') ?? '')
   const done = url.searchParams.get('done')
-  if (done === 'denied') return pairPage(h`<h1>拒否しました</h1><p class="lead">DSH の設定タブには「拒否されました」と表示されます。</p><p><a class="button" href="/">ホームへ</a></p>`)
+  if (done === 'denied') return pairPage(ui, t('pair.deniedTitle'), h`${pageHead(t('pair.deniedTitle'), { subtitle: t('pair.deniedLead') })}<div class="actions"><a class="btn" href="/">${t('notFound.home')}</a></div>`)
   const info = code ? await hubStub(env).pairLookup(code) : null
   if (!info || info.status !== 'pending') {
-    return pairPage(h`<h1>DSH ホストの追加</h1>
-${code ? flash('確認コードが見つからないか、期限が切れています。DSH の設定タブでやり直してください。', 'error') : ''}
-<p class="lead">DSH の設定画面の「Remora」タブに表示された確認コードを入力してください。QR コードを読み取った場合は自動で入ります。</p>
+    return pairPage(ui, t('pair.title'), h`${pageHead(t('pair.title'), { subtitle: t('pair.lead') })}
+${code ? flash(t('pair.notFound'), 'error') : ''}
 <form method="get" action="${ENDPOINTS.pairApprove}" class="stack">
-  <input name="code" placeholder="XXXX-XXXX" maxlength="9" autocomplete="off" required>
-  <button class="primary" type="submit">次へ</button>
-</form>`)
+  <label class="field"><span class="label">${t('pair.code')}</span><input name="code" placeholder="XXXX-XXXX" maxlength="12" autocomplete="off" autocapitalize="characters" spellcheck="false" required class="code-big"></label>
+  <button class="primary" type="submit">${t('pair.next')}</button>
+</form>
+<details class="plain mt"${raw(code ? '' : ' open')}><summary>${t('pair.howTitle')}</summary>${pairSteps(ui, hubOrigin(request, env), false)}</details>`)
   }
-  return pairPage(h`<h1>このホストを追加しますか</h1>
-<div class="consent">
-  <p class="client-name">${info.name}</p>
-  <p>確認コード: <strong class="big code">${formatUserCode(info.userCode)}</strong></p>
-  <p class="muted">DSH の設定タブに表示されているコードと同じか確かめてください。違うときは拒否してください。</p>
-  <p class="muted">プラグイン ${info.pluginVersion || '不明'} ・ 鍵の指紋 <code>${info.publicKeyFingerprint}</code></p>
-  <p class="muted">追加すると、このハブのオーナーのパスキー（公開鍵）がホストに登録され、危険な操作の確認に使われます。</p>
-</div>
+  return pairPage(ui, t('pair.confirmTitle'), h`${pageHead(t('pair.confirmTitle'))}
+${url.searchParams.get('msg') === 'reauth' ? flash(t('msg.reauth'), 'error') : ''}
+<div class="box"><dl class="kv">
+  <dt>${t('pair.host')}</dt><dd><strong class="untrusted">${info.name}</strong></dd>
+  <dt>${t('pair.code')}</dt><dd><span class="code-big" data-testid="hub-pair-code">${formatUserCode(info.userCode)}</span></dd>
+  <dt>${t('pair.started')}</dt><dd>${i18n.relative(info.createdAt)}</dd>
+  <dt>${t('pair.plugin')}</dt><dd>${info.pluginVersion || '—'}</dd>
+  <dt>${t('pair.fingerprint')}</dt><dd><code>${info.publicKeyFingerprint}</code></dd>
+</dl></div>
+<div class="notice warn mt">${t('pair.check')}</div>
+<p class="muted small">${t('pair.effect')}</p>
 <form method="post" action="${ENDPOINTS.pairApprove}" data-reauth>
   <input type="hidden" name="code" value="${info.userCode}">
   <div class="actions">
-    <button class="primary" type="submit" name="decision" value="approve">パスキーで確認して追加</button>
-    <button type="submit" name="decision" value="deny" data-no-reauth>拒否</button>
+    <button class="primary" type="submit" name="decision" value="approve" data-testid="hub-pair-approve">${t('pair.approve')}</button>
+    <button type="submit" name="decision" value="deny" data-no-reauth>${t('pair.deny')}</button>
   </div>
+  <div data-status role="status" hidden></div>
 </form>`)
 }
 
@@ -110,7 +117,7 @@ export async function pairApprovePost(request: Request, env: Env): Promise<Respo
     await hub.pairDecide(code, false, '')
     return redirect(`${ENDPOINTS.pairApprove}?done=denied`)
   }
-  if (!session.fresh) return pairPage(h`<h1>パスキーでの確認が必要です</h1><p class="lead">戻って、ボタンからパスキーで確認してください。</p><p><a class="button" href="${ENDPOINTS.pairApprove}?code=${code}">戻る</a></p>`)
+  if (!session.fresh) return redirect(`${ENDPOINTS.pairApprove}?code=${encodeURIComponent(code)}&msg=reauth`)
   const host = await hub.pairDecide(code, true, newHostId())
   if (!host) return redirect(`${ENDPOINTS.pairApprove}?code=${encodeURIComponent(code)}`)
   await hostStub(env, host.hostId).provision(host.hostId, host.publicKey, host.name)

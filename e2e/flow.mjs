@@ -572,8 +572,10 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
       await again.locator('textarea[name="command"]').fill(`echo REMORA-NEVER-${nonce}`)
       await Promise.all([hubPage.waitForURL(/\/confirm\//, { timeout: 20_000 }), again.locator('button[type="submit"]').click()])
       await Promise.all([hubPage.waitForURL(/msg=confirmation-denied/, { timeout: 20_000 }), (await mustBePresent(hubPage, HUB.confirmDeny, 'the deny button')).click()])
-      const deniedState = await (await mustBePresent(hubPage, HUB.confirmState, 'the state on the confirm page')).innerText()
-      if (!deniedState.includes('拒否')) throw new Error(`after denying, the page says "${deniedState}"`)
+      const stateElement = await mustBePresent(hubPage, HUB.confirmState, 'the state on the confirm page')
+      // data-state is the same in every hub language; the text is the fallback for older hubs (Japanese only).
+      const deniedState = (await stateElement.getAttribute('data-state')) ?? await stateElement.innerText()
+      if (!['denied', '拒否'].some(word => deniedState.includes(word))) throw new Error(`after denying, the page says "${deniedState}"`)
       return `token refused (${refused.body.error.denial?.layer}: ${refused.body.error.denial?.reason}); full access on (${dshShot}); ran on ${confirmPath} with the passkey → "${text.trim().split('\n').join(' | ')}" (${outputShot}); a second command denied`
     } finally {
       await setCeiling('request')
@@ -611,7 +613,7 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
   await r.step('maintenance.rotate-key', 'The owner rotates the host key from the host page: the plugin proves a new key, reconnects with it, and tasks still run', { needs: ['task.complete', 'hub.owner'], timeoutMs: 180_000, onFailure: failShot('rotate-key') }, async () => {
     const hubPage = state.hubPage
     await hubPage.goto(`${state.hub.origin}/hosts/${state.host.hostId}`)
-    const summary = hubPage.locator('details.card').filter({ hasText: 'ホスト鍵の更新' }).locator('summary')
+    const summary = hubPage.locator('[data-testid="hub-rotate-key"] > summary')
     if (await summary.count() === 0) throw new Error('the host page offers no key rotation (does the plugin advertise host.rotate-key?)')
     await summary.first().click()
     await Promise.all([hubPage.waitForURL(/msg=key-rotated/, { timeout: 60_000 }), hubPage.locator(`form[action="/hosts/${state.host.hostId}/rotate-key"] button[type="submit"]`).click()])

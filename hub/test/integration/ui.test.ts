@@ -6,6 +6,34 @@ import { FakeHost, ORIGIN, eventually, reauth, setupOwner } from './helpers.ts'
 const now = Date.now()
 
 describe('owner pages', () => {
+  it('keeps host-provided repair links on this hub', async () => {
+    const owner = await setupOwner()
+    const host = await FakeHost.create()
+    await host.pair(owner, 'repair-link-pc')
+    let fix = 'hub:/connections#reauthorize'
+    host.respond = () => ({ ok: false, error: { code: 'unavailable', message: 'Try the repair link', fix } })
+    await host.connect({ ceiling: { level: 'view' }, operations: ['session.get'] })
+    await host.next('ready')
+    try {
+      for (const [hint, target] of [
+        ['hub:/connections#reauthorize', '/connections#reauthorize'],
+        ['hub:https://evil.example/', '/'],
+        ['hub://evil.example/', '/'],
+        ['hub:/\\evil.example/', '/'],
+        ['hub:javascript:alert(1)', '/'],
+      ]) {
+        fix = hint as string
+        const page = await (await owner.browser.fetch(`/hosts/${host.hostId}/sessions/s1`, { headers: { 'accept-language': 'en' } })).text()
+        expect(page).toContain(`<a href="${target}">this hub</a>`)
+        expect(page).not.toContain('href="https://evil.example/')
+        expect(page).not.toContain('href="//evil.example/')
+        expect(page).not.toContain('href="javascript:')
+      }
+    } finally {
+      host.socket?.close(1000, 'done')
+    }
+  })
+
   it('renders the inbox, hosts, sessions, tasks, attention, connections, audit and settings', async () => {
     const owner = await setupOwner()
     const host = await FakeHost.create()
@@ -38,8 +66,8 @@ describe('owner pages', () => {
     expect(home).toContain('リモート全権')
     expect(home).toContain('無料枠')
     expect(home).toContain('実行時間・保存容量などは含みません')
-    expect(home).toContain('Free プランは無料枠の上限で利用が止まります')
-    expect(home).toContain('Paid プランでは超過分が課金')
+    expect(home).toContain('Workers Free では無料枠の上限で利用が止まります')
+    expect(home).toContain('Workers Paid では超えた分が課金')
 
     const hostPage = await (await owner.browser.fetch(`/hosts/${host.hostId}`)).text()
     expect(hostPage).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
@@ -48,7 +76,7 @@ describe('owner pages', () => {
 
     const sessionPage = await (await owner.browser.fetch(`/hosts/${host.hostId}/sessions/s1`)).text()
     expect(sessionPage).toContain('deepseek / v4 / high')
-    expect(sessionPage).toContain('DSH Web で誰かがこのセッションを見ています')
+    expect(sessionPage).toContain('DSH Web でこのセッションが開かれています')
     expect(sessionPage).toContain('hello &lt;i&gt;there&lt;/i&gt;')
 
     // Sending a prompt from the session page starts a task and shows it.
@@ -64,9 +92,9 @@ describe('owner pages', () => {
     const attention = await (await owner.browser.fetch('/attention')).text()
     expect(attention).toContain('Which file?')
     expect(attention).toContain('data-confirm-op="approval.respond"')
-    expect(attention).toContain('<details class="confirm-preview"><summary>パスキーで署名する内容</summary>')
-    expect(attention).not.toContain('<details class="confirm-preview" open')
-    expect(attention).toContain('tool-ask-user を timed に切り替える')
+    expect(attention).toContain('<details class="plain confirm-preview"><summary>パスキーで署名する内容</summary>')
+    expect(attention).not.toContain('confirm-preview" open')
+    expect(attention).toContain('legacy モードのため')
     const answered = await owner.browser.postForm('/attention/respond', { hostId: host.hostId, sessionId: 's1', attentionId: 'q1', optionId: 'a' })
     expect(answered.headers.get('location')).toBe('/attention?msg=sent')
 
@@ -85,8 +113,8 @@ describe('owner pages', () => {
     expect(connections).toContain('chatgpt.com/plugins')
 
     const settings = await (await owner.browser.fetch('/settings')).text()
-    expect(settings).toContain('パスキー（1 本）')
-    expect(settings).toContain('2 本以上')
+    expect(settings).toContain('<h2>パスキー <span class="count">1</span></h2>')
+    expect(settings).toContain('2 本目のパスキー')
 
     const audit = await (await owner.browser.fetch('/audit')).text()
     expect(audit).toContain('ハッシュ連鎖は正常')

@@ -157,7 +157,7 @@ describe('security fixes', () => {
   it('explains passkey removal, previews confirmations and rejects bad op encodings', async () => {
     const owner = await setupOwner()
     const settings = await (await owner.browser.fetch('/settings')).text()
-    expect(settings).toContain('各ホストの DSH 画面で変更を承認するまで')
+    expect(settings).toContain('新しい一覧を受け取り')
     await reauth(owner)
     const issued = await owner.browser.postForm('/settings/tokens', { name: 'enc', scope: ['dsh.read'], days: '7' })
     const pat = /rmr_pat_[A-Za-z0-9_-]+/.exec(await issued.text())?.[0] as string

@@ -14,7 +14,7 @@ test('release versions stay together and the release note exists', () => {
   const hub = json('hub/package.json').version
   const lock = json('hub/package-lock.json')
   const hubVersion = /HUB_VERSION\s*=\s*['"]([^'"]+)['"]/.exec(read('hub/src/version.ts'))?.[1]
-  assert.equal(plugin, '0.1.5')
+  assert.equal(plugin, '0.1.6')
   assert.equal(cli, plugin)
   assert.equal(hub, plugin)
   assert.equal(lock.version, plugin)

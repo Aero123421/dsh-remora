@@ -46,7 +46,11 @@ async function startSession(env: Env): Promise<string> {
   return sessionCookie(SESSION_COOKIE, token, Math.floor(SESSION_MAX_MS / 1000))
 }
 
-const fail = (status: number, message: string) => json({ error: { code: status === 429 ? 'rate_limited' : status === 403 ? 'denied' : 'invalid_request', message } }, { status })
+/**
+ * `reason` names the failure for the page script, which shows it in the
+ * reader's language (`js.error.<reason>`); `message` stays for API callers.
+ */
+const fail = (status: number, message: string, reason: string) => json({ error: { code: status === 429 ? 'rate_limited' : status === 403 ? 'denied' : status === 409 ? 'conflict' : status === 404 ? 'not_found' : 'invalid_request', message, reason } }, { status })
 
 function algorithmOf(publicKey: Uint8Array<ArrayBuffer>): number {
   const alg = decodeCredentialPublicKey(publicKey).get(cose.COSEKEYS.alg)
@@ -74,7 +78,7 @@ async function verifyRegistration(env: Env, origin: string, challengeId: unknown
       algorithm: algorithmOf(credential.publicKey),
       counter: credential.counter,
       transports: credential.transports ?? [],
-      label: typeof label === 'string' && label.trim() ? label.trim().slice(0, 60) : 'パスキー',
+      label: typeof label === 'string' && label.trim() ? label.trim().slice(0, 60) : 'Passkey',
       createdAt: Date.now(),
       lastUsedAt: null,
     }
@@ -90,7 +94,7 @@ async function registrationOptions(env: Env, origin: string, kind: string) {
     rpName: 'Remora',
     rpID: rpIdOf(origin),
     userName: 'owner',
-    userDisplayName: 'Remora オーナー',
+    userDisplayName: 'Remora owner',
     userID: bytes(await hub.ownerUserId()),
     attestationType: 'none',
     excludeCredentials: existing.map(passkey => ({ id: passkey.credentialId, transports: passkey.transports })),
@@ -142,7 +146,7 @@ async function assertionOptions(env: Env, origin: string, kind: string, withCred
 export async function handleAuth(request: Request, env: Env, path: string): Promise<Response> {
   const origin = hubOrigin(request, env)
   if (request.method !== 'POST') return new Response('method not allowed', { status: 405, headers: { allow: 'POST' } })
-  if (!sameOrigin(request, origin)) return fail(403, 'cross-origin request refused')
+  if (!sameOrigin(request, origin)) return fail(403, 'cross-origin request refused', 'cross-origin')
   const hub = hubStub(env)
   const ip = clientIp(request)
 
@@ -165,36 +169,36 @@ export async function handleAuth(request: Request, env: Env, path: string): Prom
   try {
     body = (await readJson(request)) as Record<string, unknown>
   } catch {
-    return fail(400, 'invalid JSON')
+    return fail(400, 'invalid JSON', 'bad-request')
   }
 
   switch (path) {
     case '/auth/setup/options': {
       const [max, window] = RATE_LIMITS.setup
-      if (!(await hub.hit(`setup:${ip}`, max, window))) return fail(429, 'too many attempts')
+      if (!(await hub.hit(`setup:${ip}`, max, window))) return fail(429, 'too many attempts', 'rate-limited')
       const state = await hub.state()
       const expected = secrets(env).SETUP_TOKEN
-      if (state.setupComplete) return fail(403, 'setup is already complete')
-      if (!expected || expected.length < 16) return fail(403, 'SETUP_TOKEN is not set (at least 16 characters)')
-      if (typeof body.setupToken !== 'string' || !safeEqual(await sha256Hex(body.setupToken), await sha256Hex(expected))) return fail(403, 'wrong setup token')
+      if (state.setupComplete) return fail(403, 'setup is already complete', 'setup-done')
+      if (!expected || expected.length < 16) return fail(403, 'SETUP_TOKEN is not set (at least 16 characters)', 'setup-token-missing')
+      if (typeof body.setupToken !== 'string' || !safeEqual(await sha256Hex(body.setupToken), await sha256Hex(expected))) return fail(403, 'wrong setup token', 'setup-token-wrong')
       return json(await registrationOptions(env, origin, 'setup'))
     }
     case '/auth/setup/verify': {
       const passkey = await verifyRegistration(env, origin, body.challengeId, body.response, 'setup', body.label)
-      if (!passkey) return fail(400, 'passkey registration failed')
+      if (!passkey) return fail(400, 'passkey registration failed', 'register-failed')
       const codes = await hub.completeSetup(passkey)
-      if (!codes) return fail(403, 'setup is already complete')
+      if (!codes) return fail(403, 'setup is already complete', 'setup-done')
       return json({ ok: true, recoveryCodes: codes }, { headers: { 'set-cookie': await startSession(env) } })
     }
     case '/auth/login/options': {
       const [max, window] = RATE_LIMITS.login
-      if (!(await hub.hit(`login:${ip}`, max, window))) return fail(429, 'too many attempts')
+      if (!(await hub.hit(`login:${ip}`, max, window))) return fail(429, 'too many attempts', 'rate-limited')
       return json(await assertionOptions(env, origin, 'login', false))
     }
     case '/auth/login/verify': {
       if (!(await verifyAssertion(env, origin, body.challengeId, body.response, 'login'))) {
         await hub.audit({ actor: 'owner', actorName: 'オーナー', operation: 'login.passkey', hostId: null, outcome: 'denied', layer: null, reason: 'assertion-failed' })
-        return fail(403, 'passkey sign-in failed')
+        return fail(403, 'passkey sign-in failed', 'sign-in-failed')
       }
       await hub.audit({ actor: 'owner', actorName: 'オーナー', operation: 'login.passkey', hostId: null, outcome: 'ok', layer: null, reason: null })
       return json({ ok: true }, { headers: { 'set-cookie': await startSession(env) } })
@@ -203,13 +207,13 @@ export async function handleAuth(request: Request, env: Env, path: string): Prom
 
   // Everything below needs a signed-in owner.
   const session = await getSession(request, env)
-  if (!session) return fail(403, 'sign in first')
+  if (!session) return fail(403, 'sign in first', 'signed-out')
 
   switch (path) {
     case '/auth/reauth/options':
       return json(await assertionOptions(env, origin, 'reauth', true))
     case '/auth/reauth/verify': {
-      if (!(await verifyAssertion(env, origin, body.challengeId, body.response, 'reauth'))) return fail(403, 'passkey check failed')
+      if (!(await verifyAssertion(env, origin, body.challengeId, body.response, 'reauth'))) return fail(403, 'passkey check failed', 'reauth-failed')
       await hub.markReauth(session.hash)
       return json({ ok: true })
     }
@@ -217,26 +221,26 @@ export async function handleAuth(request: Request, env: Env, path: string): Prom
       if (!session.fresh) return json({ error: { code: 'reauth_required', message: 'confirm with a passkey first' } }, { status: 403 })
       return json(await registrationOptions(env, origin, 'add-passkey'))
     case '/auth/passkeys/verify': {
-      if (!session.fresh) return fail(403, 'confirm with a passkey first')
+      if (!session.fresh) return fail(403, 'confirm with a passkey first', 'reauth-needed')
       const passkey = await verifyRegistration(env, origin, body.challengeId, body.response, 'add-passkey', body.label)
-      if (!passkey || !(await hub.addPasskey(passkey))) return fail(400, 'passkey registration failed')
+      if (!passkey || !(await hub.addPasskey(passkey))) return fail(400, 'passkey registration failed', 'register-failed')
       return json({ ok: true })
     }
     case '/auth/confirm/options': {
       // A WebAuthn assertion bound to one request on one host, verified by the DSH plugin.
       const hostId = body.hostId
       const operation = body.operation
-      if (typeof hostId !== 'string' || typeof operation !== 'string') return fail(400, 'hostId and operation are required')
+      if (typeof hostId !== 'string' || typeof operation !== 'string') return fail(400, 'hostId and operation are required', 'bad-request')
       const requestId = `r_${randomToken(12)}`
       const issuedAt = Date.now()
       let rawParams = typeof body.params === 'object' && body.params !== null && !Array.isArray(body.params) ? (body.params as Record<string, unknown>) : {}
       if (typeof body.pendingId === 'string') {
         // A request a client parked for the owner: sign over exactly what it asked for.
         const pending = await confirmations(env, hostId).view(body.pendingId)
-        if (!pending || pending.state !== 'pending' || pending.operation !== operation) return fail(409, 'this request is no longer waiting')
+        if (!pending || pending.state !== 'pending' || pending.operation !== operation) return fail(409, 'this request is no longer waiting', 'gone')
         rawParams = pending.params
       }
-      if (typeof rawParams.hostId === 'string' && rawParams.hostId !== hostId) return fail(400, 'params.hostId does not match hostId')
+      if (typeof rawParams.hostId === 'string' && rawParams.hostId !== hostId) return fail(400, 'params.hostId does not match hostId', 'bad-request')
       // The challenge covers the params the host will see, hostId included.
       const params = finalParams(operation, rawParams, hostId)
       const challenge = await confirmationChallenge({ hubOrigin: origin, hostId, requestId, operation, params, issuedAt })
@@ -250,5 +254,5 @@ export async function handleAuth(request: Request, env: Env, path: string): Prom
       return json({ requestId, issuedAt, params, options })
     }
   }
-  return fail(404, 'not found')
+  return fail(404, 'not found', 'bad-request')
 }

@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { route } from '../../src/router.ts'
 import { escapeHtml, h, page, raw, visibleText } from '../../src/ui/layout.ts'
+import { i18n } from '../../src/i18n/index.ts'
 
 test('routes', () => {
   assert.deepEqual(route('GET', '/'), { kind: 'ui' })
@@ -30,7 +31,7 @@ test('pages escape outside values', () => {
   const title = '<script>alert(1)</script>'
   const body = h`<p>${title}</p>${raw('<b>ok</b>')}${[h`<i>${'&'}</i>`]}`
   assert.equal(body.value, '<p>&lt;script&gt;alert(1)&lt;/script&gt;</p><b>ok</b><i>&amp;</i>')
-  const html = page({ title, body })
+  const html = page({ i18n: i18n('ja'), title, body })
   assert.ok(!html.includes('<script>alert'))
   assert.ok(!/<script>[^<]/.test(html), 'no inline script')
   assert.ok(html.includes('非公式'))

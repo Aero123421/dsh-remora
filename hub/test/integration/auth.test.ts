@@ -24,7 +24,7 @@ describe('owner authentication', () => {
     const page = await owner.browser.fetch('/')
     expect(page.status).toBe(200)
     expect(page.headers.get('content-security-policy')).toContain("script-src 'self'")
-    expect(await page.text()).toContain('はじめに')
+    expect(await page.text()).toContain('使い始める')
 
     // A fresh browser has to log in.
     const fresh = await new Browser().fetch('/settings')

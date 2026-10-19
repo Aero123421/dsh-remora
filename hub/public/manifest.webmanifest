@@ -2,14 +2,13 @@
   "id": "/",
   "name": "Remora",
   "short_name": "Remora",
-  "description": "DSH を外から操作するためのハブ（非公式）",
+  "description": "Remora hub: drive your DSH (DeepSeek Harness) sessions from outside. Unofficial.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#0b0f17",
-  "theme_color": "#0b0f17",
-  "lang": "ja",
-  "icons": [
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+    "icons": [
     {
       "src": "/remora-192.png",
       "sizes": "192x192",

@@ -7,27 +7,23 @@ import { handleAuth } from './auth.ts'
 import { hubOrigin } from './config.ts'
 import { HostDO } from './host-do.ts'
 import { HubDO } from './hub-do.ts'
-import { html } from './http.ts'
 import { handleMcp } from './mcp.ts'
 import { countWorkerRequest, hostStub, maybeFlush } from './meter.ts'
 import { handleOAuth, oauthFor, registerProtectedHandlers } from './oauth.ts'
 import { isPairedHost } from './ops.ts'
 import { hostUnpair, pairApprovePage, pairApprovePost, pairPoll, pairStart } from './pair.ts'
 import { route } from './router.ts'
-import { h, page } from './ui/layout.ts'
-import { handleUi } from './ui/routes.ts'
+import { uiFor } from './ui/layout.ts'
+import { handleUi, notFound as notFoundPage } from './ui/routes.ts'
 import { HUB_VERSION } from './version.ts'
 
 export { HostDO, HubDO }
 
 registerProtectedHandlers({ mcp: handleMcp, api: handleApi })
 
-function notFound(): Response {
-  return html(page({ title: '見つかりません', narrow: true, body: h`<h1>見つかりません</h1><p><a class="button" href="/">ホームへ</a></p>` }), { status: 404 })
-}
-
 async function dispatch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url)
+  const notFound = () => notFoundPage(uiFor(request))
   const target = route(request.method, url.pathname)
   switch (target.kind) {
     case 'health':

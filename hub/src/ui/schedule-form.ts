@@ -2,9 +2,11 @@
  * The hub's "add a scheduled prompt" form → the `when` of schedule.create.
  * Kept apart from the page code so it can be unit-tested without Workers.
  */
+import type { MessageKey, Vars } from '../i18n/index.ts'
 import type { ScheduleWhen } from '../vendor/protocol/api.ts'
 
-export type WhenOutcome = { ok: true; when: ScheduleWhen } | { ok: false; message: string }
+/** A failure names its message; the page renders it in the reader's language. */
+export type WhenOutcome = { ok: true; when: ScheduleWhen } | { ok: false; message: MessageKey; vars?: Vars }
 
 /** `2026-10-13T09:00` read as a wall-clock time in `timeZone` → RFC 3339 in UTC, or null. */
 export function zonedTime(local: string, timeZone: string): string | null {
@@ -41,40 +43,40 @@ function validZone(timeZone: string): boolean {
 }
 
 export function whenFromForm(form: URLSearchParams): WhenOutcome {
-  const fail = (message: string): WhenOutcome => ({ ok: false, message })
+  const fail = (message: MessageKey, vars?: Vars): WhenOutcome => ({ ok: false, message, ...(vars ? { vars } : {}) })
   const kind = form.get('kind') ?? ''
   const timeZone = (form.get('timeZone') ?? '').trim() || 'UTC'
   const minutes = Number(form.get('minutes') ?? '')
   const time = (form.get('time') ?? '').trim()
-  if (['at', 'daily', 'weekly', 'cron'].includes(kind) && !validZone(timeZone)) return fail(`タイムゾーン「${timeZone}」が分かりません（例: Asia/Tokyo）。`)
+  if (['at', 'daily', 'weekly', 'cron'].includes(kind) && !validZone(timeZone)) return fail('schedules.error.zone', { zone: timeZone })
   switch (kind) {
     case 'after':
-      if (!Number.isFinite(minutes) || minutes < 1 || minutes > 366 * 24 * 60) return fail('何分後かを 1 から 527040 の間で入れてください。')
+      if (!Number.isFinite(minutes) || minutes < 1 || minutes > 366 * 24 * 60) return fail('schedules.error.after')
       return { ok: true, when: { afterSeconds: Math.round(minutes * 60) } }
     case 'every':
-      if (!Number.isFinite(minutes) || minutes < 1 || minutes > 366 * 24 * 60) return fail('間隔を 1 から 527040 分の間で入れてください。')
+      if (!Number.isFinite(minutes) || minutes < 1 || minutes > 366 * 24 * 60) return fail('schedules.error.every')
       return { ok: true, when: { everySeconds: Math.round(minutes * 60) } }
     case 'at': {
       const at = zonedTime(form.get('at') ?? '', timeZone)
-      if (!at) return fail('日時を入れてください。')
-      if (Date.parse(at) <= Date.now()) return fail('過去の日時は指定できません。')
+      if (!at) return fail('schedules.error.at')
+      if (Date.parse(at) <= Date.now()) return fail('schedules.error.past')
       return { ok: true, when: { at } }
     }
     case 'daily':
-      if (!TIME.test(time)) return fail('時刻を HH:mm で入れてください。')
+      if (!TIME.test(time)) return fail('schedules.error.time')
       return { ok: true, when: { daily: { time, timeZone } } }
     case 'weekly': {
-      if (!TIME.test(time)) return fail('時刻を HH:mm で入れてください。')
+      if (!TIME.test(time)) return fail('schedules.error.time')
       const weekdays = [...new Set(form.getAll('weekday').map(Number).filter(day => Number.isInteger(day) && day >= 1 && day <= 7))].sort((a, b) => a - b)
-      if (weekdays.length === 0) return fail('曜日を 1 つ以上選んでください。')
+      if (weekdays.length === 0) return fail('schedules.error.weekdays')
       return { ok: true, when: { weekly: { time, timeZone, weekdays } } }
     }
     case 'cron': {
       const expression = (form.get('cron') ?? '').trim()
-      if (expression === '' || expression.length > 200) return fail('cron 式を入れてください（例: 0 9 * * 1-5）。')
+      if (expression === '' || expression.length > 200) return fail('schedules.error.cron')
       return { ok: true, when: { cron: { expression, timeZone } } }
     }
     default:
-      return fail('いつ実行するかを選んでください。')
+      return fail('schedules.error.kind')
   }
 }

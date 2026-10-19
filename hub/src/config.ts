@@ -82,3 +82,6 @@ export const RATE_LIMITS = {
 } as const satisfies Record<string, readonly [number, number]>
 
 export type RateLimitName = keyof typeof RATE_LIMITS
+
+/** Where the plugin, the CLI and their install scripts are published. */
+export const RELEASES_URL = 'https://github.com/Aero123421/dsh-remora/releases'

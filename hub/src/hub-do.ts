@@ -13,6 +13,7 @@ import { AUDIT_SCHEMA, appendAudit, listAudit, type AuditEntry, type AuditRow } 
 import { CHALLENGE_TTL_MS, DEVICE_CODE_TTL_MS, DEVICE_POLL_INTERVAL_S, FULL_ACCESS_MS, RECOVERY_CODE_COUNT, REAUTH_WINDOW_MS, SESSION_IDLE_MS, SESSION_MAX_MS } from './config.ts'
 import { PUSH_TYPES, type CallContext, type ClientKind, type ClientRecord, type ClientWithGrants, type DeviceInfo, type DevicePoll, type GrantLevel, type GrantSetting, type HostRecord, type HubState, type MeterTotals, type OwnerCredential, type PairingInfo, type PasskeyRecord, type PersonalTokenRecord, type PushDevice, type PushEvent, type PushOutcome, type PushType } from './types.ts'
 import { buildPushRequest, generateVapidKeys, type VapidKeys } from './webpush.ts'
+import { pushText } from './attention.ts'
 import { base32, parseJson, randomBytes, randomCode, randomToken, sha256Hex, utcDay, verifyEd25519 } from './util.ts'
 import {
   CONFIRMATION_REQUEST_TTL_MS, HUB_CONFIRMATION_PREFIX, PAIRING_POLL_INTERVAL_MS, PAIRING_TTL_MS, TASK_WAIT_MAX_MS, USER_CODE_ALPHABET, pairPollMessage,
@@ -223,7 +224,7 @@ export class HubDO extends DurableObject<Env> {
     ctx.blockConcurrencyWhile(async () => {
       this.sql.exec(SCHEMA)
       // Columns added after the first release.
-      for (const statement of ['ALTER TABLE pairings ADD COLUMN source TEXT', 'ALTER TABLE pairings ADD COLUMN last_seen_at INTEGER', 'ALTER TABLE approvals ADD COLUMN fetches INTEGER NOT NULL DEFAULT 0']) {
+      for (const statement of ['ALTER TABLE pairings ADD COLUMN source TEXT', 'ALTER TABLE pairings ADD COLUMN last_seen_at INTEGER', 'ALTER TABLE approvals ADD COLUMN fetches INTEGER NOT NULL DEFAULT 0', 'ALTER TABLE push_subscriptions ADD COLUMN lang TEXT']) {
         try {
           this.sql.exec(statement)
         } catch {
@@ -647,7 +648,7 @@ export class HubDO extends DurableObject<Env> {
     this.sql.exec('INSERT INTO pats (id, hash, name, scopes, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)', id, await sha256Hex(token), name, JSON.stringify(scopes), now, record.expiresAt)
     this.sql.exec(
       `INSERT INTO clients (client_id, name, kind, created_at) VALUES (?, ?, 'pat', ?) ON CONFLICT (client_id) DO NOTHING`,
-      `pat:${id}`, `個人トークン: ${name}`, now,
+      `pat:${id}`, name, now,
     )
     await this.audit({ actor: 'owner', actorName: 'オーナー', operation: 'pat.create', hostId: null, outcome: 'ok', layer: null, reason: `pat:${id}` })
     return { token, record }
@@ -754,17 +755,18 @@ export class HubDO extends DurableObject<Env> {
   }
 
   /** Store a device's subscription (one per endpoint); re-subscribing updates its keys. */
-  async pushSubscribe(input: { endpoint: string; p256dh: string; auth: string; label: string }): Promise<{ id: string } | { error: string }> {
+  async pushSubscribe(input: { endpoint: string; p256dh: string; auth: string; label: string; lang?: string }): Promise<{ id: string } | { error: string }> {
+    const lang = input.lang ?? null
     const existing = this.sql.exec<{ id: string }>('SELECT id FROM push_subscriptions WHERE endpoint = ?', input.endpoint).toArray()[0]
     if (existing) {
-      this.sql.exec('UPDATE push_subscriptions SET p256dh = ?, auth = ?, label = ?, last_error = NULL WHERE id = ?', input.p256dh, input.auth, input.label, existing.id)
+      this.sql.exec('UPDATE push_subscriptions SET p256dh = ?, auth = ?, label = ?, lang = ?, last_error = NULL WHERE id = ?', input.p256dh, input.auth, input.label, lang, existing.id)
       return { id: existing.id }
     }
     if (this.count('SELECT COUNT(*) AS n FROM push_subscriptions') >= PUSH_MAX_DEVICES) return { error: 'too-many-devices' }
     const id = base32(randomBytes(10))
     this.sql.exec(
-      'INSERT INTO push_subscriptions (id, endpoint, p256dh, auth, label, types, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      id, input.endpoint, input.p256dh, input.auth, input.label, JSON.stringify(PUSH_TYPES), Date.now(),
+      'INSERT INTO push_subscriptions (id, endpoint, p256dh, auth, label, types, created_at, lang) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      id, input.endpoint, input.p256dh, input.auth, input.label, JSON.stringify(PUSH_TYPES), Date.now(), lang,
     )
     await this.audit({ actor: 'owner', actorName: 'オーナー', operation: 'push.subscribe', hostId: null, outcome: 'ok', layer: null, reason: null })
     return { id }
@@ -799,7 +801,7 @@ export class HubDO extends DurableObject<Env> {
     // The call that delivered this batch is itself a Durable Object request.
     await this.meterAdd({ worker: 0, durable: 0, kv: 0 })
     if (events.length === 0) return outcome
-    const rows = this.sql.exec<{ id: string; endpoint: string; p256dh: string; auth: string; types: string }>('SELECT id, endpoint, p256dh, auth, types FROM push_subscriptions').toArray()
+    const rows = this.sql.exec<{ id: string; endpoint: string; p256dh: string; auth: string; types: string; lang: string | null }>('SELECT id, endpoint, p256dh, auth, types, lang FROM push_subscriptions').toArray()
     if (rows.length === 0) return outcome
     const keys = await this.vapidKeys()
     const subject = origin && origin.startsWith('https://') ? origin : 'mailto:remora-hub@localhost'
@@ -820,6 +822,8 @@ export class HubDO extends DurableObject<Env> {
         title: first.title,
         url: wanted.length > 1 ? (wanted.some(event => event.type === 'attention') ? '/attention' : '/') : first.url,
         count: wanted.length,
+        ...(first.op ? { op: first.op } : {}),
+        ...(row.lang ? { lang: row.lang } : {}),
         ...(typeof first.expiresAt === 'number' ? { expiresAt: first.expiresAt } : {}),
         tag: wanted.length > 1 ? 'remora-batch' : `${first.kind}:${first.hostId ?? ''}:${first.url}`,
       }
@@ -918,8 +922,7 @@ export class HubDO extends DurableObject<Env> {
       id, clientId, clientName.slice(0, 200), operation, now, now + CONFIRMATION_REQUEST_TTL_MS, now,
     )
     await this.audit({ actor: clientId, actorName: clientName, operation: `${operation}.requested`, hostId: null, outcome: 'ok', layer: null, reason: null })
-    const what = operation === 'audit.export' ? '監査ログの書き出し' : operation === 'hub.export' ? 'ハブ設定の書き出し' : operation
-    this.ctx.waitUntil(this.notify([{ type: 'attention', kind: 'confirmation', hostId: null, host: 'ハブ', title: `${clientName.slice(0, 40)}: ${what}`, url: `/confirm/hub/${id}`, expiresAt: now + CONFIRMATION_REQUEST_TTL_MS }], origin).catch(() => undefined))
+    this.ctx.waitUntil(this.notify([{ type: 'attention', kind: 'confirmation', hostId: null, host: 'Remora', title: pushText(clientName, 40), op: operation, url: `/confirm/hub/${id}`, expiresAt: now + CONFIRMATION_REQUEST_TTL_MS }], origin).catch(() => undefined))
     return this.approvalRow(id) as ApprovalRecord
   }
 

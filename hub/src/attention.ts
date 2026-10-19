@@ -56,17 +56,6 @@ export function answerRoute(item: Pick<AttentionItem, 'kind' | 'answerable' | 'a
   return 'dsh-web'
 }
 
-/** Countdown text such as 「あと 4 分 05 秒」. */
-export function countdownText(expiresAt: number, now = Date.now()): string {
-  const left = Math.max(0, Math.ceil((expiresAt - now) / 1000))
-  if (left === 0) return '期限切れ'
-  const hours = Math.floor(left / 3600)
-  const minutes = Math.floor((left % 3600) / 60)
-  const seconds = left % 60
-  if (hours > 0) return `あと ${hours} 時間 ${minutes} 分`
-  return `あと ${minutes} 分 ${String(seconds).padStart(2, '0')} 秒`
-}
-
 const SECRET_LIKE = [
   /\b(?:sk|pk|rk|ghp|gho|ghu|ghs|ghr|github_pat|xox[abprs]|AKIA|ASIA|AIza|glpat|hf|rmr_pat)[-_A-Za-z0-9]{8,}/g,
   /\b[A-Za-z0-9+/_=-]{32,}/g,

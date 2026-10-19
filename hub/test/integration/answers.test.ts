@@ -100,7 +100,7 @@ describe('answering questions, plan reviews and approvals from outside', () => {
     expect(all).toContain('1. Do this')
     expect(all).toContain('data-testid="hub-plan-reject"')
     expect(all).toContain('期限が切れました')
-    expect(all).toContain('tool-ask-user を timed に切り替える')
+    expect(all).toContain('legacy モードのため')
 
     // The browser asks for a challenge over the final params, signs it, and posts the assertion.
     const params = { sessionId: 's9', attentionId: 'approval:9', answer: { approve: true } }

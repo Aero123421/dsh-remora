@@ -12,8 +12,29 @@ export const SETUP_TOKEN = 'test-setup-token-0123456789'
 
 const SELF = (exports as unknown as { default: Fetcher }).default
 
-export function hubFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  return SELF.fetch(new Request(`${ORIGIN}${path}`, { redirect: 'manual', ...init }))
+/**
+ * Fetch from the hub. Pages render in the request's language; these tests were
+ * written against the Japanese pages, so Accept-Language defaults to `ja`.
+ */
+export async function hubFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers)
+  if (!headers.has('accept-language')) headers.set('accept-language', 'ja')
+  const response = await SELF.fetch(new Request(`${ORIGIN}${path}`, { redirect: 'manual', ...init, headers }))
+  if (response.headers.get('content-type')?.includes('text/html')) assertNoNestedForms(await response.clone().text(), path)
+  return response
+}
+
+/**
+ * Browsers drop a <form> start tag inside another form, so the inner buttons
+ * submit the outer form (a "Deny" button once ran the command it was meant to
+ * refuse). Every page the tests fetch is checked.
+ */
+export function assertNoNestedForms(html: string, where: string): void {
+  let depth = 0
+  for (const match of html.matchAll(/<(\/?)form\b/gi)) {
+    depth += match[1] ? -1 : 1
+    if (depth > 1) throw new Error(`nested <form> on ${where} at offset ${match.index}`)
+  }
 }
 
 // --- minimal CBOR encoder ------------------------------------------------------------

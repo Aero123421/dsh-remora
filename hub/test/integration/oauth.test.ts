@@ -258,7 +258,7 @@ describe('OAuth, MCP and the HTTP API', () => {
     expect(known.status).toBe(200)
     const html = await known.text()
     expect(html).toContain('chatgpt.com')
-    expect(html).toContain('既知のクライアント')
+    expect(html).toContain('既知のアプリ')
 
     const evilQuery = new URLSearchParams({ response_type: 'code', client_id: 'https://evil.example/client.json', redirect_uri: 'https://evil.example/cb', scope: 'dsh.read', state: 's', code_challenge: challenge, code_challenge_method: 'S256', resource: MCP })
     const unknown = await owner.browser.fetch(`/oauth/authorize?${evilQuery}`)
