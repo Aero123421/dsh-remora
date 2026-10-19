@@ -20,7 +20,8 @@ export interface LocaleLanguage {
 }
 
 export interface Locale {
-  register(ns: string, copy: LocaleCopy): () => void
+  /** Registers dictionaries for one namespace. A locale id that is already present throws. */
+  register(ns: string, copy: { [locale: string]: Record<string, string> }): () => void
   /** Adds a language. Throws when `id` is already registered. The disposer removes only this definition. */
   addLanguage(input: { id: string; label: string; fallback: string }): () => void
   bind(ns: string): (key: string, params?: Record<string, unknown>) => string

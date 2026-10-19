@@ -147,6 +147,27 @@ test('turning Remora off removes ja when Remora was the plugin that defined it',
   assert.equal(world.hasJa(), false)
   assert.equal(world.active(), 'en')
   assert.equal(world.locale.bind(NS)('conn.status'), 'conn.status')
+  assert.equal(world.locale.bind('common')('__dshRemoraJaProbe'), '__dshRemoraJaProbe')
+})
+
+test('turning Remora off keeps ja when Remora defined it and dsh-japanese then registered shell copy', () => {
+  const world = catalog()
+  installLocale(world.ctx)
+  assert.equal(world.hasJa(), true)
+  const shell = {
+    en: { cancel: 'Cancel', trigger: 'Settings' },
+    zh: { cancel: '取消', trigger: '设置' },
+    ja: { cancel: 'キャンセル', trigger: '設定' },
+  }
+  world.locale.register('common', shell)
+  world.locale.register('settings', shell)
+  world.setActive('ja')
+  world.dispose()
+  assert.equal(world.hasJa(), true)
+  assert.equal(world.active(), 'ja')
+  assert.equal(world.locale.bind('common')('cancel'), 'キャンセル')
+  assert.equal(world.locale.bind('settings')('trigger'), '設定')
+  assert.equal(world.locale.bind(NS)('kill.title'), 'kill.title')
 })
 
 test('every visible string has English and Japanese copy, so a missing language does not show the key', () => {
