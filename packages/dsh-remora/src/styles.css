@@ -60,11 +60,27 @@
 .rmr .rmr-tabs > [role="tab"] { flex: 1 0 auto; min-width: 0; max-width: 100%; min-height: 28px; height: auto; padding: 4px 12px; white-space: normal; }
 .rmr .rmr-tabs > [role="tab"][aria-selected="true"] { background: var(--dsw-alias-bg-layer-1); box-shadow: var(--dsw-elevation-soft); }
 @container remora (max-width: 360px) {
+  /* Break at spaces and between CJK characters. URLs keep their own wrapping.
+   * Wider settings columns keep the base `overflow-wrap: anywhere`. */
+  .rmr { overflow-wrap: normal; }
+  .rmr-mono { overflow-wrap: anywhere; word-break: break-all; }
   .rmr-levels { grid-template-columns: minmax(0, 1fr); }
-  .rmr-kill { flex-wrap: wrap; }
-  .rmr-kill > button { max-width: 100%; height: auto; white-space: normal; }
-  .rmr-row { gap: 12px; flex-wrap: wrap; }
-  .rmr-grow { min-width: 0; }
+  .rmr-kill { flex-wrap: wrap; flex-direction: column; align-items: stretch; }
+  .rmr-kill > button { max-width: 100%; height: auto; white-space: normal; align-self: flex-start; }
+  .rmr-row { gap: 8px; flex-wrap: wrap; flex-direction: column; align-items: stretch; }
+  .rmr-row-text { flex: 1 1 100%; width: 100%; }
+  .rmr-row-actions { width: 100%; max-width: 100%; justify-content: flex-start; }
+  .rmr-inline { width: 100%; min-width: 0; }
+  .rmr-grow { min-width: 0; width: 100%; }
+  .rmr input,
+  .rmr textarea { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
+  .rmr [role="tablist"] > [role="tab"],
+  .rmr .rmr-tabs > [role="tab"] {
+    flex: 1 1 100%;
+    overflow-wrap: normal;
+    word-break: normal;
+    padding: 4px 8px;
+  }
 }
 /* Sidebar chip */
 .rmr-chip-wrap { position: relative; }

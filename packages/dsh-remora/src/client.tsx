@@ -7,7 +7,8 @@
  * DSH's `window.__ModuleLoader__`; React comes from the host page, and the
  * official DSH primitives are compiled in from pinned DSH source.
  */
-import { en, ja, NS } from './locales.ts'
+import { attachJapanese } from './japanese.ts'
+import { NS } from './locales.ts'
 import css from './styles.css'
 import type { ClientContext } from './ui/api.ts'
 import { officialCss } from './ui/css-registry.ts'
@@ -16,7 +17,7 @@ import { PluginsEntry, RemoraChip, RemoraPage } from './ui/page.tsx'
 export const inject = ['slots', 'locale', 'connection']
 
 export function apply(ctx: ClientContext): void {
-  ctx.effect(() => ctx.locale.register(NS, { en, ja }), 'dsh-remora: copy')
+  ctx.effect(() => attachJapanese(ctx.locale), 'dsh-remora: japanese')
   ctx.effect(() => {
     const style = document.createElement('style')
     style.dataset.dshRemora = ''

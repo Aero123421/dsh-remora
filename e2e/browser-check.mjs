@@ -8,6 +8,40 @@ import { dsh as DSH, remora as REMORA } from './lib/selectors.mjs'
 import { firstPresent, instrument, mustBePresent, shot } from './lib/browser.mjs'
 import assert from 'node:assert/strict'
 
+/** Latin letters that change line without a space are a mid-word break. CJK may wrap per character. */
+async function narrowColumnReport(section) {
+  return section.evaluate(root => {
+    const column = root.getBoundingClientRect()
+    const problems = []
+    const visit = element => {
+      const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT)
+      let textNode
+      while ((textNode = walker.nextNode())) {
+        const text = textNode.textContent ?? ''
+        const range = document.createRange()
+        let lastTop = null
+        for (let i = 0; i < text.length; i++) {
+          range.setStart(textNode, i)
+          range.setEnd(textNode, i + 1)
+          const rect = range.getBoundingClientRect()
+          if (rect.width === 0 && rect.height === 0) continue
+          if (lastTop !== null && rect.top - lastTop > 2 && /[A-Za-z]/.test(text[i - 1] ?? '') && /[A-Za-z]/.test(text[i] ?? '')) {
+            problems.push(`${text[i - 1]}|${text[i]} in ${text.slice(Math.max(0, i - 8), i + 8)}`)
+          }
+          lastTop = rect.top
+        }
+      }
+    }
+    for (const tab of root.querySelectorAll('.rmr-tabs > [role="tab"], [data-testid="remora-hub-status"]')) visit(tab)
+    const inputOverflow = [...root.querySelectorAll('input, textarea')].flatMap(input => {
+      const box = input.getBoundingClientRect()
+      const overflow = Math.max(0, box.right - column.right, column.left - box.left)
+      return overflow > 1 ? [{ overflow: Math.round(overflow), label: input.getAttribute('aria-label') }] : []
+    })
+    return { problems, inputOverflow, columnWidth: Math.round(column.width) }
+  })
+}
+
 /** Check the rendered selection surface, including constrained grid tracks. */
 export async function checkSettingsLayout(page, section) {
   const viewport = page.viewportSize()
@@ -48,11 +82,22 @@ export async function checkSettingsLayout(page, section) {
       await section.locator('#rmr-tabs-scope-panel').waitFor({ state: 'visible' })
       assert.equal(await section.locator('#rmr-tabs-scope').evaluate(element => element === document.activeElement), true)
     }
+    await page.setViewportSize({ width: 390, height: viewport.height })
+    await section.locator('#rmr-tabs-connection').click()
+    const narrow = await narrowColumnReport(section)
+    assert.deepEqual(narrow.problems, [], `390px mid-word break: ${narrow.problems.join('; ')}`)
+    assert.deepEqual(narrow.inputOverflow, [], `390px input overflow: ${JSON.stringify(narrow.inputOverflow)}`)
+    for (const value of ['permissions', 'scope', 'activity', 'compat']) {
+      await section.locator(`#rmr-tabs-${value}`).click()
+      const tab = await narrowColumnReport(section)
+      assert.deepEqual(tab.problems, [], `${value} mid-word break at 390px: ${tab.problems.join('; ')}`)
+      assert.deepEqual(tab.inputOverflow, [], `${value} input overflow at 390px: ${JSON.stringify(tab.inputOverflow)}`)
+    }
   } finally {
     await page.setViewportSize(viewport)
     await section.locator('#rmr-tabs-connection').click()
   }
-  return 'Five tabs and keyboard navigation: selection matches its panel at 1280px and 600px; permission cards use two columns or one without overflow'
+  return 'Five tabs and keyboard navigation: selection matches its panel at 1280px and 600px; permission cards use two columns or one without overflow; at 390px tab names and status stay on word boundaries and inputs stay in the column'
 }
 
 /** Open DSH Web in a fresh English context and dismiss the first-use notice. */
