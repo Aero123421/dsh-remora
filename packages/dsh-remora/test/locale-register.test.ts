@@ -37,13 +37,15 @@ function catalog(initial: Language[] = [
         revision += 1
       }
     },
-    register(ns, copy) {
+    register(ns: string, localeOrDicts: string | LocaleCopy, dict?: Record<string, string>) {
       let table = dicts.get(ns)
       if (!table) {
         table = new Map()
         dicts.set(ns, table)
       }
-      const pairs = Object.entries(copy)
+      const pairs: Array<[string, Record<string, string>]> = typeof localeOrDicts === 'string'
+        ? [[localeOrDicts, dict ?? {}]]
+        : Object.entries(localeOrDicts)
       for (const [id] of pairs) if (table.has(id)) throw new Error(`locale namespace "${ns}" already has locale "${id}"`)
       for (const [id, entries] of pairs) table.set(id, entries)
       revision += 1
@@ -108,19 +110,28 @@ function catalog(initial: Language[] = [
   }
 }
 
-test('ja is added only when the catalog does not already have it, then the dictionaries are registered', () => {
+test('the plugin alone makes ja selectable, and zh-CN reads English without a zh dictionary', () => {
   const client = readFileSync(join(src, 'client.tsx'), 'utf8')
+  const install = readFileSync(join(src, 'locale-install.ts'), 'utf8')
+  const testSource = readFileSync(fileURLToPath(import.meta.url), 'utf8')
   assert.match(client, /installLocale\(ctx\)/)
+  assert.doesNotMatch(testSource, /addLanguage\(\s*\{[^}]*id:\s*['"]ja['"]/)
+  assert.doesNotMatch(install, /zh:\s*en/)
   const alone = catalog()
+  assert.equal(alone.hasJa(), false)
   installLocale(alone.ctx)
-  assert.equal(alone.hasJa(), true)
+  const added = alone.locale.getSnapshot().locales.find(locale => locale.id === 'ja')
+  assert.deepEqual(added, { id: 'ja', label: '日本語', fallback: 'en' })
   alone.setActive('ja')
   assert.equal(alone.locale.bind(NS)('kill.title'), ja['kill.title'])
   assert.equal(alone.locale.bind(NS)('kill.title'), '緊急停止')
-  const zh = alone.locale.bind(NS)
   alone.setActive('zh')
-  assert.equal(zh('kill.title'), en['kill.title'])
-  assert.notEqual(zh('kill.title'), 'kill.title')
+  assert.equal(alone.locale.bind(NS)('kill.title'), en['kill.title'])
+  assert.equal(alone.locale.bind(NS)('conn.notPaired'), en['conn.notPaired'])
+  assert.notEqual(alone.locale.bind(NS)('kill.title'), 'kill.title')
+  assert.notEqual(alone.locale.bind(NS)('conn.notPaired'), 'conn.notPaired')
+  const release = alone.locale.register(NS, 'zh', { 'kill.title': 'unused' })
+  release()
 })
 
 test('turning Remora off leaves ja in place when dsh-japanese already defined it', () => {

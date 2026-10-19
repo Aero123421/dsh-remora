@@ -6,11 +6,11 @@ import { SnapshotStore } from './snapshot-store.ts'
 
 export type Translate = (key: CopyKey, params?: Record<string, unknown>) => string
 
-/** Built-in catalogs require `en` and `zh`. `zh` may be the English dictionary. */
+/** One locale's flat dictionary. A missing `zh` entry is not a Chinese dictionary: built-in `zh` falls back to `en`. */
+export type LocaleDict = Record<string, string>
+
 export interface LocaleCopy {
-  en: Record<string, string>
-  zh: Record<string, string>
-  [locale: string]: Record<string, string>
+  [locale: string]: LocaleDict
 }
 
 export interface LocaleLanguage {
@@ -20,8 +20,14 @@ export interface LocaleLanguage {
 }
 
 export interface Locale {
-  /** Registers dictionaries for one namespace. A locale id that is already present throws. */
-  register(ns: string, copy: { [locale: string]: Record<string, string> }): () => void
+  /**
+   * Single-locale form. Remora uses this so a typed object register, which
+   * requires a `zh` dictionary, is not how these strings are published.
+   * Built-in `zh` has fallback `en`, and lookup walks that chain.
+   */
+  register(ns: string, locale: string, dict: LocaleDict): () => void
+  /** Object form. A locale id that is already present throws. */
+  register(ns: string, copy: LocaleCopy): () => void
   /** Adds a language. Throws when `id` is already registered. The disposer removes only this definition. */
   addLanguage(input: { id: string; label: string; fallback: string }): () => void
   bind(ns: string): (key: string, params?: Record<string, unknown>) => string

@@ -15,8 +15,10 @@ const SHELL_NAMESPACES = ['common', 'settings'] as const
  * `ja` dictionary. dsh-japanese skips its own `addLanguage` when Remora added
  * `ja` first, so dropping the definition here would switch the shell back to
  * English. A `ja` that dsh-japanese itself registered is never owned by this
- * disposer. `zh` is the English dictionary: the typed catalog requires it, and
- * Remora has no Chinese copy.
+ * disposer. No `zh` dictionary is registered. The typed object form of
+ * `register` would require one, so each locale is registered on its own.
+ * Built-in `zh` falls back to `en`, and a missing key is read from that
+ * English dictionary instead of being shown as its key name.
  */
 export function installLocale(ctx: Pick<ClientContext, 'effect' | 'locale'>): void {
   if (!ctx.locale.getSnapshot().locales.some(locale => locale.id === 'ja')) {
@@ -28,7 +30,14 @@ export function installLocale(ctx: Pick<ClientContext, 'effect' | 'locale'>): vo
       }
     }, 'dsh-remora: language')
   }
-  ctx.effect(() => ctx.locale.register(NS, { en, ja, zh: en }), 'dsh-remora: copy')
+  ctx.effect(() => {
+    const removeEn = ctx.locale.register(NS, 'en', en)
+    const removeJa = ctx.locale.register(NS, 'ja', ja)
+    return () => {
+      removeJa()
+      removeEn()
+    }
+  }, 'dsh-remora: copy')
 }
 
 function shellJaIsRegistered(locale: Locale): boolean {
