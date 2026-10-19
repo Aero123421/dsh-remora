@@ -13,6 +13,11 @@ interface Language extends LocaleLanguage {
   fallback?: string
 }
 
+/** dsh-japanese stand-in. The plugin source must not name this host method. */
+interface CatalogLocale extends Locale {
+  addLanguage(input: { id: string; label: string; fallback: string }): () => void
+}
+
 /** Catalog with the same disposer rules as DSH 0.2.1-rc.2. */
 function catalog(initial: Language[] = [
   { id: 'en', label: 'English' },
@@ -22,7 +27,7 @@ function catalog(initial: Language[] = [
   const dicts = new Map<string, Map<string, Record<string, string>>>()
   let active = 'en'
   let revision = 0
-  const locale: Locale = {
+  const locale: CatalogLocale = {
     getSnapshot: () => ({ revision, active, locales: [...languages.values()] }),
     addLanguage(input) {
       if (languages.has(input.id)) throw new Error(`locale "${input.id}" is already registered`)

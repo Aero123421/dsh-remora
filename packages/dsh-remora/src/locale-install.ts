@@ -3,9 +3,9 @@ import type { ClientContext } from './ui/api.ts'
 
 /**
  * Register Remora's dictionaries. The language `ja` is defined only by
- * dsh-japanese. This plugin does not call `addLanguage`. Without that
- * language, lookup uses built-in `en`, so the screen shows English rather
- * than key names. No `zh` dictionary is registered. The typed object form of
+ * dsh-japanese. This plugin does not define that language. Without it,
+ * lookup uses built-in `en`, so the screen shows English rather than key
+ * names. No `zh` dictionary is registered. The typed object form of
  * `register` would require one, so each locale is registered on its own.
  * Built-in `zh` falls back to `en`, and a missing key is read from that
  * English dictionary.
