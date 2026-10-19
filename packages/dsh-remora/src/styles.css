@@ -1,5 +1,5 @@
 /* Remora settings tab. Colors come from DSH's theme tokens so the page follows light/dark themes. */
-.rmr { display: flex; flex-direction: column; gap: 20px; width: 100%; min-width: 0; container: remora / inline-size; color: var(--dsw-alias-label-primary); font-size: 14px; line-height: 20px; overflow-wrap: normal; word-break: normal; }
+.rmr { display: flex; flex-direction: column; gap: 20px; width: 100%; min-width: 0; container: remora / inline-size; color: var(--dsw-alias-label-primary); font-size: 14px; line-height: 20px; overflow-wrap: break-word; word-break: normal; }
 .rmr p { margin: 0; }
 .rmr h3 { margin: 0; font-size: 14px; font-weight: 600; line-height: 20px; }
 .rmr-header { display: flex; flex-direction: column; gap: 6px; }
@@ -7,12 +7,14 @@
 .rmr-title { margin: 0; font-size: 18px; font-weight: 600; line-height: 26px; }
 .rmr-muted { color: var(--dsw-alias-label-secondary); font-size: 12px; line-height: 18px; }
 .rmr-faint { color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 18px; }
-.rmr-mono { font-family: var(--dsw-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; overflow-wrap: anywhere; word-break: break-all; }
+.rmr-mono { font-family: var(--dsw-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; overflow-wrap: break-word; word-break: break-all; }
 .rmr-section { display: flex; flex-direction: column; }
 .rmr-section-head { display: flex; flex-direction: column; gap: 4px; padding: 4px 0 8px; }
 .rmr-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 14px 0; border-bottom: 0.5px solid var(--dsw-alias-border-l2); }
 .rmr-row:last-child { border-bottom: none; }
-.rmr-row-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.rmr-row-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1 1 12rem; }
+.rmr-field { width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; }
+.rmr-field > input { width: 100%; min-width: 0; }
 .rmr-row-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
 .rmr-stack { display: flex; flex-direction: column; gap: 8px; }
 .rmr-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -61,9 +63,9 @@
 .rmr .rmr-tabs > [role="tab"][aria-selected="true"] { background: var(--dsw-alias-bg-layer-1); box-shadow: var(--dsw-elevation-soft); }
 /* A container query does not match the container element, so word breaking is set
  * on descendants. URLs stay on `.rmr-mono` and may break anywhere. */
-.rmr * { overflow-wrap: normal; word-break: normal; }
+.rmr * { overflow-wrap: break-word; word-break: normal; }
 .rmr .rmr-mono,
-.rmr .rmr-mono * { overflow-wrap: anywhere; word-break: break-all; }
+.rmr .rmr-mono * { overflow-wrap: break-word; word-break: break-all; }
 @container remora (max-width: 360px) {
   /* Stack actions under the label and keep every control inside the column.
    * Buttons grow in height and wrap at spaces. Wider columns keep the row layout. */

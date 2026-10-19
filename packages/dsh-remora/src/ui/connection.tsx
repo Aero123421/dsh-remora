@@ -77,7 +77,7 @@ export function ConnectionSection({ snapshot, t, run, busy }: SectionProps) {
         <span className="rmr-muted">{t('conn.hostNameHint')}</span>
       </div>
       <div className="rmr-row-actions">
-        <Input value={hostName} maxLength={100} aria-label={t('conn.hostName')} disabled={busy} onChange={event => setHostName(event.target.value)}
+        <Input className="rmr-field" value={hostName} maxLength={100} aria-label={t('conn.hostName')} disabled={busy} onChange={event => setHostName(event.target.value)}
           onBlur={() => { if (hostName.trim() !== '' && hostName !== snapshot.settings.hostName) void run('settings', { hostName }) }} />
       </div>
     </div>

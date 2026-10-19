@@ -8,7 +8,7 @@ Remora の DSH プラグインです。DSH の設定画面に「Remora」タブ�
 
 対応する DSH: `>=0.2.1-alpha.2 <0.2.2-0`
 
-日本語の表示には [dsh-japanese](https://github.com/Aero123421/dsh-japanese) が必要です。言語を日本語にすると、設定の Remora も日本語になります。dsh-japanese が無いとき、および中国語では、Remora の文言は英語です。
+言語 `ja` が未登録のときだけ、Remora は dsh-japanese と同じく `ja`（表示名「日本語」、フォールバック `en`）を追加してから辞書を登録します。すでに `ja` があるときは追加しません。追加せずに呼ぶと id の重複で失敗します。dsh-japanese が登録した `ja` は、Remora を無効にしても残ります。Remora だけが `ja` を追加していた場合は、Remora を無効にするとその定義も外れ、表示は英語に戻ります。中国語向けの辞書は英語と同じ内容です。DSH 本体を日本語にするには [dsh-japanese](https://github.com/Aero123421/dsh-japanese) を入れてください。
 
 ## 使い方
 

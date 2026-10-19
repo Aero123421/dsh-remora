@@ -6,11 +6,26 @@ import { SnapshotStore } from './snapshot-store.ts'
 
 export type Translate = (key: CopyKey, params?: Record<string, unknown>) => string
 
+/** Built-in catalogs require `en` and `zh`. `zh` may be the English dictionary. */
+export interface LocaleCopy {
+  en: Record<string, string>
+  zh: Record<string, string>
+  [locale: string]: Record<string, string>
+}
+
+export interface LocaleLanguage {
+  id: string
+  label: string
+  fallback?: string
+}
+
 export interface Locale {
-  register(ns: string, copy: Record<string, Record<string, string>>): () => void
+  register(ns: string, copy: LocaleCopy): () => void
+  /** Adds a language. Throws when `id` is already registered. The disposer removes only this definition. */
+  addLanguage(input: { id: string; label: string; fallback: string }): () => void
   bind(ns: string): (key: string, params?: Record<string, unknown>) => string
   subscribe(listener: () => void): () => void
-  getSnapshot(): { revision: number }
+  getSnapshot(): { revision: number; active: string; locales: readonly LocaleLanguage[] }
 }
 
 export interface ClientContext {

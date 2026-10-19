@@ -1,25 +1,152 @@
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { en, ja } from '../src/locales.ts'
+import { installLocale } from '../src/locale-install.ts'
+import { en, ja, NS } from '../src/locales.ts'
+import type { Locale, LocaleCopy, LocaleLanguage } from '../src/ui/api.ts'
 
 const src = join(dirname(fileURLToPath(import.meta.url)), '../src')
 
-function files(dir: string): string[] {
-  return readdirSync(dir).flatMap(name => {
-    const path = join(dir, name)
-    return statSync(path).isDirectory() ? files(path) : [path]
-  })
+interface Language extends LocaleLanguage {
+  fallback?: string
 }
 
-test('the plugin registers its dictionaries and does not define the ja language', () => {
-  const client = readFileSync(join(src, 'client.tsx'), 'utf8')
-  assert.match(client, /ctx\.locale\.register\(NS, \{ en, ja \}\)/)
-  for (const path of files(src)) {
-    assert.equal(readFileSync(path, 'utf8').includes('addLanguage'), false, path)
+/** Catalog with the same disposer rules as DSH 0.2.1-rc.2. */
+function catalog(initial: Language[] = [
+  { id: 'en', label: 'English' },
+  { id: 'zh', label: '简体中文', fallback: 'en' },
+]) {
+  const languages = new Map(initial.map(language => [language.id, language]))
+  const dicts = new Map<string, Map<string, Record<string, string>>>()
+  let active = 'en'
+  let revision = 0
+  const locale: Locale = {
+    getSnapshot: () => ({ revision, active, locales: [...languages.values()] }),
+    addLanguage(input) {
+      if (languages.has(input.id)) throw new Error(`locale "${input.id}" is already registered`)
+      if (!languages.has(input.fallback)) throw new Error(`locale fallback "${input.fallback}" is not registered`)
+      const language = { ...input }
+      languages.set(input.id, language)
+      revision += 1
+      return () => {
+        if (languages.get(input.id) !== language) return
+        languages.delete(input.id)
+        if (active === input.id) active = 'en'
+        revision += 1
+      }
+    },
+    register(ns, copy) {
+      let table = dicts.get(ns)
+      if (!table) {
+        table = new Map()
+        dicts.set(ns, table)
+      }
+      const pairs = Object.entries(copy)
+      for (const [id] of pairs) if (table.has(id)) throw new Error(`locale namespace "${ns}" already has locale "${id}"`)
+      for (const [id, entries] of pairs) table.set(id, entries)
+      revision += 1
+      return () => {
+        let removed = false
+        for (const [id, entries] of pairs) {
+          if (table.get(id) === entries) {
+            table.delete(id)
+            removed = true
+          }
+        }
+        if (removed) revision += 1
+      }
+    },
+    bind: ns => (key, params) => {
+      const chain = fallback(active)
+      const table = dicts.get(ns)
+      let template = key
+      for (const id of chain) {
+        const value = table?.get(id)?.[key]
+        if (value !== undefined) {
+          template = value
+          break
+        }
+      }
+      if (!params) return template
+      return template.replace(/\{(\w+)\}/g, (match, name) => name in params ? String(params[name]) : match)
+    },
+    subscribe: () => () => {},
   }
+  function fallback(start: string): string[] {
+    const chain: string[] = []
+    const seen = new Set<string>()
+    let current = languages.get(start)
+    while (current && !seen.has(current.id)) {
+      seen.add(current.id)
+      chain.push(current.id)
+      current = current.fallback ? languages.get(current.fallback) : undefined
+    }
+    if (!seen.has('en')) chain.push('en')
+    return chain
+  }
+  const cleanups: Array<() => void> = []
+  const ctx = {
+    locale,
+    effect(setup: () => () => void) {
+      cleanups.push(setup())
+    },
+  }
+  return {
+    ctx,
+    locale,
+    dispose: () => {
+      for (const cleanup of [...cleanups].reverse()) cleanup()
+      cleanups.length = 0
+    },
+    hasJa: () => languages.has('ja'),
+    active: () => active,
+    setActive: (id: string) => {
+      active = id
+    },
+  }
+}
+
+test('ja is added only when the catalog does not already have it, then the dictionaries are registered', () => {
+  const client = readFileSync(join(src, 'client.tsx'), 'utf8')
+  assert.match(client, /installLocale\(ctx\)/)
+  const alone = catalog()
+  installLocale(alone.ctx)
+  assert.equal(alone.hasJa(), true)
+  alone.setActive('ja')
+  assert.equal(alone.locale.bind(NS)('kill.title'), ja['kill.title'])
+  assert.equal(alone.locale.bind(NS)('kill.title'), '緊急停止')
+  const zh = alone.locale.bind(NS)
+  alone.setActive('zh')
+  assert.equal(zh('kill.title'), en['kill.title'])
+  assert.notEqual(zh('kill.title'), 'kill.title')
+})
+
+test('turning Remora off leaves ja in place when dsh-japanese already defined it', () => {
+  const world = catalog([{ id: 'en', label: 'English' }, { id: 'zh', label: '简体中文', fallback: 'en' }, { id: 'ja', label: '日本語', fallback: 'en' }])
+  const japanese = { settings: '設定' }
+  world.locale.register('dsh.japanesePack', { en: { settings: 'Settings' }, zh: { settings: '设置' }, ja: japanese } satisfies LocaleCopy)
+  world.setActive('ja')
+  installLocale(world.ctx)
+  assert.equal(world.locale.bind(NS)('title'), 'Remora')
+  assert.equal(world.locale.bind('dsh.japanesePack')('settings'), '設定')
+  world.dispose()
+  assert.equal(world.hasJa(), true, 'ja defined by dsh-japanese stays after Remora is removed')
+  assert.equal(world.active(), 'ja')
+  assert.equal(world.locale.bind('dsh.japanesePack')('settings'), '設定')
+  assert.equal(world.locale.bind(NS)('kill.title'), 'kill.title', 'Remora dictionaries leave with the plugin')
+})
+
+test('turning Remora off removes ja when Remora was the plugin that defined it', () => {
+  const world = catalog()
+  installLocale(world.ctx)
+  world.setActive('ja')
+  assert.equal(world.locale.bind(NS)('conn.status'), ja['conn.status'])
+  world.dispose()
+  assert.equal(world.hasJa(), false)
+  assert.equal(world.active(), 'en')
+  assert.equal(world.locale.bind(NS)('conn.status'), 'conn.status')
 })
 
 test('every visible string has English and Japanese copy, so a missing language does not show the key', () => {
@@ -38,9 +165,12 @@ test('the narrow settings column keeps words intact and constrains inputs', () =
   const start = css.indexOf('@container remora (max-width: 360px)')
   const narrow = css.slice(start, css.indexOf('@media (max-width: 480px)'))
   assert.ok(start > 0)
-  assert.match(css, /\.rmr \{[^}]*overflow-wrap: normal; word-break: normal;/)
-  assert.match(css, /\.rmr \* \{ overflow-wrap: normal; word-break: normal; \}/)
-  assert.match(css, /\.rmr \.rmr-mono,\s*\n\.rmr \.rmr-mono \* \{ overflow-wrap: anywhere; word-break: break-all; \}/)
+  assert.match(css, /\.rmr \{[^}]*overflow-wrap: break-word; word-break: normal;/)
+  assert.match(css, /\.rmr \* \{ overflow-wrap: break-word; word-break: normal; \}/)
+  assert.match(css, /\.rmr \.rmr-mono,\s*\n\.rmr \.rmr-mono \* \{ overflow-wrap: break-word; word-break: break-all; \}/)
+  assert.match(css, /\.rmr-row-text \{[^}]*flex: 1 1 12rem;/)
+  assert.match(css, /\.rmr-field \{ width: 100%; min-width: 0;/)
+  assert.match(readFileSync(join(src, 'ui/connection.tsx'), 'utf8'), /<Input className="rmr-field"/)
   assert.match(narrow, /\.rmr-row-text \{ flex: 1 1 100%; width: 100%; min-width: 0; max-width: 100%; \}/)
   assert.match(narrow, /\.rmr :has\(> input\),\s*\n {2}\.rmr :has\(> textarea\) \{ width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; \}/)
   assert.match(narrow, /\.rmr input,\s*\n {2}\.rmr textarea \{ width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; \}/)
@@ -52,4 +182,5 @@ test('the narrow settings column keeps words intact and constrains inputs', () =
   assert.doesNotMatch(wide, /\.rmr-row \{[^}]*flex-direction:\s*column/)
   assert.doesNotMatch(wide, /\.rmr-row-text \{[^}]*flex-basis:\s*100%/)
   assert.doesNotMatch(wide, /\.rmr \{[^}]*overflow-wrap:\s*anywhere/)
+  assert.doesNotMatch(css, /overflow-wrap:\s*anywhere/)
 })
