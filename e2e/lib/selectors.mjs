@@ -88,16 +88,16 @@ export const hub = {
   tokenCreate: [testid('hub-token-create'), css('button[type="submit"]')],
   tokenValue: [testid('hub-secret'), css('pre#secret')],
   /** /connections: one card per client, a level <select> per host. */
-  clientCard: name => scope => scope.locator('article.card').filter({ hasText: name }),
+  clientCard: name => scope => scope.locator('[data-testid="hub-client"], article.card').filter({ hasText: name }),
   grantSelect: [testid('hub-grant-level'), css('select[name="level"]')],
   /** The page an attention item's answerUrl opens (/attention/<hostId>/<attentionId>). */
   attentionItem: [testid('hub-attention-item'), css('article.attention-item')],
-  questionOption: label => scope => scope.locator('label.check').filter({ hasText: label }).locator('input[type="radio"]'),
+  questionOption: label => scope => scope.locator('label.option, label.check').filter({ hasText: label }).locator('input[type="radio"]'),
   questionAnswer: [testid('hub-question-answer')],
   approvalAllow: [testid('hub-approval-allow')],
   approvalReject: [testid('hub-approval-reject')],
   /** Host page: the terminal form (inside a <details>) and session search. */
-  terminalOpen: scope => scope.locator('details.card').filter({ hasText: 'ターミナル' }).locator('summary'),
+  terminalOpen: scope => scope.locator('[data-testid="hub-terminal"] > summary, details.card:has-text("ターミナル") > summary'),
   terminalForm: [css('form[action$="/terminal"]')],
   /** /confirm/<hostId>/<id>: a parked command and its outcome. */
   confirmCommand: [testid('hub-confirm-command')],

@@ -29,9 +29,18 @@ Remora のハブです。自分の Cloudflare アカウントの無料枠で動�
 
 ## デプロイ
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Aero123421/dsh-remora/tree/main/hub)
+1. **SETUP_TOKEN を用意する**: 最初のパスキー登録で一度だけ使う合言葉です。32 文字程度のランダムな文字列を作り、パスワードマネージャーに控えてください（例: `openssl rand -base64 32`）。Cloudflare に入れた後は値を表示できません。
+2. **カスタムドメインを使うなら先に決める**: パスキーは開いたドメインに結び付きます。あとからドメインを変えると、パスキーの登録とクライアントの接続をやり直すことになります。`*.workers.dev` のまま使う場合は何もしなくて構いません。
+3. **ボタンでデプロイする**: 下のボタンを押すと、このフォルダが自分の GitHub に複製され、Cloudflare にデプロイされます。途中で `SETUP_TOKEN` を聞かれたら、1 の値を貼ります。
 
-ボタンを押すと、このフォルダが自分の GitHub に複製され、Cloudflare にデプロイされます。途中で `SETUP_TOKEN` を聞かれたら、長いランダムな文字列を入れてください。最初のパスキーを登録すると使えなくなる、一度きりの合言葉です。
+   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Aero123421/dsh-remora/tree/main/hub)
+
+4. **ハブを開く**: デプロイ完了の画面か、Cloudflare の「Workers & Pages → remora-hub」に出る URL（`https://remora-hub.<アカウント>.workers.dev` など）を開くと、初期設定の画面になります。SETUP_TOKEN を入れてパスキーを登録し、表示されるリカバリーコードを保管します。
+5. **続き**: ハブのホームにある「使い始める」の手順に沿って、DSH にプラグインを入れてペアリングします。
+
+SETUP_TOKEN を忘れたときは、Cloudflare の「Workers & Pages → remora-hub → 設定 → 変数とシークレット」で新しい値に上書きします。初期設定が済むと SETUP_TOKEN は使えなくなるので、その後は削除して構いません。
+
+画面は日本語・英語・中文で表示します。ブラウザの言語から選び、画面下の言語の切り替えで変えられます（選んだ言語はこのブラウザに保存します）。通知の文面は、通知をオンにしたときの言語で表示します。
 
 使うもの（無料枠のあるサービス）: Workers、Durable Objects（SQLite）、KV（OAuth のトークンだけ）、静的アセット（アイコン）。
 

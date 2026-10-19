@@ -39,7 +39,8 @@ test('URL client ids always go through the CIMD allowlist', () => {
 })
 
 test('attention helpers: answer urls, routes and push text', async () => {
-  const { answerRoute, answerUrl, pushText, stampAnswerUrls, countdownText } = await import('../../src/attention.ts')
+  const { answerRoute, answerUrl, pushText, stampAnswerUrls } = await import('../../src/attention.ts')
+  const { i18n } = await import('../../src/i18n/index.ts')
   assert.equal(answerUrl('https://hub.example.com', 'habc', 'approval:7/x'), 'https://hub.example.com/attention/habc/approval%3A7%2Fx')
   const result = { items: [{ attentionId: 'q1', hostId: 'h1', sessionId: 's', kind: 'question', title: 't', answerable: true, createdAt: null }], task: { attention: [{ attentionId: 'a1', hostId: 'h1', sessionId: 's', kind: 'approval', title: 't', answerable: false, createdAt: null }] }, other: { attentionId: 'x', kind: 'nope' } }
   stampAnswerUrls(result, 'https://hub.example.com')
@@ -54,8 +55,9 @@ test('attention helpers: answer urls, routes and push text', async () => {
   assert.equal(answerRoute({ kind: 'question', answerable: false }, now), 'dsh-web')
   assert.equal(answerRoute({ kind: 'plan-review', answerable: true }, now), 'remote')
   assert.equal(answerRoute({ kind: 'goal-stopped', answerable: true, answerVia: 'remote' }, now), 'dsh-web')
-  assert.equal(countdownText(now + 125_000, now), 'あと 2 分 05 秒')
-  assert.equal(countdownText(now - 1, now), '期限切れ')
+  assert.equal(i18n('ja').countdown(now + 125_000, now), 'あと 2 分 05 秒')
+  assert.equal(i18n('ja').countdown(now - 1, now), '期限切れ')
+  assert.equal(i18n('en').countdown(now + 7_380_000, now), '2 h 3 min left')
   assert.equal(pushText('Approve shell:\n rm -rf  build'), 'Approve shell: rm -rf build')
   assert.equal(pushText('token sk-abcdefghijklmnop and ghp_1234567890abcdef please'), 'token ••• and ••• please')
   assert.equal(Array.from(pushText('あ'.repeat(200))).length, 80)

@@ -3,6 +3,10 @@
 'use strict'
 
 ;(() => {
+  let strings = {}
+  try { strings = JSON.parse(document.body.dataset.i18n || '{}') } catch { strings = {} }
+  const tr = (key, vars) => String(strings[key] || key).replace(/\{(\w+)\}/g, (match, name) => (vars && name in vars ? String(vars[name]) : match))
+
   const toBytes = text => {
     const base64 = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4)
     const binary = atob(base64)
@@ -24,12 +28,13 @@
     if (!response.ok) throw new Error((data.error && data.error.message) || `HTTP ${response.status}`)
     return data
   }
+  const standalone = () => !!(window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true
+  const isIos = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
   const deviceLabel = () => {
     const ua = navigator.userAgent
-    const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android' : /Mac OS X/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : 'デバイス'
+    const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android' : /Mac OS X/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : tr('js.deviceFallback')
     const browser = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : ''
-    const standalone = window.matchMedia && window.matchMedia('(display-mode: standalone)').matches
-    return [os, browser, standalone ? '（ホーム画面）' : ''].filter(Boolean).join(' ')
+    return [os, browser, standalone() ? tr('js.deviceHome') : ''].filter(Boolean).join(' ')
   }
 
   document.addEventListener('DOMContentLoaded', async () => {
@@ -41,18 +46,19 @@
     const status = root.querySelector('[data-push-status]')
     const say = (message, kind) => {
       status.textContent = message
-      status.className = `flash ${kind || 'ok'}`
+      status.className = `notice ${kind === 'error' ? 'error' : 'ok'}`
       status.hidden = false
     }
     if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
-      root.querySelector('[data-push-unsupported]').hidden = false
+      // Safari on iPhone and iPad gets Web Push only in a Home Screen app.
+      root.querySelector(isIos() && !standalone() ? '[data-push-ios]' : '[data-push-unsupported]').hidden = false
       return
     }
     let registration
     try {
       registration = await navigator.serviceWorker.register('/sw.js', { scope: '/' })
     } catch (error) {
-      say(`サービスワーカーを登録できませんでした: ${error.message}`, 'error')
+      say(tr('js.pushWorkerFailed', { message: error.message }), 'error')
       return
     }
     let subscription = await registration.pushManager.getSubscription()
@@ -66,14 +72,15 @@
       off.hidden = !known
     }
     mark()
-    if (Notification.permission === 'denied') say('このサイトの通知はブラウザでブロックされています。ブラウザ（iPhone は設定アプリ）の通知設定から許可してください。', 'error')
+    if (Notification.permission === 'denied') say(tr('js.pushBlocked'), 'error')
 
     on.addEventListener('click', async () => {
+      on.disabled = true
       try {
         // Ask first, while the click still counts as a user gesture (Safari requires it).
         const permission = await Notification.requestPermission()
         if (permission !== 'granted') {
-          say('通知が許可されませんでした。', 'error')
+          say(tr('js.pushNotAllowed'), 'error')
           return
         }
         if (subscription && !sameKey(subscription, key)) {
@@ -82,13 +89,16 @@
         }
         subscription = subscription || await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: toBytes(key) })
         await post('/push/subscribe', { subscription: subscription.toJSON(), label: deviceLabel() })
-        location.assign('/settings?msg=push-saved#notifications')
+        location.assign('/settings?msg=push-on#notifications')
       } catch (error) {
-        say(`通知をオンにできませんでした: ${error.message}`, 'error')
+        say(tr('js.pushOnFailed', { message: error.message }), 'error')
+      } finally {
+        on.disabled = false
       }
     })
 
     off.addEventListener('click', async () => {
+      off.disabled = true
       try {
         if (subscription) {
           const endpoint = subscription.endpoint
@@ -97,7 +107,8 @@
         }
         location.assign('/settings?msg=push-removed#notifications')
       } catch (error) {
-        say(`通知を止められませんでした: ${error.message}`, 'error')
+        off.disabled = false
+        say(tr('js.pushOffFailed', { message: error.message }), 'error')
       }
     })
   })

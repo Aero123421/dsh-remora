@@ -38,8 +38,8 @@ describe('owner pages', () => {
     expect(home).toContain('リモート全権')
     expect(home).toContain('無料枠')
     expect(home).toContain('実行時間・保存容量などは含みません')
-    expect(home).toContain('Free プランは無料枠の上限で利用が止まります')
-    expect(home).toContain('Paid プランでは超過分が課金')
+    expect(home).toContain('Workers Free では無料枠の上限で利用が止まります')
+    expect(home).toContain('Workers Paid では超えた分が課金')
 
     const hostPage = await (await owner.browser.fetch(`/hosts/${host.hostId}`)).text()
     expect(hostPage).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
@@ -48,7 +48,7 @@ describe('owner pages', () => {
 
     const sessionPage = await (await owner.browser.fetch(`/hosts/${host.hostId}/sessions/s1`)).text()
     expect(sessionPage).toContain('deepseek / v4 / high')
-    expect(sessionPage).toContain('DSH Web で誰かがこのセッションを見ています')
+    expect(sessionPage).toContain('DSH Web でこのセッションが開かれています')
     expect(sessionPage).toContain('hello &lt;i&gt;there&lt;/i&gt;')
 
     // Sending a prompt from the session page starts a task and shows it.
@@ -64,9 +64,9 @@ describe('owner pages', () => {
     const attention = await (await owner.browser.fetch('/attention')).text()
     expect(attention).toContain('Which file?')
     expect(attention).toContain('data-confirm-op="approval.respond"')
-    expect(attention).toContain('<details class="confirm-preview"><summary>パスキーで署名する内容</summary>')
-    expect(attention).not.toContain('<details class="confirm-preview" open')
-    expect(attention).toContain('tool-ask-user を timed に切り替える')
+    expect(attention).toContain('<details class="plain confirm-preview"><summary>パスキーで署名する内容</summary>')
+    expect(attention).not.toContain('confirm-preview" open')
+    expect(attention).toContain('legacy モードのため')
     const answered = await owner.browser.postForm('/attention/respond', { hostId: host.hostId, sessionId: 's1', attentionId: 'q1', optionId: 'a' })
     expect(answered.headers.get('location')).toBe('/attention?msg=sent')
 
@@ -85,8 +85,8 @@ describe('owner pages', () => {
     expect(connections).toContain('chatgpt.com/plugins')
 
     const settings = await (await owner.browser.fetch('/settings')).text()
-    expect(settings).toContain('パスキー（1 本）')
-    expect(settings).toContain('2 本以上')
+    expect(settings).toContain('<h2>パスキー <span class="count">1</span></h2>')
+    expect(settings).toContain('2 本目のパスキー')
 
     const audit = await (await owner.browser.fetch('/audit')).text()
     expect(audit).toContain('ハッシュ連鎖は正常')

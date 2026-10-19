@@ -22,7 +22,8 @@ import { ACCESS_TOKEN_TTL_S, RATE_LIMITS, REFRESH_TOKEN_IDLE_TTL_S, REFRESH_TOKE
 import { bodyText, clientIp, html, json, readForm, redirect, sameOrigin } from './http.ts'
 import { countingKv, hubStub } from './meter.ts'
 import type { ClientKind } from './types.ts'
-import { flash, h, page, raw, type Raw } from './ui/layout.ts'
+import { flash, h, narrowHtml, pageHead, raw, uiFor, type Raw, type Ui } from './ui/layout.ts'
+import type { MessageKey } from './i18n/index.ts'
 import { randomToken } from './util.ts'
 import { CLI_CLIENT_ID, ENDPOINTS, SCOPES, resourceIndicators, formatUserCode, normalizeUserCode, sha256, toBase64Url } from './vendor/protocol/index.ts'
 
@@ -124,7 +125,7 @@ export function oauthFor(origin: string, env: Env): OAuthSetup {
       if (token.startsWith('rmr_pat_')) {
         const pat = await hubStub(env).validatePersonalToken(token)
         if (!pat) return null
-        return { props: { clientId: `pat:${pat.id}`, clientName: `個人トークン: ${pat.name}` }, audience: resource, scope: pat.scopes, expiresAt: Math.floor(pat.expiresAt / 1000), clientId: `pat:${pat.id}`, userId: 'owner' }
+        return { props: { clientId: `pat:${pat.id}`, clientName: pat.name }, audience: resource, scope: pat.scopes, expiresAt: Math.floor(pat.expiresAt / 1000), clientId: `pat:${pat.id}`, userId: 'owner' }
       }
       return viaServer(env)(resource, token)
     },
@@ -230,29 +231,41 @@ function oauthApi(setup: OAuthSetup, env: Env): OAuthHelpers {
   return setup.server.getOAuthApi(oauthEnv(env))
 }
 
-function errorPage(title: string, message: string, status = 400): Response {
-  return html(page({ title, narrow: true, body: h`<h1>${title}</h1><p class="lead">${message}</p><p><a class="button" href="/">ホームへ</a></p>` }), { status })
+function errorPage(ui: Ui, title: MessageKey, message: string, status = 400): Response {
+  return html(narrowHtml(ui, ui.t(title), h`${pageHead(ui.t(title), { subtitle: message })}<div class="actions"><a class="btn" href="/">${ui.t('notFound.home')}</a></div>`), { status })
 }
 
-const SCOPE_LABEL: Readonly<Record<string, string>> = {
-  'dsh.read': '一覧と状態を見る（ホスト、ワークスペース、セッション、要対応）',
-  'dsh.content': '会話の本文・差分・成果物を読む',
-  'dsh.tasks': 'タスクを依頼する・追加指示・取り消し・質問への回答',
-  'dsh.admin': '危険な操作（リモート全権でのみ、パスキー確認つき）',
-  offline_access: 'ログインを保つ（更新トークン）',
+function scopeLabel(ui: Ui, scope: string): string {
+  const key = `scope.${scope}`
+  return key in SCOPE_KEYS ? ui.t(SCOPE_KEYS[key] as MessageKey) : scope
 }
 
-function scopeChoices(requested: string[]): Raw {
+const SCOPE_KEYS: Readonly<Record<string, MessageKey>> = {
+  'scope.dsh.read': 'scope.dsh.read',
+  'scope.dsh.content': 'scope.dsh.content',
+  'scope.dsh.tasks': 'scope.dsh.tasks',
+  'scope.dsh.admin': 'scope.dsh.admin',
+  'scope.offline_access': 'scope.offline_access',
+}
+
+/**
+ * The scopes the owner grants. What the client asked for is pre-selected,
+ * except `dsh.admin` for clients other than the Remora CLI: apps that ask
+ * for every advertised scope should not get it by default.
+ */
+function scopeChoices(ui: Ui, requested: string[], clientId: string): Raw {
   const asked = requested.filter(scope => (SCOPES as readonly string[]).includes(scope))
-  const defaults = asked.length > 0 ? asked : DEFAULT_SCOPES
-  return h`<fieldset class="scopes"><legend>許可する範囲</legend>
-${SCOPES.map(scope => h`<label class="check"><input type="checkbox" name="scope" value="${scope}"${raw(defaults.includes(scope) ? ' checked' : '')}> <span><code>${scope}</code> ${SCOPE_LABEL[scope] ?? ''}</span></label>`)}
-${requested.includes(OFFLINE_ACCESS) ? h`<input type="hidden" name="scope" value="${OFFLINE_ACCESS}"><p class="muted">${SCOPE_LABEL[OFFLINE_ACCESS] ?? ''}</p>` : ''}
+  const defaults = (asked.length > 0 ? asked : DEFAULT_SCOPES).filter(scope => scope !== 'dsh.admin' || clientId === CLI_CLIENT_ID)
+  return h`<fieldset class="scopes"><legend>${ui.t('consent.scopes')}</legend>
+${SCOPES.map(scope => h`<label class="check"><input type="checkbox" name="scope" value="${scope}"${raw(defaults.includes(scope) ? ' checked' : '')}> <span>${scopeLabel(ui, scope)} <span class="faint mono small">${scope}</span>${scope === 'dsh.admin' ? h` <span class="tag danger">${ui.t('consent.adminTag')}</span>` : ''}</span></label>`)}
+${requested.includes(OFFLINE_ACCESS) ? h`<input type="hidden" name="scope" value="${OFFLINE_ACCESS}"><p class="muted small">${scopeLabel(ui, OFFLINE_ACCESS)}</p>` : ''}
 </fieldset>`
 }
 
 async function authorizeGet(request: Request, env: Env, setup: OAuthSetup): Promise<Response> {
   const url = new URL(request.url)
+  const ui = uiFor(request)
+  const { t } = ui
   if (url.searchParams.get('client_id') === CLI_CLIENT_ID) await ensureCliClient(env)
   const oauth = oauthApi(setup, env)
   let authRequest: AuthRequest
@@ -261,51 +274,50 @@ async function authorizeGet(request: Request, env: Env, setup: OAuthSetup): Prom
   } catch (error) {
     if (error instanceof AuthorizationError) {
       if (error.redirectTo) return redirect(error.redirectTo, {}, 302)
-      return errorPage('接続できません', `認可リクエストが正しくありません: ${error.description}`)
+      return errorPage(ui, 'consent.cannotConnect', t('consent.badRequest', { detail: error.description }))
     }
-    if (error instanceof CimdFetchError) return errorPage('接続できません', 'クライアントのメタデータ文書を取得できませんでした。')
+    if (error instanceof CimdFetchError) return errorPage(ui, 'consent.cannotConnect', t('consent.metadataFailed'))
     throw error
   }
   const hub = hubStub(env)
   const state = await hub.state()
   const policy = clientPolicy(authRequest.clientId, authRequest.redirectUri, { allowOtherClients: state.allowOtherClients, dcr: dcrEnabled(env) })
   if (!policy.allowed) {
-    return errorPage('このクライアントは許可されていません', policy.reason === 'dcr-disabled'
-      ? '動的クライアント登録（DCR）はこのハブでは無効です。'
-      : '既知のクライアント（ChatGPT、Claude、Claude Code、Remora CLI）以外は既定で拒否します。必要なら設定で「その他のクライアントを許可」をオンにしてください。', 403)
+    return errorPage(ui, 'consent.notAllowed', policy.reason === 'dcr-disabled' ? t('consent.dcrOff') : t('consent.notListed'), 403)
   }
   const session = await getSession(request, env)
   if (!session) return redirect(`/login?next=${encodeURIComponent(url.pathname + url.search)}`)
   const details = await oauth.describeConsent(authRequest)
   const known = knownClientName(authRequest.clientId, authRequest.redirectUri)
   const consent = await oauth.beginConsent(authRequest)
-  const body = h`<h1>接続を許可しますか</h1>
-<div class="consent">
-  <p class="client-name">${known ?? details.clientName}</p>
+  const body = h`${pageHead(t('consent.title'))}
+<div class="box"><div class="box-pad">
+  <p class="consent-name">${known ?? details.clientName}</p>
   ${details.clientDomain
-    ? h`<p>発行元: <strong class="big">${details.clientDomain}</strong>${known ? h` <span class="badge ok">既知のクライアント</span>` : h` <span class="badge warn">許可リスト外</span>`}</p>`
-    : h`<p>${authRequest.clientId === CLI_CLIENT_ID ? 'Remora CLI（ハブに組み込みのクライアント）' : '自己申告の名前です（ドメインは確認できません）。'}</p>`}
-  <p>トークンの送り先: <strong class="big">${details.redirectHost}</strong></p>
-  ${details.redirectIsLoopback ? h`<p class="flash error">送り先はこのパソコン上のアプリです。今ちょうど自分でログインを始めたときだけ許可してください。</p>` : ''}
-  <p class="muted">新しいクライアントは、どのホストでも「見るだけ」から始まります。依頼まで許すには、許可したあと「接続」画面で広げてください。</p>
-</div>
-<form method="post" action="${ENDPOINTS.authorize}" data-reauth>
+    ? h`<p class="muted">${t('consent.domain')} <strong>${details.clientDomain}</strong> ${known ? h`<span class="tag ok">${t('consent.known')}</span>` : h`<span class="tag warn">${t('consent.unlisted')}</span>`}</p>`
+    : h`<p class="muted">${authRequest.clientId === CLI_CLIENT_ID ? t('consent.cli') : t('consent.selfNamed')}</p>`}
+</div><dl class="kv"><dt>${t('consent.redirect')}</dt><dd><strong>${details.redirectHost}</strong></dd></dl></div>
+${details.redirectIsLoopback ? h`<div class="notice warn mt">${t('consent.loopback')}</div>` : ''}
+<form method="post" action="${ENDPOINTS.authorize}" data-reauth class="stack mt">
   <input type="hidden" name="handle" value="${consent.handle}">
-  ${scopeChoices(authRequest.scope)}
+  ${scopeChoices(ui, authRequest.scope, authRequest.clientId)}
+  <p class="muted small">${t('consent.startsView')}</p>
   <div class="actions">
-    <button class="primary" type="submit" name="decision" value="approve">パスキーで確認して許可</button>
-    <button type="submit" name="decision" value="deny" data-no-reauth>拒否</button>
+    <button class="primary" type="submit" name="decision" value="approve" data-testid="hub-consent-approve">${t('consent.approve')}</button>
+    <button type="submit" name="decision" value="deny" data-no-reauth>${t('consent.deny')}</button>
   </div>
+  <div data-status role="status" hidden></div>
 </form>`
   const headers = consent.headers
-  return html(page({ title: '接続の許可', narrow: true, body, scripts: ['/js/webauthn.js'] }), { headers })
+  return html(narrowHtml(ui, t('consent.title'), body), { headers })
 }
 
 async function authorizePost(request: Request, env: Env, setup: OAuthSetup): Promise<Response> {
   const origin = hubOrigin(request, env)
-  if (!sameOrigin(request, origin)) return errorPage('拒否しました', '別のサイトからの送信は受け付けません。', 403)
+  const ui = uiFor(request)
+  if (!sameOrigin(request, origin)) return errorPage(ui, 'consent.refused', ui.t('consent.crossSite'), 403)
   const session = await getSession(request, env)
-  if (!session) return errorPage('ログインが必要です', 'もう一度接続をやり直してください。', 403)
+  if (!session) return errorPage(ui, 'consent.signIn', ui.t('consent.signInAgain'), 403)
   const form = await readForm(request.clone())
   const handle = form.get('handle') ?? ''
   const oauth = oauthApi(setup, env)
@@ -314,12 +326,12 @@ async function authorizePost(request: Request, env: Env, setup: OAuthSetup): Pro
       const denied = await oauth.denyConsent(request, handle)
       return new Response(null, { status: 302, headers: denied.headers })
     }
-    if (!session.fresh) return errorPage('パスキーでの確認が必要です', '許可するには、ボタンを押してパスキーで確認してください。', 403)
+    if (!session.fresh) return errorPage(ui, 'consent.reauth', ui.t('consent.reauthLead'), 403)
     const scopes = form.getAll('scope').filter(scope => (SCOPES as readonly string[]).includes(scope) || scope === OFFLINE_ACCESS)
     const approved = await oauth.approveConsent(request, handle, { scope: scopes })
     const state = await hubStub(env).state()
     const policy = clientPolicy(approved.request.clientId, approved.request.redirectUri, { allowOtherClients: state.allowOtherClients, dcr: dcrEnabled(env) })
-    if (!policy.allowed) return errorPage('このクライアントは許可されていません', '許可リストが変わりました。', 403)
+    if (!policy.allowed) return errorPage(ui, 'consent.notAllowed', ui.t('consent.listChanged'), 403)
     const details = await oauth.describeConsent(approved.request)
     const name = knownClientName(approved.request.clientId, approved.request.redirectUri) ?? details.clientName
     const { redirectTo } = await oauth.completeAuthorization({
@@ -335,7 +347,7 @@ async function authorizePost(request: Request, env: Env, setup: OAuthSetup): Pro
     approved.headers.set('location', redirectTo)
     return new Response(null, { status: 302, headers: approved.headers })
   } catch (error) {
-    if (error instanceof AuthorizationError) return errorPage('接続できません', `認可を完了できませんでした: ${error.description}`)
+    if (error instanceof AuthorizationError) return errorPage(ui, 'consent.cannotConnect', ui.t('consent.failed', { detail: error.description }))
     throw error
   }
 }
@@ -396,47 +408,50 @@ async function deviceToken(form: URLSearchParams, env: Env, ctx: ExecutionContex
 
 async function deviceGet(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url)
+  const ui = uiFor(request)
+  const { t } = ui
   const session = await getSession(request, env)
   if (!session) return redirect(`/login?next=${encodeURIComponent(url.pathname + url.search)}`)
   const code = normalizeUserCode(url.searchParams.get('code') ?? '')
   const info = code ? await hubStub(env).deviceLookup(code) : null
   const status = url.searchParams.get('done')
   let body: Raw
-  if (status === 'approved') body = h`<h1>許可しました</h1><p class="lead">CLI に戻ってください。数秒でログインが完了します。</p>`
-  else if (status === 'denied') body = h`<h1>拒否しました</h1><p class="lead">CLI のログインは失敗します。</p>`
+  if (status === 'approved') body = pageHead(t('device.approvedTitle'), { subtitle: t('device.approvedLead') })
+  else if (status === 'denied') body = pageHead(t('device.deniedTitle'), { subtitle: t('device.deniedLead') })
   else if (!info || info.status !== 'pending') {
-    body = h`<h1>CLI のログイン</h1>
-${code ? flash('コードが見つからないか、期限が切れています。', 'error') : ''}
-<p class="lead">ターミナルに表示されたコードを入力してください。</p>
+    body = h`${pageHead(t('device.title'), { subtitle: t('device.lead') })}
+${code ? flash(t('device.notFound'), 'error') : ''}
 <form method="get" action="${ENDPOINTS.deviceVerify}" class="stack">
-  <input name="code" inputmode="text" autocomplete="one-time-code" placeholder="XXXX-XXXX" maxlength="9" required>
-  <button class="primary" type="submit">次へ</button>
+  <label class="field"><span class="label">${t('device.code')}</span><input name="code" inputmode="text" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" placeholder="XXXX-XXXX" maxlength="12" required class="code-big"></label>
+  <button class="primary" type="submit">${t('pair.next')}</button>
 </form>`
   } else {
-    body = h`<h1>CLI のログインを許可しますか</h1>
-<div class="consent">
-  <p class="client-name">Remora CLI</p>
-  <p>コード: <strong class="big code">${formatUserCode(info.userCode)}</strong></p>
-  <p class="muted">ターミナルに表示されているコードと一致するか確かめてください。一致しないときは拒否してください。</p>
-  <p>範囲: ${info.scope.map(scope => h`<code>${scope}</code> `)}</p>
-  <p class="muted">送り先: ${info.resource}</p>
-</div>
+    body = h`${pageHead(t('device.confirmTitle'))}
+<div class="box"><dl class="kv">
+  <dt>${t('device.client')}</dt><dd><strong>Remora CLI</strong></dd>
+  <dt>${t('device.code')}</dt><dd><span class="code-big">${formatUserCode(info.userCode)}</span></dd>
+  <dt>${t('consent.scopes')}</dt><dd>${info.scope.map(scope => h`<div>${scopeLabel(ui, scope)} <span class="faint mono small">${scope}</span></div>`)}</dd>
+  <dt>${t('device.resource')}</dt><dd>${info.resource.endsWith('/mcp') ? 'MCP' : 'HTTP API'} <span class="faint mono small">${info.resource}</span></dd>
+</dl></div>
+<div class="notice warn mt">${t('device.check')}</div>
 <form method="post" action="${ENDPOINTS.deviceVerify}" data-reauth>
   <input type="hidden" name="code" value="${info.userCode}">
   <div class="actions">
-    <button class="primary" type="submit" name="decision" value="approve">パスキーで確認して許可</button>
-    <button type="submit" name="decision" value="deny" data-no-reauth>拒否</button>
+    <button class="primary" type="submit" name="decision" value="approve">${t('consent.approve')}</button>
+    <button type="submit" name="decision" value="deny" data-no-reauth>${t('consent.deny')}</button>
   </div>
+  <div data-status role="status" hidden></div>
 </form>`
   }
-  return html(page({ title: 'CLI のログイン', narrow: true, body, scripts: ['/js/webauthn.js'] }))
+  return html(narrowHtml(ui, t('device.title'), body))
 }
 
 async function devicePost(request: Request, env: Env, setup: OAuthSetup): Promise<Response> {
   const origin = hubOrigin(request, env)
-  if (!sameOrigin(request, origin)) return errorPage('拒否しました', '別のサイトからの送信は受け付けません。', 403)
+  const ui = uiFor(request)
+  if (!sameOrigin(request, origin)) return errorPage(ui, 'consent.refused', ui.t('consent.crossSite'), 403)
   const session = await getSession(request, env)
-  if (!session) return errorPage('ログインが必要です', 'もう一度やり直してください。', 403)
+  if (!session) return errorPage(ui, 'consent.signIn', ui.t('consent.signInAgain'), 403)
   const form = await readForm(request)
   const code = normalizeUserCode(form.get('code') ?? '')
   const hub = hubStub(env)
@@ -446,7 +461,7 @@ async function devicePost(request: Request, env: Env, setup: OAuthSetup): Promis
     await hub.deviceDecide(code, { approve: false })
     return redirect(`${ENDPOINTS.deviceVerify}?done=denied`)
   }
-  if (!session.fresh) return errorPage('パスキーでの確認が必要です', '許可するには、ボタンを押してパスキーで確認してください。', 403)
+  if (!session.fresh) return errorPage(ui, 'consent.reauth', ui.t('consent.reauthLead'), 403)
   await ensureCliClient(env)
   const codeVerifier = randomToken(48)
   const codeChallenge = toBase64Url(await sha256(codeVerifier))
@@ -472,7 +487,7 @@ async function devicePost(request: Request, env: Env, setup: OAuthSetup): Promis
     revokeExistingGrants: false,
   })
   const authCode = new URL(redirectTo).searchParams.get('code')
-  if (!authCode) return errorPage('許可できませんでした', '認可コードを発行できませんでした。', 500)
+  if (!authCode) return errorPage(ui, 'device.failedTitle', ui.t('device.failedLead'), 500)
   await hub.deviceDecide(code, { approve: true, authCode, codeVerifier, redirectUri })
   await hub.upsertClient({ clientId: CLI_CLIENT_ID, name: 'Remora CLI', kind: 'cli', domain: null, redirectHost: '127.0.0.1' })
   return redirect(`${ENDPOINTS.deviceVerify}?done=approved`)

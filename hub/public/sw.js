@@ -1,24 +1,85 @@
 // Remora hub service worker: shows Web Push notifications and opens the
-// right hub page when one is tapped. Payloads carry no conversation content.
+// right hub page when one is tapped. Payloads carry no conversation content,
+// only codes; the text is chosen here in the device's language (the hub
+// stores the page language with each subscription).
 'use strict'
 
-const LABELS = {
-  approval: '承認待ち',
-  question: 'AI からの質問',
-  'plan-review': 'プランの確認',
-  confirmation: 'パスキーでの確認待ち',
-  'task-completed': 'タスクが完了しました',
-  'task-failed': 'タスクが失敗しました',
-  'host-offline': 'オフラインになりました',
-  'host-online': '再接続しました',
-  test: 'Remora のテスト通知',
+const TEXT = {
+  en: {
+    kinds: {
+      approval: 'Approval needed',
+      question: 'Question from the agent',
+      'plan-review': 'Plan to review',
+      confirmation: 'Passkey confirmation needed',
+      'task-completed': 'Task completed',
+      'task-failed': 'Task failed',
+      'host-offline': 'went offline',
+      'host-online': 'is back online',
+      test: 'Remora test notification',
+    },
+    ops: { 'terminal.run': 'Run a terminal command', 'host.rotate-key': 'Rotate host key', 'audit.export': 'Export audit log', 'hub.export': 'Export hub settings' },
+    test: 'If you can read this, notifications work.',
+    expired: 'Expired',
+    hours: (h, m) => `${h} h ${m} min left`,
+    minutes: m => `${m} min left`,
+    more: n => `and ${n} more`,
+    hostEvent: (host, label) => `${host} ${label}`,
+    titled: (label, host) => `${label} · ${host}`,
+  },
+  ja: {
+    kinds: {
+      approval: '承認待ち',
+      question: 'AI からの質問',
+      'plan-review': 'プランの確認',
+      confirmation: 'パスキーでの確認待ち',
+      'task-completed': 'タスクが完了しました',
+      'task-failed': 'タスクが失敗しました',
+      'host-offline': 'がオフラインになりました',
+      'host-online': 'が再接続しました',
+      test: 'Remora のテスト通知',
+    },
+    ops: { 'terminal.run': 'ターミナルでコマンドを実行', 'host.rotate-key': 'ホスト鍵の更新', 'audit.export': '監査ログの書き出し', 'hub.export': 'ハブ設定の書き出し' },
+    test: 'これが読めていれば、通知は届いています。',
+    expired: '期限切れ',
+    hours: (h, m) => `あと ${h} 時間 ${m} 分`,
+    minutes: m => `あと ${m} 分`,
+    more: n => `ほか ${n} 件`,
+    hostEvent: (host, label) => `${host} ${label}`,
+    titled: (label, host) => `${label}（${host}）`,
+  },
+  zh: {
+    kinds: {
+      approval: '需要审批',
+      question: '智能体提问',
+      'plan-review': '需要审阅计划',
+      confirmation: '需要通行密钥确认',
+      'task-completed': '任务已完成',
+      'task-failed': '任务失败',
+      'host-offline': '已离线',
+      'host-online': '已重新连接',
+      test: 'Remora 测试通知',
+    },
+    ops: { 'terminal.run': '运行终端命令', 'host.rotate-key': '轮换主机密钥', 'audit.export': '导出审计日志', 'hub.export': '导出中枢设置' },
+    test: '能看到这条消息，说明通知已送达。',
+    expired: '已过期',
+    hours: (h, m) => `剩余 ${h} 小时 ${m} 分`,
+    minutes: m => `剩余 ${m} 分钟`,
+    more: n => `另有 ${n} 条`,
+    hostEvent: (host, label) => `${host} ${label}`,
+    titled: (label, host) => `${label}（${host}）`,
+  },
 }
 
-const left = expiresAt => {
+const pick = lang => {
+  const base = String(lang || (self.navigator && self.navigator.language) || 'en').toLowerCase().split('-')[0]
+  return TEXT[base] || TEXT.en
+}
+
+const left = (text, expiresAt) => {
   const ms = expiresAt - Date.now()
-  if (ms <= 0) return '期限切れ'
+  if (ms <= 0) return text.expired
   const minutes = Math.ceil(ms / 60000)
-  return minutes >= 60 ? `あと ${Math.floor(minutes / 60)} 時間 ${minutes % 60} 分` : `あと ${minutes} 分`
+  return minutes >= 60 ? text.hours(Math.floor(minutes / 60), minutes % 60) : text.minutes(minutes)
 }
 
 const sameOriginPath = url => {
@@ -40,14 +101,17 @@ self.addEventListener('push', event => {
   } catch {
     data = {}
   }
+  const text = pick(data.lang)
   const kind = String(data.kind || 'test')
   const host = String(data.host || '').slice(0, 60)
-  const label = LABELS[kind] || 'Remora'
-  const title = kind.startsWith('host-') ? `${host} が${label}` : host && kind !== 'test' ? `${label}（${host}）` : label
+  const label = text.kinds[kind] || 'Remora'
+  const title = kind.startsWith('host-') ? text.hostEvent(host, label) : host && kind !== 'test' ? text.titled(label, host) : label
   const lines = []
+  if (kind === 'test') lines.push(text.test)
+  if (data.op) lines.push(text.ops[String(data.op)] || String(data.op))
   if (data.title) lines.push(String(data.title).slice(0, 80))
-  if (typeof data.expiresAt === 'number') lines.push(left(data.expiresAt))
-  if (typeof data.count === 'number' && data.count > 1) lines.push(`ほか ${data.count - 1} 件`)
+  if (typeof data.expiresAt === 'number') lines.push(left(text, data.expiresAt))
+  if (typeof data.count === 'number' && data.count > 1) lines.push(text.more(data.count - 1))
   const attention = kind === 'approval' || kind === 'question' || kind === 'plan-review' || kind === 'confirmation'
   event.waitUntil(self.registration.showNotification(title, {
     body: lines.join('\n'),

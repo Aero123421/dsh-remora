@@ -27,5 +27,12 @@
     "@cloudflare/workers-oauth-provider": "1.2.3",
     "@modelcontextprotocol/sdk": "1.30.1",
     "@simplewebauthn/server": "14.0.3"
+  },
+  "cloudflare": {
+    "bindings": {
+      "SETUP_TOKEN": {
+        "description": "One-time secret for registering the first passkey (16+ characters). Generate a long random value, keep a copy, and enter it on the hub's setup page. 最初のパスキー登録に一度だけ使う合言葉（16 文字以上）。控えておき、ハブの初期設定画面で入力します。"
+      }
+    }
   }
 }

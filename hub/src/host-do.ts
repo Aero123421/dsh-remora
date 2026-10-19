@@ -1005,8 +1005,7 @@ export class HostDO extends DurableObject<Env> {
     await this.scheduleAlarm()
     if (call.actor.clientId !== OWNER_CLIENT_ID) {
       // Like every notification, no content: who asks for what kind of operation, not the command.
-      const what = call.op === 'terminal.run' ? 'コマンドの実行' : call.op === 'host.rotate-key' ? 'ホスト鍵の更新' : call.op
-      this.push([{ type: 'attention', kind: 'confirmation', hostId: this.hostId, host: this.displayName(), title: pushText(`${call.actor.clientName}: ${what}`), url: `/confirm/${this.hostId ?? ''}/${id}`, expiresAt: now + CONFIRMATION_REQUEST_TTL_MS }])
+      this.push([{ type: 'attention', kind: 'confirmation', hostId: this.hostId, host: this.displayName(), title: pushText(call.actor.clientName, 40), op: call.op, url: `/confirm/${this.hostId ?? ''}/${id}`, expiresAt: now + CONFIRMATION_REQUEST_TTL_MS }])
     }
     return { ok: true, result: this.confirmationInfo(this.confirmationRow(id) as ConfirmationRow, call.origin) }
   }

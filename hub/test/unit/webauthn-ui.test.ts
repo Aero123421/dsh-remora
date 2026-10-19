@@ -41,6 +41,7 @@ function ui(kind: 'add' | 'grant', stale = false) {
     PublicKeyCredential: { parseCreationOptionsFromJSON: (options: unknown) => options, parseRequestOptionsFromJSON: (options: unknown) => options },
     navigator: { credentials },
     document: {
+      body: { dataset: { i18n: JSON.stringify({ 'js.grantUnsaved': 'Not saved. Choose the level again.' }) } },
       addEventListener(_type: string, handler: () => void) { ready = handler },
       querySelectorAll(selector: string) {
         if (kind === 'add' && selector === 'form[data-add-passkey]') return [form]
@@ -83,7 +84,7 @@ test('cancelled grant autosave shows the saved scope, preserves an accessible re
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(page.select.value, 'full')
   assert.equal(page.status.hidden, false)
-  assert.match(page.status.textContent, /変更は保存されていません/)
+  assert.match(page.status.textContent, /Not saved/)
   assert.equal(page.button.disabled, false)
   assert.equal(page.select.disabled, false)
   assert.ok(!page.calls.some(call => call.startsWith('submit:')))

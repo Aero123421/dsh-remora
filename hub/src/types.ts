@@ -128,6 +128,8 @@ export interface PushEvent {
   /** A path on the hub, opened when the notification is tapped. */
   url: string
   expiresAt?: number | null
+  /** For a confirmation: the operation waiting for the passkey, named by the service worker in the device's language. */
+  op?: string
 }
 
 export interface PushDevice {
