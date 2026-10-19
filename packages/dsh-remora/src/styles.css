@@ -1,5 +1,5 @@
 /* Remora settings tab. Colors come from DSH's theme tokens so the page follows light/dark themes. */
-.rmr { display: flex; flex-direction: column; gap: 20px; width: 100%; min-width: 0; container: remora / inline-size; color: var(--dsw-alias-label-primary); font-size: 14px; line-height: 20px; overflow-wrap: anywhere; }
+.rmr { display: flex; flex-direction: column; gap: 20px; width: 100%; min-width: 0; container: remora / inline-size; color: var(--dsw-alias-label-primary); font-size: 14px; line-height: 20px; overflow-wrap: normal; word-break: normal; }
 .rmr p { margin: 0; }
 .rmr h3 { margin: 0; font-size: 14px; font-weight: 600; line-height: 20px; }
 .rmr-header { display: flex; flex-direction: column; gap: 6px; }
@@ -7,7 +7,7 @@
 .rmr-title { margin: 0; font-size: 18px; font-weight: 600; line-height: 26px; }
 .rmr-muted { color: var(--dsw-alias-label-secondary); font-size: 12px; line-height: 18px; }
 .rmr-faint { color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 18px; }
-.rmr-mono { font-family: var(--dsw-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; word-break: break-all; }
+.rmr-mono { font-family: var(--dsw-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; overflow-wrap: anywhere; word-break: break-all; }
 .rmr-section { display: flex; flex-direction: column; }
 .rmr-section-head { display: flex; flex-direction: column; gap: 4px; padding: 4px 0 8px; }
 .rmr-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 14px 0; border-bottom: 0.5px solid var(--dsw-alias-border-l2); }
@@ -50,7 +50,7 @@
 .rmr-notes { max-height: 240px; overflow: auto; white-space: pre-wrap; padding: 10px 12px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2); font-size: 12px; line-height: 18px; }
 /* Keep short segmented choices within the settings column. */
 .rmr [role="tablist"] { grid-auto-columns: minmax(0, 1fr); min-width: 0; max-width: 100%; }
-.rmr [role="tablist"] > [role="tab"] { min-width: 0; min-height: 28px; height: auto; padding: 4px 8px; white-space: normal; overflow-wrap: anywhere; }
+.rmr [role="tablist"] > [role="tab"] { min-width: 0; min-height: 28px; height: auto; padding: 4px 8px; white-space: normal; overflow-wrap: normal; word-break: normal; }
 /* Navigation labels have different widths. Put the selection surface on the
  * button itself so it stays aligned when the navigation scrolls. */
 /* Keep every destination visible even in the narrow settings column. */
@@ -59,21 +59,27 @@
 .rmr .rmr-tabs > [aria-hidden="true"] { display: none; }
 .rmr .rmr-tabs > [role="tab"] { flex: 1 0 auto; min-width: 0; max-width: 100%; min-height: 28px; height: auto; padding: 4px 12px; white-space: normal; }
 .rmr .rmr-tabs > [role="tab"][aria-selected="true"] { background: var(--dsw-alias-bg-layer-1); box-shadow: var(--dsw-elevation-soft); }
+/* A container query does not match the container element, so word breaking is set
+ * on descendants. URLs stay on `.rmr-mono` and may break anywhere. */
+.rmr * { overflow-wrap: normal; word-break: normal; }
+.rmr .rmr-mono,
+.rmr .rmr-mono * { overflow-wrap: anywhere; word-break: break-all; }
 @container remora (max-width: 360px) {
-  /* Break at spaces and between CJK characters. URLs keep their own wrapping.
-   * Wider settings columns keep the base `overflow-wrap: anywhere`. */
-  .rmr { overflow-wrap: normal; }
-  .rmr-mono { overflow-wrap: anywhere; word-break: break-all; }
+  /* Stack actions under the label and keep every control inside the column.
+   * Buttons grow in height and wrap at spaces. Wider columns keep the row layout. */
   .rmr-levels { grid-template-columns: minmax(0, 1fr); }
-  .rmr-kill { flex-wrap: wrap; flex-direction: column; align-items: stretch; }
-  .rmr-kill > button { max-width: 100%; height: auto; white-space: normal; align-self: flex-start; }
-  .rmr-row { gap: 8px; flex-wrap: wrap; flex-direction: column; align-items: stretch; }
-  .rmr-row-text { flex: 1 1 100%; width: 100%; }
-  .rmr-row-actions { width: 100%; max-width: 100%; justify-content: flex-start; }
-  .rmr-inline { width: 100%; min-width: 0; }
-  .rmr-grow { min-width: 0; width: 100%; }
+  .rmr-kill { flex-wrap: wrap; flex-direction: column; align-items: stretch; min-width: 0; max-width: 100%; }
+  .rmr-row { gap: 8px; flex-wrap: wrap; flex-direction: column; align-items: stretch; min-width: 0; max-width: 100%; }
+  .rmr-row-text { flex: 1 1 100%; width: 100%; min-width: 0; max-width: 100%; }
+  .rmr-row-actions { width: 100%; max-width: 100%; min-width: 0; justify-content: flex-start; }
+  .rmr-row-actions > * { max-width: 100%; min-width: 0; }
+  .rmr-inline { width: 100%; min-width: 0; max-width: 100%; }
+  .rmr-grow { min-width: 0; width: 100%; max-width: 100%; }
+  .rmr :has(> input),
+  .rmr :has(> textarea) { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
   .rmr input,
   .rmr textarea { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
+  .rmr button { max-width: 100%; height: auto; min-height: 28px; white-space: normal; overflow-wrap: normal; word-break: normal; }
   .rmr [role="tablist"] > [role="tab"],
   .rmr .rmr-tabs > [role="tab"] {
     flex: 1 1 100%;
@@ -83,6 +89,87 @@
     word-break: normal;
     padding: 4px 6px;
     font-size: 12px;
+    line-height: 16px;
+  }
+}
+/* DSH keeps a 188px settings nav, so at 320px the Remora column is about 36px
+ * and "configuration" cannot stay intact. While this plugin is installed, stack
+ * that nav above the page on narrow viewports. The stylesheet leaves with the plugin.
+ * 600px and wider keep the side nav, including the 1280px layout. */
+@media (max-width: 480px) {
+  [data-shortcut-modal="settings"] {
+    flex-direction: column;
+    width: min(800px, calc(100vw - 16px));
+    max-width: calc(100vw - 16px);
+    height: min(800px, calc(100vh - 16px));
+  }
+  [data-shortcut-modal="settings"] > nav {
+    box-sizing: border-box;
+    flex-direction: row;
+    align-items: center;
+    width: 100%;
+    max-width: 100%;
+    gap: 8px;
+    padding: 10px 10px 0;
+    overflow: hidden;
+  }
+  [data-shortcut-modal="settings"] > nav > :first-child {
+    flex: none;
+    padding: 0 4px;
+    white-space: nowrap;
+  }
+  [data-shortcut-modal="settings"] > nav > :last-child {
+    flex: 1 1 auto;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    min-width: 0;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  [data-shortcut-modal="settings"] > nav button {
+    flex: none;
+    width: auto;
+    height: 36px;
+  }
+  [data-shortcut-modal="settings"] > nav button span {
+    flex: none;
+    width: auto;
+    min-width: max-content;
+    overflow: visible;
+    text-overflow: clip;
+    white-space: nowrap;
+  }
+  [data-shortcut-modal="settings"] > div {
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
+  }
+  [data-shortcut-modal="settings"] > div > div:first-child {
+    height: auto;
+    min-height: 44px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  [data-shortcut-modal="settings"] > div > div:first-child > div {
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: calc(100% - 36px);
+    margin-left: 0;
+    justify-content: flex-start;
+  }
+  [data-shortcut-modal="settings"] > div > div:first-child > div > div {
+    min-width: 0;
+    max-width: 100%;
+  }
+  [data-shortcut-modal="settings"] > div > div:first-child > div button {
+    height: auto;
+    min-height: 28px;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: normal;
+    word-break: normal;
     line-height: 16px;
   }
 }
