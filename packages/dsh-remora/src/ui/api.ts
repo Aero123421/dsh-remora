@@ -10,9 +10,7 @@ export interface Locale {
   register(ns: string, copy: Record<string, Record<string, string>>): () => void
   bind(ns: string): (key: string, params?: Record<string, unknown>) => string
   subscribe(listener: () => void): () => void
-  getSnapshot(): { revision: number; locales?: ReadonlyArray<{ id: string }> }
-  /** Present on DSH builds that accept language packs. Older hosts omit it. */
-  addLanguage?(input: { id: string; label: string; fallback: string }): () => void
+  getSnapshot(): { revision: number }
 }
 
 export interface ClientContext {

@@ -8,6 +8,8 @@ Remora の DSH プラグインです。DSH の設定画面に「Remora」タブ�
 
 対応する DSH: `>=0.2.1-alpha.2 <0.2.2-0`
 
+日本語の表示には [dsh-japanese](https://github.com/Aero123421/dsh-japanese) が必要です。言語を日本語にすると、設定の Remora も日本語になります。dsh-japanese が無いとき、および中国語では、Remora の文言は英語です。
+
 ## 使い方
 
 1. 設定 → Remora → 接続 で、ハブの URL を入れて「ペアリングを始める」を押します。
