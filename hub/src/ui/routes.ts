@@ -84,7 +84,8 @@ const opLabel = (ui: Ui, operation: string) => label(ui, 'op', operation)
 function fixHint(ui: Ui, fix: string | undefined): Raw {
   if (!fix) return raw('')
   if (fix.startsWith('hub:')) {
-    const target = fix.slice(4)
+    // Host errors are wire input; a hub hint may only link inside this hub.
+    const target = safeNext(fix.slice(4), 'https://remora.invalid')
     return h`<p class="detail">${ui.i18n.rich('error.fixHub', { link: h`<a href="${target}">${ui.t('error.fixHubLink')}</a>` })}</p>`
   }
   if (fix.startsWith('dsh:')) return h`<p class="detail">${ui.t(fix.includes('kill-switch') ? 'error.fixDshKillSwitch' : 'error.fixDsh')}</p>`

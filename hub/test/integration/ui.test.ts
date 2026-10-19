@@ -6,6 +6,34 @@ import { FakeHost, ORIGIN, eventually, reauth, setupOwner } from './helpers.ts'
 const now = Date.now()
 
 describe('owner pages', () => {
+  it('keeps host-provided repair links on this hub', async () => {
+    const owner = await setupOwner()
+    const host = await FakeHost.create()
+    await host.pair(owner, 'repair-link-pc')
+    let fix = 'hub:/connections#reauthorize'
+    host.respond = () => ({ ok: false, error: { code: 'unavailable', message: 'Try the repair link', fix } })
+    await host.connect({ ceiling: { level: 'view' }, operations: ['session.get'] })
+    await host.next('ready')
+    try {
+      for (const [hint, target] of [
+        ['hub:/connections#reauthorize', '/connections#reauthorize'],
+        ['hub:https://evil.example/', '/'],
+        ['hub://evil.example/', '/'],
+        ['hub:/\\evil.example/', '/'],
+        ['hub:javascript:alert(1)', '/'],
+      ]) {
+        fix = hint as string
+        const page = await (await owner.browser.fetch(`/hosts/${host.hostId}/sessions/s1`, { headers: { 'accept-language': 'en' } })).text()
+        expect(page).toContain(`<a href="${target}">this hub</a>`)
+        expect(page).not.toContain('href="https://evil.example/')
+        expect(page).not.toContain('href="//evil.example/')
+        expect(page).not.toContain('href="javascript:')
+      }
+    } finally {
+      host.socket?.close(1000, 'done')
+    }
+  })
+
   it('renders the inbox, hosts, sessions, tasks, attention, connections, audit and settings', async () => {
     const owner = await setupOwner()
     const host = await FakeHost.create()
