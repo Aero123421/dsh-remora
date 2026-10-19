@@ -41,7 +41,7 @@ function AllowList({ items, allowed, busy, t, onChange, manualPlaceholder, norma
     {items.map(item => <div key={item.id} className="rmr-item">
       <div className="rmr-item-text">
         <span>{item.label}</span>
-        {item.path ?? item.description ? <span className="rmr-faint">{item.path ?? item.description}</span> : null}
+        {item.path ? <span className="rmr-faint rmr-mono">{item.path}</span> : item.description ? <span className="rmr-faint">{item.description}</span> : null}
       </div>
       <Switch checked={allowed.includes(item.id)} label={item.label} disabled={busy} onChange={on => set(item.id, on)} />
     </div>)}
@@ -150,7 +150,7 @@ export function ScopeSection({ snapshot, t, run, busy, ctx }: SectionProps & { c
       {scope.untrustedWorkspaces.map(id => {
         const ws = catalog?.workspaces.find(item => item.id === id)
         return <div key={id} className="rmr-item">
-          <div className="rmr-item-text"><span>{ws?.label ?? id}</span>{ws?.path ? <span className="rmr-faint">{ws.path}</span> : null}</div>
+          <div className="rmr-item-text"><span>{ws?.label ?? id}</span>{ws?.path ? <span className="rmr-faint rmr-mono">{ws.path}</span> : null}</div>
           <Button variant="outline" size="sm" disabled={busy || !snapshot.local} title={snapshot.local ? undefined : t('err.local-only')} onClick={() => setList('untrustedWorkspaces', scope.untrustedWorkspaces.filter(item => item !== id))}>{t('scope.trust')}</Button>
         </div>
       })}
