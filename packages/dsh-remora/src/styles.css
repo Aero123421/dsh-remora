@@ -77,9 +77,13 @@
   .rmr [role="tablist"] > [role="tab"],
   .rmr .rmr-tabs > [role="tab"] {
     flex: 1 1 100%;
+    min-width: 0;
+    max-width: 100%;
     overflow-wrap: normal;
     word-break: normal;
-    padding: 4px 8px;
+    padding: 4px 6px;
+    font-size: 12px;
+    line-height: 16px;
   }
 }
 /* Sidebar chip */
