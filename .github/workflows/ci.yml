@@ -29,7 +29,7 @@ jobs:
       - run: pnpm pack:plugin
       - name: Plugin src and dist do not define a language
         working-directory: packages/dsh-remora
-        run: '! rg -n "addLanguage" src dist'
+        run: rc=0; grep -rnF addLanguage src dist || rc=$?; test "$rc" -eq 1
       - uses: actions/upload-artifact@v7
         with:
           name: dsh-remora-plugin
