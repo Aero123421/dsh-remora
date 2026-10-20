@@ -71,4 +71,4 @@ CI のジョブ `Adapter compat (latest supported DSH)` は、プラグインの
 
 ## リリース
 
-プラグイン・CLI・ハブを同じ版番号にそろえ（`pnpm check:version`）、タグ `v<版>` を push すると `.github/workflows/release.yml` が検査・通しテスト・ビルドを行い、プラグインの tarball、5 種類の CLI 実行ファイル、インストールスクリプト、まとめた `SHA256SUMS` とビルド来歴を下書きの GitHub Release に置きます。同じ tag に Release が既にあるときは、同名の資産が無い場合だけ資産を足します。同名があるときは、その資産を残したまま失敗します。公開は人が行います。
+プラグイン・CLI・ハブを同じ版番号にそろえ（`pnpm check:version`）、タグ `v<版>` を push すると `.github/workflows/release.yml` が検査・通しテスト・ビルドを行い、プラグインの tarball、5 種類の CLI 実行ファイル、インストールスクリプト、まとめた `SHA256SUMS` とビルド来歴を下書きの GitHub Release に置きます。同じ tag の Release が公開済みなら、資産も含めて変えず失敗します。下書きで同名の資産が無いときだけ資産を足し、同名があるときは残したまま失敗します。公開は人が行います。

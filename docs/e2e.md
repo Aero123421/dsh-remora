@@ -163,7 +163,7 @@ Anthropic Messages（`POST /v1/messages`）と OpenAI Chat Completions（`POST /
 ## CI
 
 - `.github/workflows/e2e.yml`: 関連する PR では最低対応版を `--strict` で検証します。毎晩とリリースでは最低対応版と peer 範囲内の最新公開版（RC を含む）を検証し、どちらの失敗も検証失敗にします。手動実行でも対応版を選べます。`artifacts/e2e/` をアップロードし、`summary.md` をジョブの概要に出します。
-- `.github/workflows/release.yml`: `v*` タグで、版の一致（`scripts/check-version.mjs`）、型検査・テスト・ハブのバンドル、E2E（全ステップ、`--strict`）、プラグインの tarball、5 プラットフォームの CLI（`packages/cli/scripts/build-binaries.mjs` をネイティブのランナーで実行）、インストールスクリプト、全アセットの `SHA256SUMS`、`actions/attest-build-provenance` による来歴の証明、下書きの GitHub Release の作成。既にある Release には同名の資産が無いときだけ資産を足し、同名があるときは残したまま失敗します。公開は人が行います。
+- `.github/workflows/release.yml`: `v*` タグで、版の一致（`scripts/check-version.mjs`）、型検査・テスト・ハブのバンドル、E2E（全ステップ、`--strict`）、プラグインの tarball、5 プラットフォームの CLI（`packages/cli/scripts/build-binaries.mjs` をネイティブのランナーで実行）、インストールスクリプト、全アセットの `SHA256SUMS`、`actions/attest-build-provenance` による来歴の証明、下書きの GitHub Release の作成。公開済みの Release は資産も含めて変えず失敗します。下書きには同名の資産が無いときだけ資産を足し、同名があるときは残したまま失敗します。公開は人が行います。
 
 ## 既知の制約
 

@@ -10,7 +10,7 @@ const version = '0.1.7'
 const tag = 'v0.1.7'
 const names = ['SHA256SUMS', 'dsh-remora-0.1.7.tgz', 'remora.mjs']
 
-function fixture(t, { assets = [] } = {}) {
+function fixture(t, { release } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'remora-publish-'))
   const assetsDir = join(root, 'dist')
   t.after(() => rmSync(root, { recursive: true, force: true }))
@@ -18,7 +18,11 @@ function fixture(t, { assets = [] } = {}) {
   for (const name of names) writeFileSync(join(assetsDir, name), name)
   const notesFile = join(root, 'notes.md')
   writeFileSync(notesFile, 'notes')
-  const state = { calls: [], assets: new Set(assets), exists: assets.length > 0 }
+  const state = {
+    calls: [],
+    release: release ? { isDraft: release.isDraft, assets: new Set(release.assets ?? []) } : null,
+    listResult: null,
+  }
   const run = (command, args) => {
     state.calls.push([command, ...args])
     assert.equal(command, 'gh')
@@ -26,22 +30,25 @@ function fixture(t, { assets = [] } = {}) {
     assert.equal(args.includes('--latest'), false)
     assert.equal(args.includes('--draft=false'), false)
     assert.equal(args[0] === 'release' && args[1] === 'edit', false)
+    if (args[1] === 'list') {
+      if (state.listResult) return state.listResult
+      const rows = state.release ? [{ tagName: 'v0.1.6', isDraft: false }, { tagName: tag, isDraft: state.release.isDraft }] : [{ tagName: 'v0.1.6', isDraft: false }]
+      return { status: 0, stdout: JSON.stringify(rows), stderr: '' }
+    }
     if (args[1] === 'view') {
-      if (!state.exists) return { status: 1, stdout: '', stderr: 'release not found' }
-      return { status: 0, stdout: `${[...state.assets].sort().join('\n')}${state.assets.size ? '\n' : ''}`, stderr: '' }
+      const assets = state.release?.assets ?? new Set()
+      return { status: 0, stdout: `${[...assets].sort().join('\n')}${assets.size ? '\n' : ''}`, stderr: '' }
     }
     if (args[1] === 'create') {
-      state.exists = true
-      state.draft = true
-      for (const name of names) state.assets.add(name)
+      state.release = { isDraft: true, assets: new Set(names) }
       return { status: 0, stdout: '', stderr: '' }
     }
     if (args[1] === 'upload') {
       const uploaded = names.filter(name => args.some(arg => arg.endsWith(`/${name}`)))
       for (const name of uploaded) {
-        if (state.assets.has(name)) return { status: 1, stdout: '', stderr: `${name} already exists` }
+        if (state.release.assets.has(name)) return { status: 1, stdout: '', stderr: `${name} already exists` }
       }
-      for (const name of uploaded) state.assets.add(name)
+      for (const name of uploaded) state.release.assets.add(name)
       return { status: 0, stdout: '', stderr: '' }
     }
     return { status: 1, stdout: '', stderr: `unexpected ${args.join(' ')}` }
@@ -55,8 +62,8 @@ function options(f, extra = {}) {
 
 test('a missing Release is created as a draft and does not touch latest', t => {
   const f = fixture(t)
-  f.state.exists = false
   assert.equal(publishRelease(options(f)), 0)
+  assert.deepEqual(f.state.calls[0], ['gh', 'release', 'list', '--repo', repo, '--json', 'tagName,isDraft', '--limit', '1000'])
   const create = f.state.calls.find(call => call[2] === 'create')
   assert.deepEqual(create, [
     'gh', 'release', 'create', tag,
@@ -66,12 +73,11 @@ test('a missing Release is created as a draft and does not touch latest', t => {
     '--repo', repo, '--verify-tag', '--draft', '--title', 'Remora 0.1.7', '--notes-file', f.notesFile,
   ])
   assert.equal(f.state.calls.some(call => call[2] === 'upload' || call[2] === 'edit'), false)
-  assert.equal(f.state.draft, true)
+  assert.equal(f.state.release.isDraft, true)
 })
 
 test('a prerelease is still created as a draft', t => {
   const f = fixture(t)
-  f.state.exists = false
   assert.equal(publishRelease(options(f, { prerelease: true })), 0)
   const create = f.state.calls.find(call => call[2] === 'create')
   assert.equal(create.includes('--draft'), true)
@@ -79,14 +85,11 @@ test('a prerelease is still created as a draft', t => {
   assert.equal(create.includes('--latest'), false)
 })
 
-test('an existing Release only receives assets whose names are new', t => {
-  const f = fixture(t)
-  f.state.exists = true
-  f.state.draft = false
-  f.state.assets = new Set(['already-there.txt'])
-  const before = [...f.state.assets]
+test('a draft receives assets whose names are new', t => {
+  const f = fixture(t, { release: { isDraft: true, assets: ['already-there.txt'] } })
+  const before = [...f.state.release.assets]
   assert.equal(publishRelease(options(f)), 0)
-  assert.equal(f.state.draft, false)
+  assert.equal(f.state.release.isDraft, true)
   assert.deepEqual(f.state.calls.filter(call => call[2] === 'upload'), [[
     'gh', 'release', 'upload', tag,
     join(f.assetsDir, 'SHA256SUMS'),
@@ -95,20 +98,36 @@ test('an existing Release only receives assets whose names are new', t => {
     '--repo', repo,
   ]])
   assert.equal(f.state.calls.some(call => call[2] === 'edit' || call[2] === 'create'), false)
-  assert.deepEqual([...f.state.assets], [...before, ...names])
+  assert.deepEqual([...f.state.release.assets], [...before, ...names])
 })
 
-test('a same-named tarball or SHA256SUMS is left in place and the command exits 1', t => {
+test('a published Release is left unchanged, assets included, and the command exits 1', t => {
+  for (const isDraft of [false, null, undefined]) {
+    const f = fixture(t, { release: { isDraft, assets: ['dsh-remora-0.1.7.tgz', 'SHA256SUMS'] } })
+    const before = new Set(f.state.release.assets)
+    assert.equal(publishRelease(options(f)), 1)
+    assert.deepEqual(f.state.calls.map(call => call[2]), ['list'])
+    assert.deepEqual(f.state.release.assets, before)
+    assert.equal(f.state.release.isDraft, isDraft)
+  }
+})
+
+test('a failed release list is not treated as a missing Release', t => {
+  const f = fixture(t)
+  f.state.listResult = { status: 1, stdout: '', stderr: 'release not found' }
+  assert.equal(publishRelease(options(f)), 1)
+  assert.deepEqual(f.state.calls.map(call => call[2]), ['list'])
+  assert.equal(f.state.release, null)
+})
+
+test('a same-named tarball or SHA256SUMS on a draft is left in place and the command exits 1', t => {
   for (const existing of [['dsh-remora-0.1.7.tgz'], ['SHA256SUMS'], ['dsh-remora-0.1.7.tgz', 'SHA256SUMS']]) {
-    const f = fixture(t)
-    f.state.exists = true
-    f.state.draft = true
-    f.state.assets = new Set(existing)
-    const before = new Set(f.state.assets)
+    const f = fixture(t, { release: { isDraft: true, assets: existing } })
+    const before = new Set(f.state.release.assets)
     assert.equal(publishRelease(options(f)), 1)
     assert.equal(f.state.calls.some(call => call[2] === 'upload' || call[2] === 'edit' || call[2] === 'create'), false)
-    assert.deepEqual(f.state.assets, before)
-    assert.equal(f.state.draft, true)
+    assert.deepEqual(f.state.release.assets, before)
+    assert.equal(f.state.release.isDraft, true)
   }
 })
 
@@ -124,4 +143,7 @@ test('the workflow and the script never edit, clobber, or mark latest', () => {
   assert.match(workflow, /node scripts\/publish-release\.mjs/)
   assert.equal(workflow.includes('gh release'), false)
   assert.match(script, /--draft/)
+  assert.match(script, /release list/)
+  assert.match(script, /tagName,isDraft/)
+  assert.equal(script.includes('not found'), false)
 })

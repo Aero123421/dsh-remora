@@ -6,8 +6,10 @@
 #      Node.js form) and builds the standalone binaries on native runners,
 #   4. opens one draft GitHub Release with every asset, a single SHA256SUMS
 #      and build provenance attestations. A person publishes that draft.
-#      If the tag already has a Release, assets are added only when every name
-#      is new. A same-named asset is left in place and the publish step exits 1.
+#      A published Release for the tag is left unchanged, assets included, and
+#      the publish step exits 1. A draft receives assets only when every name
+#      is new. A same-named asset is left in place and the step exits 1.
+#      The tag is found from the release list JSON fields tagName and isDraft.
 # Nothing is published to npm and nothing is deployed to Cloudflare.
 name: Release
 on:
