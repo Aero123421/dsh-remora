@@ -4,8 +4,9 @@
 #   2. runs strict E2E against minimum and latest supported public DSH releases,
 #   3. packs the plugin tarball, bundles the CLI as remora.mjs (the primary,
 #      Node.js form) and builds the standalone binaries on native runners,
-#   4. publishes one GitHub Release with every asset, a single SHA256SUMS
-#      and build provenance attestations.
+#   4. opens one draft GitHub Release with every asset, a single SHA256SUMS
+#      and build provenance attestations. A person publishes that draft.
+#      If the tag already has a Release, only the assets are uploaded.
 # Nothing is published to npm and nothing is deployed to Cloudflare.
 name: Release
 on:
@@ -303,10 +304,11 @@ jobs:
           flags=""
           [ "$PRERELEASE" = "true" ] && flags="--prerelease"
           if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # The release was created by hand (e.g. "Draft a new release" on GitHub, which also creates the tag):
-            # attach the built assets and the generated notes to it instead of failing.
+            # The tag already has a Release. Upload the built assets only.
+            # Leave the title, notes, and draft or published state as they are.
+            # A person publishes the Release.
             gh release upload "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "v${VERSION}" --repo "$GITHUB_REPOSITORY" --title "Remora ${VERSION}" --notes-file notes.md $flags
           else
-            gh release create "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Remora ${VERSION}" --notes-file notes.md $flags
+            # Always a draft, including a prerelease. A person publishes it.
+            gh release create "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "Remora ${VERSION}" --notes-file notes.md $flags
           fi
