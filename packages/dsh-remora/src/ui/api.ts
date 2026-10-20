@@ -6,11 +6,31 @@ import { SnapshotStore } from './snapshot-store.ts'
 
 export type Translate = (key: CopyKey, params?: Record<string, unknown>) => string
 
+/** One locale's flat dictionary. */
+export type LocaleDict = Record<string, string>
+
+export interface LocaleCopy {
+  [locale: string]: LocaleDict
+}
+
+export interface LocaleLanguage {
+  id: string
+  label: string
+  fallback?: string
+}
+
 export interface Locale {
-  register(ns: string, copy: Record<string, Record<string, string>>): () => void
+  /**
+   * Single-locale form. Remora publishes `en`, `ja` and `zh` this way and
+   * does not define a language. Built-in `zh` falls back to `en` only for
+   * a key this dictionary does not contain.
+   */
+  register(ns: string, locale: string, dict: LocaleDict): () => void
+  /** Object form. A locale id that is already present throws. */
+  register(ns: string, copy: LocaleCopy): () => void
   bind(ns: string): (key: string, params?: Record<string, unknown>) => string
   subscribe(listener: () => void): () => void
-  getSnapshot(): { revision: number }
+  getSnapshot(): { revision: number; active: string; locales: readonly LocaleLanguage[] }
 }
 
 export interface ClientContext {

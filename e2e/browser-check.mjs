@@ -8,6 +8,88 @@ import { dsh as DSH, remora as REMORA } from './lib/selectors.mjs'
 import { firstPresent, instrument, mustBePresent, shot } from './lib/browser.mjs'
 import assert from 'node:assert/strict'
 
+/** Latin letters that change line without a space are a mid-word break. CJK may wrap per character. */
+function narrowColumnReport(section) {
+  return section.evaluate(root => {
+    const dialog = root.closest('[data-shortcut-modal="settings"]') ?? root
+    const column = root.getBoundingClientRect()
+    const dialogBox = dialog.getBoundingClientRect()
+    const problems = []
+    const visit = element => {
+      const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT)
+      let textNode
+      while ((textNode = walker.nextNode())) {
+        if (textNode.parentElement?.closest('.rmr-mono')) continue
+        const text = textNode.textContent ?? ''
+        const range = document.createRange()
+        let lastTop = null
+        for (let i = 0; i < text.length; i++) {
+          range.setStart(textNode, i)
+          range.setEnd(textNode, i + 1)
+          const rect = range.getBoundingClientRect()
+          if (rect.width === 0 && rect.height === 0) continue
+          if (lastTop !== null && rect.top - lastTop > 2 && /[A-Za-z]/.test(text[i - 1] ?? '') && /[A-Za-z]/.test(text[i] ?? '')) {
+            problems.push(`${text[i - 1]}|${text[i]} in ${JSON.stringify(text.slice(Math.max(0, i - 12), i + 12))}`)
+          }
+          lastTop = rect.top
+        }
+      }
+    }
+    visit(root)
+    const headerButton = [...dialog.querySelectorAll('button')].find(button => /configuration file|配置文件|設定ファイル/.test(button.innerText))
+    if (headerButton) visit(headerButton)
+    const horizontal = (element, bound) => {
+      const box = element.getBoundingClientRect()
+      if (box.width < 1 && box.height < 1) return 0
+      return Math.max(0, box.right - bound.right, bound.left - box.left)
+    }
+    const inputOverflow = [...root.querySelectorAll('input, textarea')].flatMap(input => {
+      const amount = horizontal(input, column)
+      return amount > 1 ? [{ overflow: Math.round(amount), label: input.getAttribute('aria-label') }] : []
+    })
+    const boxOverflow = [...root.querySelectorAll('button, input, textarea, a, .rmr-kill, .rmr-row, .rmr-tabs')].flatMap(element => {
+      const amount = horizontal(element, column)
+      if (amount <= 1) return []
+      const label = (element.getAttribute('aria-label') || element.innerText || element.tagName).trim().replace(/\s+/g, ' ').slice(0, 48)
+      return [{ overflow: Math.round(amount), label }]
+    }).slice(0, 8)
+    const headerOverflow = headerButton ? Math.round(Math.max(horizontal(headerButton, dialogBox), Math.max(0, headerButton.getBoundingClientRect().bottom - dialogBox.bottom))) : null
+    const kill = root.querySelector('[data-testid="remora-kill-switch"]')
+    const killHeight = kill ? Math.round(kill.getBoundingClientRect().height) : 0
+    return {
+      problems: problems.slice(0, 8),
+      inputOverflow,
+      boxOverflow,
+      headerOverflow,
+      columnWidth: Math.round(column.width),
+      killHeight,
+    }
+  })
+}
+
+/** At 320px and 390px, Remora settings and the document button stay on word boundaries inside the dialog. */
+export async function assertNarrowRemora(page, section) {
+  const viewport = page.viewportSize()
+  try {
+    for (const width of [390, 320]) {
+      await page.setViewportSize({ width, height: viewport.height })
+      for (const value of ['connection', 'permissions', 'scope', 'activity', 'compat']) {
+        await section.locator(`#rmr-tabs-${value}`).click()
+        const tab = await narrowColumnReport(section)
+        assert.ok(tab.columnWidth >= 160, `${width}px Remora column is ${tab.columnWidth}px`)
+        assert.deepEqual(tab.problems, [], `${value} mid-word break at ${width}px: ${tab.problems.join('; ')}`)
+        assert.deepEqual(tab.inputOverflow, [], `${value} input overflow at ${width}px: ${JSON.stringify(tab.inputOverflow)}`)
+        assert.deepEqual(tab.boxOverflow, [], `${value} box overflow at ${width}px: ${JSON.stringify(tab.boxOverflow)}`)
+        assert.ok(tab.headerOverflow === null || tab.headerOverflow <= 1, `${width}px Open configuration file overflow ${tab.headerOverflow}`)
+        if (tab.killHeight > 0) assert.ok(tab.killHeight < 320, `${width}px kill switch is ${tab.killHeight}px tall`)
+      }
+    }
+  } finally {
+    await page.setViewportSize(viewport)
+    await section.locator('#rmr-tabs-connection').click()
+  }
+}
+
 /** Check the rendered selection surface, including constrained grid tracks. */
 export async function checkSettingsLayout(page, section) {
   const viewport = page.viewportSize()
@@ -48,11 +130,12 @@ export async function checkSettingsLayout(page, section) {
       await section.locator('#rmr-tabs-scope-panel').waitFor({ state: 'visible' })
       assert.equal(await section.locator('#rmr-tabs-scope').evaluate(element => element === document.activeElement), true)
     }
+    await assertNarrowRemora(page, section)
   } finally {
     await page.setViewportSize(viewport)
     await section.locator('#rmr-tabs-connection').click()
   }
-  return 'Five tabs and keyboard navigation: selection matches its panel at 1280px and 600px; permission cards use two columns or one without overflow'
+  return 'Five tabs and keyboard navigation: selection matches its panel at 1280px and 600px; permission cards use two columns or one without overflow; at 320px and 390px words stay intact, controls stay in the column, and the kill switch stays short'
 }
 
 /** Open DSH Web in a fresh English context and dismiss the first-use notice. */

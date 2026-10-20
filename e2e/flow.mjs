@@ -39,7 +39,7 @@ import { HUB_PATHS, dsh as DSH_SELECTORS, hub as HUB, remora as REMORA } from '.
 import { hubApi, startHub } from './lib/hub.mjs'
 import { verifyAuditRecords } from '../packages/protocol/src/audit.ts'
 import { Skip } from './lib/steps.mjs'
-import { killSwitchOn, openRemoraSubTab, openRemoraTab, openSettings, rpcBody, toggleKillSwitch } from './browser-check.mjs'
+import { assertNarrowRemora, killSwitchOn, openRemoraSubTab, openRemoraTab, openSettings, rpcBody, toggleKillSwitch } from './browser-check.mjs'
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled'])
 const SCOPES = 'dsh.read dsh.content dsh.tasks'
@@ -188,7 +188,10 @@ export async function flowSteps(r, { browser, artifacts, hubDir, hubPort, hubUrl
     await shot(hubPage, artifacts, 'flow-hub-pair-approved')
     await mustBePresent(section, REMORA.hubConnected, 'the Remora tab switching to Connected', 60_000)
     const path = await shot(page, artifacts, 'flow-dsh-connected')
-    return `code ${code} approved (passkey re-auth); host ${state.hostId}; DSH tab shows Connected; ${path}`
+    await assertNarrowRemora(page, section)
+    const repair = section.getByRole('button', { name: 'New key and pair again' })
+    if (await repair.count() === 0) throw new Error('paired Remora settings has no "New key and pair again" button')
+    return `code ${code} approved (passkey re-auth); host ${state.hostId}; DSH tab shows Connected; narrow layout at 320px and 390px kept words intact; ${path}`
   })
 
   await r.step('host.permit', 'DSH side: ceiling "Can request" and the default workspace in scope', { needs: ['host.pair'], timeoutMs: 60_000, onFailure: failShot('permit', 'dsh') }, async () => {

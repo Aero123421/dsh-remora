@@ -4,8 +4,12 @@
 #   2. runs strict E2E against minimum and latest supported public DSH releases,
 #   3. packs the plugin tarball, bundles the CLI as remora.mjs (the primary,
 #      Node.js form) and builds the standalone binaries on native runners,
-#   4. publishes one GitHub Release with every asset, a single SHA256SUMS
-#      and build provenance attestations.
+#   4. opens one draft GitHub Release with every asset, a single SHA256SUMS
+#      and build provenance attestations. A person publishes that draft.
+#      A published Release for the tag is left unchanged, assets included, and
+#      the publish step exits 1. A draft receives assets only when every name
+#      is new. A same-named asset is left in place and the step exits 1.
+#      The tag is found from the release list JSON fields tagName and isDraft.
 # Nothing is published to npm and nothing is deployed to Cloudflare.
 name: Release
 on:
@@ -42,7 +46,7 @@ jobs:
         run: node scripts/check-version.mjs --tag "$GITHUB_REF_NAME"
       - run: pnpm install --frozen-lockfile
       - name: Release selection and upstream sync regressions
-        run: node --test packages/dsh-remora/scripts/compat/*.test.mjs hub/scripts/*.test.mjs
+        run: node --test scripts/publish-release.test.mjs packages/dsh-remora/scripts/compat/*.test.mjs hub/scripts/*.test.mjs
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
@@ -299,14 +303,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
           PRERELEASE: ${{ needs.verify.outputs.prerelease }}
-        run: |
-          flags=""
-          [ "$PRERELEASE" = "true" ] && flags="--prerelease"
-          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # The release was created by hand (e.g. "Draft a new release" on GitHub, which also creates the tag):
-            # attach the built assets and the generated notes to it instead of failing.
-            gh release upload "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "v${VERSION}" --repo "$GITHUB_REPOSITORY" --title "Remora ${VERSION}" --notes-file notes.md $flags
-          else
-            gh release create "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Remora ${VERSION}" --notes-file notes.md $flags
-          fi
+        run: node scripts/publish-release.mjs

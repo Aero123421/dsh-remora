@@ -1,6 +1,6 @@
 {
   "name": "@dsh-remora/cli",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "description": "remora: the Remora command line. Distributed as standalone binaries on GitHub Releases, not on npm.",
   "type": "module",
