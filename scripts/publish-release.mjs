@@ -6,7 +6,9 @@
 // not an error string. A published Release (isDraft is not true) is left unchanged, assets
 // included, and this command exits 1. A draft keeps its notes, draft state, and latest flag.
 // Assets are uploaded only when every name is new. A same-named asset, such as the plugin tarball
-// or SHA256SUMS, is left in place and this command exits 1. Nothing is overwritten.
+// or SHA256SUMS, is left in place and this command exits 1. Nothing is overwritten. The error
+// names `gh release delete-asset` so a person can remove the asset and run this again.
+// A list of 1000 releases that does not contain the tag is not treated as absence.
 import { spawnSync } from 'node:child_process'
 import { readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -61,7 +63,8 @@ export function publishRelease(options = {}) {
   const existing = new Set(viewed.stdout.split('\n').map(name => name.trim()).filter(Boolean))
   const clash = assets.filter(name => existing.has(name))
   if (clash.length) {
-    console.error(`::error::release ${tag} already has ${clash.join(', ')}; leaving those assets in place`)
+    const manual = clash.map(name => `gh release delete-asset ${tag} ${name}`).join(', ')
+    console.error(`::error::release ${tag} already has ${clash.join(', ')}; leaving those assets in place. Delete each by hand with ${manual}, then run this again.`)
     return 1
   }
   if (paths.length === 0) return 0

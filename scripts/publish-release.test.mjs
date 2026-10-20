@@ -112,6 +112,21 @@ test('a published Release is left unchanged, assets included, and the command ex
   }
 })
 
+test('a release list of exactly 1000 without the tag exits 1 and does not create', t => {
+  const f = fixture(t)
+  const rows = Array.from({ length: 1000 }, (_, index) => ({ tagName: `v0.0.${index}`, isDraft: false }))
+  assert.equal(rows.some(release => release.tagName === tag), false)
+  f.state.listResult = { status: 0, stdout: JSON.stringify(rows), stderr: '' }
+  const errors = []
+  const original = console.error
+  console.error = (...args) => { errors.push(args.map(String).join(' ')) }
+  t.after(() => { console.error = original })
+  assert.equal(publishRelease(options(f)), 1)
+  assert.deepEqual(f.state.calls.map(call => call[2]), ['list'])
+  assert.equal(f.state.release, null)
+  assert.match(errors.join('\n'), new RegExp(`release list is full and ${tag} is not in it; refusing to create`))
+})
+
 test('a failed release list is not treated as a missing Release', t => {
   const f = fixture(t)
   f.state.listResult = { status: 1, stdout: '', stderr: 'release not found' }
@@ -121,13 +136,22 @@ test('a failed release list is not treated as a missing Release', t => {
 })
 
 test('a same-named tarball or SHA256SUMS on a draft is left in place and the command exits 1', t => {
+  const errors = []
+  const original = console.error
+  console.error = (...args) => { errors.push(args.map(String).join(' ')) }
+  t.after(() => { console.error = original })
   for (const existing of [['dsh-remora-0.1.7.tgz'], ['SHA256SUMS'], ['dsh-remora-0.1.7.tgz', 'SHA256SUMS']]) {
     const f = fixture(t, { release: { isDraft: true, assets: existing } })
     const before = new Set(f.state.release.assets)
+    errors.length = 0
     assert.equal(publishRelease(options(f)), 1)
-    assert.equal(f.state.calls.some(call => call[2] === 'upload' || call[2] === 'edit' || call[2] === 'create'), false)
+    assert.equal(f.state.calls.some(call => call[2] === 'upload' || call[2] === 'edit' || call[2] === 'create' || call[2] === 'delete-asset'), false)
     assert.deepEqual(f.state.release.assets, before)
     assert.equal(f.state.release.isDraft, true)
+    const message = errors.join('\n')
+    assert.match(message, /leaving those assets in place/)
+    assert.match(message, /then run this again/)
+    for (const name of existing) assert.match(message, new RegExp(`gh release delete-asset ${tag} ${name.replaceAll('.', '\\.')}`))
   }
 })
 
