@@ -20,7 +20,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - name: Release selection and upstream sync regressions
-        run: node --test packages/dsh-remora/scripts/compat/*.test.mjs hub/scripts/*.test.mjs
+        run: node --test scripts/publish-release.test.mjs packages/dsh-remora/scripts/compat/*.test.mjs hub/scripts/*.test.mjs
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build

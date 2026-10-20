@@ -6,7 +6,8 @@
 #      Node.js form) and builds the standalone binaries on native runners,
 #   4. opens one draft GitHub Release with every asset, a single SHA256SUMS
 #      and build provenance attestations. A person publishes that draft.
-#      If the tag already has a Release, only the assets are uploaded.
+#      If the tag already has a Release, assets are added only when every name
+#      is new. A same-named asset is left in place and the publish step exits 1.
 # Nothing is published to npm and nothing is deployed to Cloudflare.
 name: Release
 on:
@@ -43,7 +44,7 @@ jobs:
         run: node scripts/check-version.mjs --tag "$GITHUB_REF_NAME"
       - run: pnpm install --frozen-lockfile
       - name: Release selection and upstream sync regressions
-        run: node --test packages/dsh-remora/scripts/compat/*.test.mjs hub/scripts/*.test.mjs
+        run: node --test scripts/publish-release.test.mjs packages/dsh-remora/scripts/compat/*.test.mjs hub/scripts/*.test.mjs
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
@@ -300,15 +301,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
           PRERELEASE: ${{ needs.verify.outputs.prerelease }}
-        run: |
-          flags=""
-          [ "$PRERELEASE" = "true" ] && flags="--prerelease"
-          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # The tag already has a Release. Upload the built assets only.
-            # Leave the title, notes, and draft or published state as they are.
-            # A person publishes the Release.
-            gh release upload "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            # Always a draft, including a prerelease. A person publishes it.
-            gh release create "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "Remora ${VERSION}" --notes-file notes.md $flags
-          fi
+        run: node scripts/publish-release.mjs
