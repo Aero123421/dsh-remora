@@ -5,6 +5,7 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { installLocale } from '../src/locale-install.ts'
 import { en, ja, NS } from '../src/locales.ts'
+import { zh } from '../src/zh.ts'
 import type { Locale, LocaleCopy, LocaleLanguage } from '../src/ui/api.ts'
 
 const src = join(dirname(fileURLToPath(import.meta.url)), '../src')
@@ -144,14 +145,14 @@ test('the plugin registers dictionaries and does not define ja', () => {
   alone.setActive('en')
   assert.equal(alone.locale.bind(NS)('kill.title'), 'Kill switch')
   alone.setActive('zh')
-  assert.equal(alone.locale.bind(NS)('kill.title'), en['kill.title'])
-  assert.equal(alone.locale.bind(NS)('conn.notPaired'), en['conn.notPaired'])
+  assert.equal(alone.locale.bind(NS)('kill.title'), zh['kill.title'])
+  assert.equal(alone.locale.bind(NS)('conn.notPaired'), zh['conn.notPaired'])
+  assert.notEqual(alone.locale.bind(NS)('kill.title'), en['kill.title'])
   assert.notEqual(alone.locale.bind(NS)('kill.title'), 'kill.title')
   assert.notEqual(alone.locale.bind(NS)('conn.notPaired'), 'conn.notPaired')
   alone.setActive('ja')
   assert.equal(alone.locale.bind(NS)('kill.title'), en['kill.title'])
-  const release = alone.locale.register(NS, 'zh', { 'kill.title': 'unused' })
-  release()
+  assert.throws(() => alone.locale.register(NS, 'zh', { 'kill.title': 'unused' }), /already has locale "zh"/)
   alone.dispose()
   assert.equal(alone.hasJa(), false)
 })
@@ -194,14 +195,23 @@ test('removing dsh-japanese first leaves Remora in English, and removing Remora 
   assert.notEqual(world.locale.bind('settings')('trigger'), 'trigger')
 })
 
-test('every visible string has English and Japanese copy, so a missing language does not show the key', () => {
+test('every visible string has English, Japanese and Simplified Chinese copy, so a missing language does not show the key', () => {
+  const placeholders = (text: string) => [...text.matchAll(/\{(\w+)\}/g)].map(match => match[1]).sort()
   const keys = Object.keys(ja)
-  assert.deepEqual(Object.keys(en).sort(), keys.sort())
+  assert.deepEqual(Object.keys(en).sort(), [...keys].sort())
+  assert.deepEqual(Object.keys(zh).sort(), [...keys].sort())
   for (const key of keys) {
-    assert.notEqual(ja[key as keyof typeof ja], '')
-    assert.notEqual(en[key as keyof typeof en], '')
-    assert.notEqual(ja[key as keyof typeof ja], key)
-    assert.notEqual(en[key as keyof typeof en], key)
+    const japanese = ja[key as keyof typeof ja]
+    const english = en[key as keyof typeof en]
+    const chinese = zh[key as keyof typeof zh]
+    assert.notEqual(japanese, '')
+    assert.notEqual(english, '')
+    assert.notEqual(chinese, '')
+    assert.notEqual(japanese, key)
+    assert.notEqual(english, key)
+    assert.notEqual(chinese, key)
+    assert.deepEqual(placeholders(chinese), placeholders(english), key)
+    assert.deepEqual(placeholders(japanese), placeholders(english), key)
   }
 })
 

@@ -6,7 +6,7 @@ import { SnapshotStore } from './snapshot-store.ts'
 
 export type Translate = (key: CopyKey, params?: Record<string, unknown>) => string
 
-/** One locale's flat dictionary. A missing `zh` entry is not a Chinese dictionary: built-in `zh` falls back to `en`. */
+/** One locale's flat dictionary. */
 export type LocaleDict = Record<string, string>
 
 export interface LocaleCopy {
@@ -21,9 +21,9 @@ export interface LocaleLanguage {
 
 export interface Locale {
   /**
-   * Single-locale form. Remora uses this so a typed object register, which
-   * requires a `zh` dictionary, is not how these strings are published.
-   * Built-in `zh` has fallback `en`, and lookup walks that chain.
+   * Single-locale form. Remora publishes `en`, `ja` and `zh` this way and
+   * does not define a language. Built-in `zh` falls back to `en` only for
+   * a key this dictionary does not contain.
    */
   register(ns: string, locale: string, dict: LocaleDict): () => void
   /** Object form. A locale id that is already present throws. */
