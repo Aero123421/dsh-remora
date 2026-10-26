@@ -56,10 +56,10 @@ export function sessionIdFor(requestId: string): string {
 
 export class Tasks {
   private readonly rt: Runtime
-  /** Tasks whose prompt call is in flight: evaluation must not judge them yet. */
+  /** Tasks preparing or sending a prompt: evaluation must not judge them yet. */
   private readonly inflight = new Set<string>()
   private readonly waiters = new Map<string, Set<() => void>>()
-  /** Serializes the moment a task gains a session and the cancel that must see that write. */
+  /** Serializes delivery and cancellation, including the moment a task gains a session. */
   private readonly lanes = new Map<string, Promise<void>>()
 
   constructor(rt: Runtime) {
@@ -130,6 +130,13 @@ export class Tasks {
     this.lanes.set(taskId, done)
     void done.then(() => { if (this.lanes.get(taskId) === done) this.lanes.delete(taskId) })
     return current
+  }
+
+  private preparing<T>(taskId: string, run: () => Promise<T>): Promise<T> {
+    return this.lane(taskId, async () => {
+      this.inflight.add(taskId)
+      try { return await run() } finally { this.inflight.delete(taskId) }
+    })
   }
 
   private async save(record: TaskRecord, state: TaskState, error?: RemoraError): Promise<TaskRecord> {
@@ -372,8 +379,9 @@ export class Tasks {
       if (known && !known.has(name)) continue
       if (!this.rt.deps.scope.isAllowedSkill(name, row.workspace?.id ?? null)) throw denied(`skill "/${name}" is not allowed for remote use`)
     }
+    record = this.rt.deps.tasks.get(record.taskId) ?? record
+    if (TERMINAL_TASK_STATES.has(record.state)) return record
     const wasLive = this.rt.liveAgent(sessionId) !== undefined
-    this.inflight.add(record.taskId)
     try {
       await this.rt.sessions.prompt({ requestId: record.requestId, sessionId, mode, content: [{ type: 'text', text }] }, context.signal)
     } catch (error) {
@@ -383,10 +391,22 @@ export class Tasks {
       }
       throw failure
     } finally {
-      this.inflight.delete(record.taskId)
       this.rt.noteWake(sessionId, wasLive)
     }
     return record
+  }
+
+  private submit(record: TaskRecord, text: string, mode: 'queue' | 'steer', context: OperationContext, retryFailed = false): Promise<TaskRecord> {
+    return this.preparing(record.taskId, async () => {
+      // Publish accepted only after evaluation is guarded, and keep the guard
+      // through preparation and DSH acceptance. Persist before sending (write-ahead).
+      const existing = this.rt.deps.tasks.get(record.taskId)
+      if (!existing) await this.rt.deps.tasks.put(record)
+      else if (retryFailed && existing.state === 'failed' && existing.error?.code !== 'internal') {
+        await this.save(existing, 'accepted')
+      }
+      return this.deliver(this.rt.deps.tasks.get(record.taskId) ?? record, text, mode, context)
+    })
   }
 
   private newRecord(taskId: string, context: OperationContext, sessionId: string | null): TaskRecord {
@@ -430,12 +450,13 @@ export class Tasks {
     const cwd = row ? row.workspacePath : create!.workspace.path
     const text = await this.promptText(params.prompt, params.skills ?? [], workspaceId, row?.sessionId ?? null, cwd, context.signal)
 
-    // Write-ahead: the record (and its requestId) is durable before DSH sees the prompt.
     let record = existing ?? this.newRecord(taskId, context, row?.sessionId ?? null)
-    if (!existing) await this.rt.deps.tasks.put(record)
-    else if (existing.state === 'failed') record = await this.save(existing, 'accepted')
 
     if (record.sessionId === null && create) {
+      // A session-less record cannot be evaluated yet. Keep creation outside the
+      // delivery lane so cancellation can finish while DSH creates the session.
+      if (!existing) await this.rt.deps.tasks.put(record)
+      else if (existing.state === 'failed') record = await this.save(existing, 'accepted')
       const sessionId = sessionIdFor(record.requestId)
       this.rt.assertWorkspace(create.workspace, context, true)
       if (create.agentPreset !== undefined && !this.rt.deps.scope.isAllowedAgentPreset(create.agentPreset)) throw denied(`agent preset "${create.agentPreset}" is not allowed for remote use`)
@@ -454,7 +475,7 @@ export class Tasks {
         throw failure
       }
       let settled = record
-      await this.lane(taskId, async () => {
+      await this.preparing(taskId, async () => {
         const current = this.rt.deps.tasks.get(taskId) ?? record
         if (TERMINAL_TASK_STATES.has(current.state)) {
           settled = current
@@ -476,11 +497,11 @@ export class Tasks {
             this.rt.deps.logger.warn('Remora: could not title the new session', error)
           })
         }
-        await this.deliver(settled, text, 'queue', context)
+        settled = await this.deliver(settled, text, 'queue', context)
       })
       return this.finish(settled, context)
     }
-    await this.deliver(record, text, 'queue', context)
+    record = await this.submit(record, text, 'queue', context, true)
     return this.finish(record, context)
   }
 
@@ -538,9 +559,7 @@ export class Tasks {
     const row = await this.rt.row(sessionId, context.signal)
     this.ensurePromptable(row)
     const text = await this.promptText(params.prompt, [], row.workspace?.id ?? null, row.sessionId, row.workspacePath, context.signal)
-    const record = existing ?? this.newRecord(taskId, context, row.sessionId)
-    if (!existing) await this.rt.deps.tasks.put(record)
-    await this.deliver(record, text, this.rt.isRunning(row.sessionId) ? 'steer' : 'queue', context)
+    const record = await this.submit(existing ?? this.newRecord(taskId, context, row.sessionId), text, this.rt.isRunning(row.sessionId) ? 'steer' : 'queue', context)
     return this.finish(record, context)
   }
 
@@ -565,9 +584,7 @@ export class Tasks {
     }
     if (!text) throw new OperationError('gone', `the prompt of task ${params.taskId} is no longer in the session`)
     const checked = await this.promptText(text, [], row.workspace?.id ?? null, row.sessionId, row.workspacePath, context.signal)
-    const record = existing ?? this.newRecord(taskId, context, row.sessionId)
-    if (!existing) await this.rt.deps.tasks.put(record)
-    await this.deliver(record, checked, 'queue', context)
+    const record = await this.submit(existing ?? this.newRecord(taskId, context, row.sessionId), checked, 'queue', context)
     return this.finish(record, context)
   }
 
