@@ -247,6 +247,7 @@ for (const stage of ['before publication', 'during preparation'] as const) {
     const snapshot = gate()
     const publication = stage === 'during preparation' ? holdPreparation(f, 'publish') : undefined
     let pending: ReturnType<typeof f.handlers['task.start']> | undefined
+    let watching: Promise<void> | undefined
     const row = f.adapter.runtime.row.bind(f.adapter.runtime)
     const projections = f.adapter.runtime.projections.bind(f.adapter.runtime)
     let captured = false
@@ -271,18 +272,21 @@ for (const stage of ['before publication', 'during preparation'] as const) {
         await publication.entered
       }
       f.adapter.watcher.schedule('s1', 0)
+      // idle's drain keeps a referenced timer until the unref'ed Watcher timer
+      // starts. Awaiting only the barrier can let Node 22 exit before it runs.
+      watching = f.adapter.watcher.idle()
       await snapshot.entered
       publication?.release()
       pending ??= f.handlers['task.start'](params, context({ taskId: 't1' }))
       assert.equal((await pending).state, 'accepted')
       assert.equal(f.session.inbox.length, 1)
       snapshot.release()
-      await f.adapter.watcher.idle()
+      await watching
       assert.equal((await f.stored())?.state, 'accepted')
       assert.deepEqual(await f.handlers['task.cancel']({ taskId: 't1' }, context()), { cancelled: true, how: 'removed-from-queue' })
       assert.equal(f.session.inbox.length, 0)
       assert.equal((await f.stored())?.state, 'cancelled')
-    } finally { snapshot.release(); publication?.release(); await pending?.catch(() => undefined); await f.cleanup() }
+    } finally { snapshot.release(); publication?.release(); await Promise.allSettled([pending, watching]); await f.cleanup() }
   })
 }
 
