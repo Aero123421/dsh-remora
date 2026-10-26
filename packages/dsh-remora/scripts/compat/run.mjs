@@ -300,15 +300,39 @@ await step('task.resubmit re-sends the logged prompt; task.steer on an idle sess
 })
 
 await step('task.cancel removes a queued prompt through session.updateQueue', async () => {
-  model.script.unshift({ hangAfter: dsh.textResponse('long').slice(0, 2) })
-  await h['task.start']({ target: { sessionId }, prompt: 'long running', idempotencyKey: 'k6' }, context('t6'))
-  await waitFor('t6 running', () => records.get('t6')?.state === 'running' || ctx.agents.get(sessionId)?.status === 'running')
-  await h['task.start']({ target: { sessionId }, prompt: 'queued behind', idempotencyKey: 'k7' }, context('t7'))
-  assert.equal((await h['session.get']({ sessionId }, context())).queueLength, 1)
-  assert.deepEqual(await h['task.cancel']({ taskId: 't7' }, context()), { cancelled: true, how: 'removed-from-queue' })
-  assert.equal((await h['session.get']({ sessionId }, context())).queueLength, 0)
-  assert.deepEqual(await h['task.cancel']({ taskId: 't6' }, context()), { cancelled: true, how: 'stopped-session' })
-  await waitFor('agent idle', () => ctx.agents.get(sessionId)?.status !== 'running')
+  // A running Agent may have claimed the message without logging it yet.
+  // Cancellation must not stop an unidentified turn; retry once it is logged.
+  let claimed = false
+  let releaseClaim
+  const claimHold = new Promise(resolve => { releaseClaim = resolve })
+  const stopClaim = ctx.on('agent/pre-step', async (input, next) => {
+    if (input.messages.some(message => message.source?.rpcId === remoraRequestId('compat-client', 't6'))) {
+      claimed = true
+      await claimHold
+    }
+    return next()
+  }, { global: true })
+  try {
+    model.script.unshift({ hangAfter: dsh.textResponse('long').slice(0, 2) })
+    await h['task.start']({ target: { sessionId }, prompt: 'long running', idempotencyKey: 'k6' }, context('t6'))
+    await waitFor('t6 claimed before logging', () => claimed)
+    await assert.rejects(h['task.cancel']({ taskId: 't6' }, context()), { code: 'conflict' })
+    assert.equal(records.get('t6').state, 'accepted', 'a claimed but unidentified turn remains retryable')
+    releaseClaim()
+    await waitFor('t6 logged and running', () => records.get('t6')?.state === 'running')
+    await h['task.start']({ target: { sessionId }, prompt: 'queued behind', idempotencyKey: 'k7' }, context('t7'))
+    assert.equal((await h['session.get']({ sessionId }, context())).queueLength, 1)
+    assert.deepEqual(await h['task.cancel']({ taskId: 't7' }, context()), { cancelled: true, how: 'removed-from-queue' })
+    assert.equal((await h['session.get']({ sessionId }, context())).queueLength, 0)
+    assert.deepEqual(await h['task.cancel']({ taskId: 't6' }, context()), { cancelled: true, how: 'stopped-session' })
+    await waitFor('agent idle', () => ctx.agents.get(sessionId)?.status !== 'running')
+  } finally {
+    releaseClaim()
+    stopClaim()
+    // A failed assertion must not leave the scripted hanging turn blocking the
+    // question/approval/schedule checks that share this session.
+    if (ctx.agents.get(sessionId)?.status === 'running') await ctx.sessionController.cancel({ sessionId })
+  }
 })
 
 await step('blocking ask_user_question: Remora holds it in the user-questions chain; attention.respond answers it', async () => {
