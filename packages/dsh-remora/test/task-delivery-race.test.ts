@@ -240,3 +240,82 @@ test('new-session publication stays accepted while its title is being set', { ti
     assert.equal((await f.stored())?.state, 'cancelled')
   } finally { hold.release(); await pending.catch(() => undefined); await f.cleanup() }
 })
+
+for (const stage of ['before publication', 'during preparation'] as const) {
+  test(`watcher snapshot captured ${stage} cannot cancel a later delivery`, { timeout: 10_000 }, async () => {
+    const f = await setup()
+    const snapshot = gate()
+    const publication = stage === 'during preparation' ? holdPreparation(f, 'publish') : undefined
+    let pending: ReturnType<typeof f.handlers['task.start']> | undefined
+    const row = f.adapter.runtime.row.bind(f.adapter.runtime)
+    const projections = f.adapter.runtime.projections.bind(f.adapter.runtime)
+    let captured = false
+    let paused = false
+    f.adapter.runtime.projections = async (...args) => {
+      const values = await projections(...args)
+      if (!captured) {
+        captured = true
+        assert.equal(f.session.inbox.length, 0)
+      }
+      return values
+    }
+    f.adapter.runtime.row = async (...args) => {
+      // Watcher has already read events and the empty inbox. Hold its scope
+      // recheck while publication, prompt and preparation all finish.
+      if (captured && !paused) { paused = true; await snapshot.wait() }
+      return row(...args)
+    }
+    try {
+      if (publication) {
+        pending = f.handlers['task.start'](params, context({ taskId: 't1' }))
+        await publication.entered
+      }
+      f.adapter.watcher.schedule('s1', 0)
+      await snapshot.entered
+      publication?.release()
+      pending ??= f.handlers['task.start'](params, context({ taskId: 't1' }))
+      assert.equal((await pending).state, 'accepted')
+      assert.equal(f.session.inbox.length, 1)
+      snapshot.release()
+      await f.adapter.watcher.idle()
+      assert.equal((await f.stored())?.state, 'accepted')
+      assert.deepEqual(await f.handlers['task.cancel']({ taskId: 't1' }, context()), { cancelled: true, how: 'removed-from-queue' })
+      assert.equal(f.session.inbox.length, 0)
+      assert.equal((await f.stored())?.state, 'cancelled')
+    } finally { snapshot.release(); publication?.release(); await pending?.catch(() => undefined); await f.cleanup() }
+  })
+}
+
+test('a status snapshot and an accepted retry cannot cross delivery', { timeout: 10_000 }, async () => {
+  const f = await setup()
+  const prompt = f.dsh.sessionController.prompt
+  f.dsh.sessionController.prompt = async () => { throw new RemoteError('gateway/cancelled', 'cancelled') }
+  const snapshot = gate()
+  let reading: ReturnType<typeof f.handlers['task.get']> | undefined
+  let retry: ReturnType<typeof f.handlers['task.start']> | undefined
+  try {
+    await assert.rejects(f.handlers['task.start'](params, context({ taskId: 't1' })), OperationError)
+    assert.equal((await f.stored())?.state, 'accepted')
+    f.dsh.sessionController.prompt = prompt
+    const projections = f.adapter.runtime.projections.bind(f.adapter.runtime)
+    let armed = true
+    f.adapter.runtime.projections = async (...args) => {
+      const values = await projections(...args)
+      if (armed) { armed = false; await snapshot.wait() }
+      return values
+    }
+    reading = f.handlers['task.get']({ taskId: 't1' }, context())
+    await snapshot.entered
+    retry = f.handlers['task.start'](params, context({ taskId: 't1' }))
+    snapshot.release()
+    await Promise.all([reading, retry])
+    // Either the read settles cancellation first and the retry does not send,
+    // or delivery wins and the ledger remains accepted with a removable item.
+    const stored = await f.stored()
+    assert.equal(f.session.inbox.length, stored?.state === 'cancelled' ? 0 : 1)
+    if (stored?.state === 'accepted') {
+      assert.deepEqual(await f.handlers['task.cancel']({ taskId: 't1' }, context()), { cancelled: true, how: 'removed-from-queue' })
+    }
+    assert.equal(f.session.inbox.length, 0)
+  } finally { snapshot.release(); await Promise.allSettled([reading, retry]); await f.cleanup() }
+})

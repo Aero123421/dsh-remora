@@ -184,6 +184,9 @@ export class Tasks {
     const unchanged = (): Evaluation => ({ state: record.state, attention: [], events: [], turns: [], ...(record.error ? { error: record.error } : {}) })
     if (record.sessionId === null || TERMINAL_TASK_STATES.has(record.state) || this.inflight.has(record.taskId)) return unchanged()
     const sessionId = record.sessionId
+    // Watcher's snapshot may predate this task's publication or delivery. An
+    // accepted task needs a fresh read before absence can settle cancellation.
+    if (record.state === 'accepted') preloaded = undefined
     const events = preloaded?.events ?? await this.rt.events(sessionId, signal)
     const values = preloaded ? preloaded.values : await this.rt.projections(sessionId, signal)
     const attention = this.rt.attention(sessionId, events, values)
@@ -226,6 +229,15 @@ export class Tasks {
 
   /** Re-evaluate one task and persist/emit a state change. */
   async refresh(record: TaskRecord, signal: AbortSignal, preloaded?: { events: readonly DshSessionEvent[]; values: DshProjectionValues | null }): Promise<{ record: TaskRecord; evaluation: Evaluation }> {
+    record = this.rt.deps.tasks.get(record.taskId) ?? record
+    if (this.inflight.has(record.taskId)) return { record, evaluation: await this.evaluate(record, signal) }
+    // Keep the snapshot read and its saved decision in the delivery/cancel lane.
+    // A read that settles absence first must prevent a subsequent retry sending.
+    return this.lane(record.taskId, () => this.refreshLocked(record, signal, preloaded))
+  }
+
+  private async refreshLocked(record: TaskRecord, signal: AbortSignal, preloaded?: { events: readonly DshSessionEvent[]; values: DshProjectionValues | null }): Promise<{ record: TaskRecord; evaluation: Evaluation }> {
+    record = this.rt.deps.tasks.get(record.taskId) ?? record
     let evaluation: Evaluation
     try {
       evaluation = await this.evaluate(record, signal, preloaded)
@@ -635,7 +647,7 @@ export class Tasks {
       record = await this.save(record, 'cancelled')
       return { cancelled: true, how: 'stopped-session' }
     }
-    const refreshed = await this.refresh(record, context.signal)
+    const refreshed = await this.refreshLocked(record, context.signal)
     if (TERMINAL_TASK_STATES.has(refreshed.record.state)) return { cancelled: false, how: 'already-finished' }
     throw new OperationError('conflict', 'the task is changing turns; retry cancellation')
   }
