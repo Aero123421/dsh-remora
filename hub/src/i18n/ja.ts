@@ -52,6 +52,7 @@ export const ja: Messages = {
   'msg.passkey-added': 'パスキーを追加しました。',
   'msg.passkey-removed': 'パスキーを削除しました。ペアリング済みの DSH ホストは、各ホストの DSH で新しい一覧を承認するまで、削除したパスキーを危険な操作の確認に使える鍵として信頼し続けます。',
   'msg.passkey-last': '最後の 1 本は削除できません。先に別のパスキーを追加してください。',
+  'msg.passkey-missing': 'そのパスキーは登録されていません。一覧を更新して、残っているパスキーを確認してください。',
   'msg.token-revoked': '個人トークンを取り消しました。',
   'msg.client-revoked': '接続を取り消しました。',
   'msg.grant-saved': '権限を保存しました。',

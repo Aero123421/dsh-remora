@@ -119,11 +119,11 @@ export function useAction(t: Translate, store: SnapshotStore<RemoraSnapshot>) {
   return { run: store.run, busy, error: actionError === null ? null : errorText(t, actionError) }
 }
 
-export function formatRemaining(ms: number): string {
+export function formatRemaining(ms: number, t: Translate): string {
   const minutes = Math.max(0, Math.ceil(ms / 60_000))
   const h = Math.floor(minutes / 60)
   const m = minutes % 60
-  return h > 0 ? `${h}h ${m}m` : `${m}m`
+  return h > 0 ? t('perm.remainingHours', { h, m }) : t('perm.remainingMinutes', { m })
 }
 
 export function formatTime(at: number): string {

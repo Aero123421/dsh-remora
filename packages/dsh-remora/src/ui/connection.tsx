@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Button, Input, Modal, StateDot } from 'remora-official-primitives'
 import type { RemoraSnapshot } from '../state.ts'
 import type { Translate } from './api.ts'
@@ -19,8 +19,9 @@ export function ConnectionSection({ snapshot, t, run, busy }: SectionProps) {
   const [hostName, setHostName] = useState(snapshot.settings.hostName)
   const [repairing, setRepairing] = useState(false)
   const [confirmUnpair, setConfirmUnpair] = useState(false)
+  const hubUrlEdited = useRef(false)
   useEffect(() => { setHostName(snapshot.settings.hostName) }, [snapshot.settings.hostName])
-  useEffect(() => { if (hub.url && hubUrl === '') setHubUrl(hub.url) }, [hub.url, hubUrl])
+  useEffect(() => { if (!hubUrlEdited.current && hub.url) setHubUrl(hub.url) }, [hub.url])
   const waiting = pairing.phase === 'waiting' || pairing.phase === 'starting'
   const showPairForm = !hub.paired || repairing || waiting
   const link = hub.link
@@ -87,7 +88,7 @@ export function ConnectionSection({ snapshot, t, run, busy }: SectionProps) {
         <span>{t('conn.hubUrl')}</span>
         <span className="rmr-muted">{repairing ? t('conn.repairHint') : t('conn.hubUrlHint')}</span>
         <div className="rmr-inline">
-          <Input className="rmr-grow" data-testid="remora-hub-url" value={hubUrl} placeholder="https://remora-hub.example.workers.dev" aria-label={t('conn.hubUrl')} disabled={waiting} onChange={event => setHubUrl(event.target.value)} />
+          <Input className="rmr-grow" data-testid="remora-hub-url" value={hubUrl} placeholder="https://remora-hub.example.workers.dev" aria-label={t('conn.hubUrl')} disabled={waiting} onChange={event => { hubUrlEdited.current = true; setHubUrl(event.target.value) }} />
           {waiting
             ? <Button variant="outline" size="sm" onClick={() => { void run('pairing-cancel') }}>{t('cancel')}</Button>
             : <Button variant="primary" size="sm" data-testid="remora-pair-start" disabled={busy || hubUrl.trim() === '' || !snapshot.local || hub.lock === 'restart' || hub.lock === 'other'} title={snapshot.local ? undefined : t('err.local-only')}

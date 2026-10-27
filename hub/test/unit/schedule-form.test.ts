@@ -15,6 +15,9 @@ test('zonedTime reads a wall-clock time in a time zone, across daylight saving',
   assert.equal(zonedTime('2026-12-01T12:00', 'America/New_York'), '2026-12-01T17:00:00Z')
   assert.equal(zonedTime('2026-10-13 09:00', 'UTC'), null)
   assert.equal(zonedTime('2026-10-13T09:00', 'Mars/Olympus'), null)
+  assert.equal(zonedTime('2026-03-08T02:30', 'America/New_York'), null)
+  assert.equal(zonedTime('2026-03-08T03:30', 'America/New_York'), '2026-03-08T07:30:00Z')
+  assert.equal(zonedTime('2026-11-01T01:30', 'America/New_York'), '2026-11-01T05:30:00Z')
 })
 
 test('whenFromForm turns the hub form into one schedule shape', () => {

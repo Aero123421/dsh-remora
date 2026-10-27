@@ -52,6 +52,7 @@ export const zh: Messages = {
   'msg.passkey-added': '已添加通行密钥。',
   'msg.passkey-removed': '已移除通行密钥。在你于每台主机的 DSH 中批准新列表之前，已配对的 DSH 主机在危险操作上仍会信任它。',
   'msg.passkey-last': '不能移除唯一的通行密钥。请先添加另一个。',
+  'msg.passkey-missing': '这个通行密钥没有注册。请刷新列表，确认仍在的通行密钥。',
   'msg.token-revoked': '已撤销个人令牌。',
   'msg.client-revoked': '已撤销连接。',
   'msg.grant-saved': '已保存访问权限。',

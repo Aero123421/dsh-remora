@@ -139,8 +139,20 @@ export function whenOf(cmd: Cmd): ScheduleWhen {
   const at = str(cmd.args, 'at')
   if (at !== undefined) {
     // With an offset as given; without one, read as this machine's local time.
-    const withOffset = /(Z|[+-]\d{2}:\d{2})$/i.test(at.trim())
-    const parsed = Date.parse(withOffset ? at.trim() : at.trim().replace(' ', 'T'))
+    // A date alone is local midnight. Date.parse treats `YYYY-MM-DD` as UTC.
+    const trimmed = at.trim()
+    const withOffset = /(Z|[+-]\d{2}:\d{2})$/i.test(trimmed)
+    const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed)
+    let parsed: number
+    if (dateOnly) {
+      const year = Number(dateOnly[1])
+      const month = Number(dateOnly[2])
+      const day = Number(dateOnly[3])
+      const local = new Date(year, month - 1, day)
+      parsed = local.getFullYear() === year && local.getMonth() === month - 1 && local.getDate() === day ? local.getTime() : Number.NaN
+    } else {
+      parsed = Date.parse(withOffset ? trimmed : trimmed.replace(' ', 'T'))
+    }
     if (!Number.isFinite(parsed)) throw usageError('--at は 2026-10-13T09:00 や 2026-10-13T09:00:00+09:00 のように指定してください。')
     given.push({ at: withOffset ? at.trim() : new Date(parsed).toISOString() })
   }

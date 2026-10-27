@@ -54,6 +54,7 @@ export const en = {
   'msg.passkey-added': 'Passkey added.',
   'msg.passkey-removed': 'Passkey removed. Paired DSH hosts keep trusting it for dangerous operations until you approve the new list in DSH on each host.',
   'msg.passkey-last': 'You cannot remove your only passkey. Add another one first.',
+  'msg.passkey-missing': 'That passkey is not registered. Refresh the list and check the passkeys that remain.',
   'msg.token-revoked': 'Personal token revoked.',
   'msg.client-revoked': 'Connection revoked.',
   'msg.grant-saved': 'Access saved.',

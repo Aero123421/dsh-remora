@@ -58,6 +58,20 @@ test('kill switch toggles and validates its payload; turning it off needs this P
   } finally { await p.close() }
 })
 
+test('a forbidden slash command is rejected and not stored', async () => {
+  const p = await plugin()
+  try {
+    const denied = await rpc<RemoraSnapshot>(p.routes, 'settings', { scope: { commands: ['/permission'] } })
+    assert.equal(denied.ok ? null : denied.error.code, 'remora/invalid-payload')
+    const state = await rpc<RemoraSnapshot>(p.routes, 'state')
+    assert.ok(state.ok)
+    assert.deepEqual(state.value.settings.scope.commands, [])
+    const saved = await rpc<RemoraSnapshot>(p.routes, 'settings', { scope: { commands: ['compact'] } })
+    assert.ok(saved.ok)
+    assert.deepEqual(saved.value.settings.scope.commands, ['/compact'])
+  } finally { await p.close() }
+})
+
 test('requests with the wrong media type or method name are refused', async () => {
   const p = await plugin()
   try {
