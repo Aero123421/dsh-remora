@@ -438,6 +438,10 @@ export class RemoraCore {
   private async stopLink(state: 'idle' | 'stopped', error: string | null, removeSchedules?: string): Promise<void> {
     this.dispatcher.abortAll('link stopped')
     this.link.stop(state, error)
+    // The link will not reconnect. A question or approval Remora is still
+    // holding goes back to DSH's own card instead of being rejected here
+    // when the wait ends.
+    try { this.adapter?.releaseAnswers?.() } catch (releaseError) { this.ctx.logger.warn('Remora: could not release held answers', releaseError) }
     try {
       await this.adapter?.stopClones?.()
       await this.keyWrites
