@@ -332,11 +332,12 @@ export class HubDO extends DurableObject<Env> {
   }
 
   /** The last passkey cannot be removed: the hub would be locked except for recovery codes. */
-  async removePasskey(credentialId: string): Promise<boolean> {
-    if (this.count('SELECT COUNT(*) AS n FROM passkeys') <= 1) return false
-    this.sql.exec('DELETE FROM passkeys WHERE credential_id = ?', credentialId)
+  async removePasskey(credentialId: string): Promise<'removed' | 'last' | 'missing'> {
+    if (this.count('SELECT COUNT(*) AS n FROM passkeys') <= 1) return 'last'
+    const removed = this.sql.exec('DELETE FROM passkeys WHERE credential_id = ?', credentialId).rowsWritten > 0
+    if (!removed) return 'missing'
     await this.audit({ actor: 'owner', actorName: 'オーナー', operation: 'passkey.remove', hostId: null, outcome: 'ok', layer: null, reason: null })
-    return true
+    return 'removed'
   }
 
   async renamePasskey(credentialId: string, label: string): Promise<void> {
@@ -354,16 +355,37 @@ export class HubDO extends DurableObject<Env> {
 
   // --- recovery codes -------------------------------------------------------
 
-  private async replaceRecoveryCodes(): Promise<string[]> {
-    this.sql.exec('DELETE FROM recovery_codes')
+  /** In-flight regeneration. A second request on this object waits on the same codes. */
+  private recoveryInflight: Promise<string[]> | null = null
+
+  private replaceRecoveryCodes(): Promise<string[]> {
+    if (this.recoveryInflight) return this.recoveryInflight
+    const run = this.writeRecoveryCodes()
+    this.recoveryInflight = run
+    void run.finally(() => {
+      if (this.recoveryInflight === run) this.recoveryInflight = null
+    })
+    return run
+  }
+
+  /**
+   * Hash every code before deleting the old ones. The delete and inserts do not
+   * await, so another request cannot land between them. Concurrent callers share
+   * one run and therefore the same codes that were stored.
+   */
+  private async writeRecoveryCodes(): Promise<string[]> {
     const now = Date.now()
-    const codes: string[] = []
+    const prepared: { display: string; hash: string }[] = []
     for (let i = 0; i < RECOVERY_CODE_COUNT; i++) {
       const raw = base32(randomBytes(8)).slice(0, 12)
-      codes.push(`${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`)
-      this.sql.exec('INSERT INTO recovery_codes (hash, created_at) VALUES (?, ?)', await sha256Hex(`remora-recovery/v1\n${raw}`), now)
+      prepared.push({
+        display: `${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`,
+        hash: await sha256Hex(`remora-recovery/v1\n${raw}`),
+      })
     }
-    return codes
+    this.sql.exec('DELETE FROM recovery_codes')
+    for (const item of prepared) this.sql.exec('INSERT INTO recovery_codes (hash, created_at) VALUES (?, ?)', item.hash, now)
+    return prepared.map(item => item.display)
   }
 
   async regenerateRecoveryCodes(): Promise<string[]> {

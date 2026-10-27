@@ -71,6 +71,7 @@ test('schedules add turns one --after/--at/--every/--daily/--weekly/--cron into 
     [['--cron', '0 9 * * 1-5', '--tz', 'UTC'], { cron: { expression: '0 9 * * 1-5', timeZone: 'UTC' } }],
     [['--at', '2030-01-02T03:04:00+09:00'], { at: '2030-01-02T03:04:00+09:00' }],
     [['--at', '2030-01-02T03:04'], { at: new Date(2030, 0, 2, 3, 4).toISOString() }],
+    [['--at', '2030-01-02'], { at: new Date(2030, 0, 2).toISOString() }],
   ]
   for (const [flags, when] of cases) {
     const c = await loggedIn({ stdinText: 'from stdin' })
@@ -78,7 +79,7 @@ test('schedules add turns one --after/--at/--every/--daily/--weekly/--cron into 
     assert.deepEqual(hub.calls[0]?.params.when, when, flags.join(' '))
     assert.equal(hub.calls[0]?.params.prompt, 'from stdin')
   }
-  for (const flags of [[], ['--after', '5m', '--daily', '09:00'], ['--weekly', '18:30'], ['--every', '30s'], ['--daily', '25:00']]) {
+  for (const flags of [[], ['--after', '5m', '--daily', '09:00'], ['--weekly', '18:30'], ['--every', '30s'], ['--daily', '25:00'], ['--at', '2030-02-31']]) {
     const bad = await loggedIn()
     assert.equal(await main(['schedules', 'add', 's-1', '--title', 'x', ...flags, 'p'], bad.ctx), EXIT.usage, flags.join(' '))
     assert.equal(hub.calls.length, 0)

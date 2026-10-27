@@ -28,7 +28,10 @@ export function zonedTime(local: string, timeZone: string): string | null {
   // Two passes settle the offset around a daylight-saving change.
   const first = wall - offset(wall)
   const utc = wall - offset(first)
-  return Number.isFinite(utc) ? new Date(utc).toISOString().replace('.000Z', 'Z') : null
+  if (!Number.isFinite(utc)) return null
+  // A skipped wall time (spring forward) would otherwise land on a different hour.
+  if (utc + offset(utc) !== wall) return null
+  return new Date(utc).toISOString().replace('.000Z', 'Z')
 }
 
 const TIME = /^([01]\d|2[0-3]):[0-5]\d$/
