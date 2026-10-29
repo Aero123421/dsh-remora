@@ -7,16 +7,23 @@
 // DSH_UPSTREAM_COMMIT=<40-hex sha> fetches that commit instead of upstream.json.
 // DSH_UPSTREAM_DIR=<checkout> skips the git fetch and uses a local checkout.
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { cacheRoot, compileOfficial, ensureUpstream, packageRoot, upstreamIdentity } from './upstream.mjs'
+import { cacheRoot, compileOfficial, ensureUpstream, packageRoot, upstreamIdentity, upstreamRoot, writeEntry } from './upstream.mjs'
 
 await ensureUpstream()
 console.log(`DSH ${await upstreamIdentity()}: Remora adapter compat`)
 const bundle = join(cacheRoot, 'compat-host.mjs')
-await compileOfficial(join(packageRoot, 'scripts/compat/host-entry.ts'), bundle, {
+// 0.2.2 separates native tool execution; older pins have no such package.
+const nativeExecutor = existsSync(join(upstreamRoot, 'packages/core/tool-executor-native/src/index.ts'))
+const entry = await writeEntry('compat-entry.ts', `
+export * from ${JSON.stringify(join(packageRoot, 'scripts/compat/host-entry.ts'))}
+${nativeExecutor ? "export * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'" : ''}
+`)
+await compileOfficial(entry, bundle, {
   '@dsh-compat/mock-adapter': 'packages/core/agent-loop/tests/mock-adapter.ts',
   // Paths for @deepseek-ai/* overrides are relative to this package.
   '@deepseek-ai/node-addon-system/flock': 'scripts/compat/flock-shim.ts',
@@ -81,6 +88,7 @@ async function boot() {
   await ctx.plugin(dsh.SessionProjectionRegistry)
   await ctx.plugin(dsh.SystemPrompt, { personaPrefix: '' })
   await ctx.plugin(dsh.ToolRuntime)
+  if (nativeExecutor) await ctx.plugin(dsh.NativeExecutor)
   await ctx.plugin(dsh.AgentRegistry)
   await ctx.plugin(dsh.JsonlSessionPersistence, { root: join(root, 'sessions') })
   await ctx.plugin(dsh.SessionCheckpointPolicy)
@@ -113,6 +121,8 @@ async function boot() {
     retirePrompt: () => {},
   })
   ctx.provide('fs', {})
+  // No Remote gateway is composed; latest DSH queries its pending-event catalog.
+  ctx.provide('typertGateway', { getPendingRemoteEvents: () => [] })
   await ctx.plugin(dsh.CompatSessionQuery)
   // alpha.3: session list and search filter rows through remoteAccess.allows().
   // TypertRegistry provides that service's resource registry. An in-process call has no
