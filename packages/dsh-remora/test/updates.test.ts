@@ -751,7 +751,7 @@ test('unbounded DSH peer ranges are refused, and a 0.2 ceiling is accepted', asy
     const result = await checkForUpdate('0.1.0', fetchImpl, 123, runtime)
     assert.equal(result.installUnavailable, 'compatibility-unknown', peer)
   }
-  const accepted = ['>=0.2.1-alpha.2 <0.2.2-0', '>=0.2.1-alpha.2 <0.3.0-0', '^0.2.1']
+  const accepted = ['>=0.2.1-alpha.2 <0.2.2-0', '>=0.2.1-alpha.2 <=0.2.2-alpha.2', '>=0.2.1-alpha.2 <0.3.0-0', '^0.2.1']
   for (const peer of accepted) {
     const fetchImpl = async (url: string) => {
       if (url.startsWith('https://raw.githubusercontent.com/')) return Response.json({ name: 'dsh-remora', version: '0.2.0', dsh: { bundle: { patch: './cordis.patch.yml' } }, peerDependencies: { '@deepseek-ai/dsh': peer } })

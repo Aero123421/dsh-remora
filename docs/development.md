@@ -46,13 +46,15 @@ npm test
 - 質問・プランの確認・承認への外からの回答は `src/adapter/answerer.ts` が DSH の waterfall に入って受け付けます。`timed` モードの質問は `userQuestions.answer` で答えます。承認はパスキー確認が既定で、DSH 側のスイッチで MCP・CLI からも許可できます。
 - `packages/protocol` や `assets/` のロゴを変えたら `pnpm vendor:sync` を実行し、`hub/` 側のコピーも一緒にコミットします。
 
-## DSH 0.2.1-alpha.3
+## DSH の対応範囲
 
-`upstream.json` は `2fbf435`（0.2.1-alpha.3、2026-10-14）です。`peerDependencies` の `@deepseek-ai/dsh` は `>=0.2.1-alpha.2 <0.2.2-0` のままです。DSH は `semver.satisfies(runtime, range, { includePrerelease: true })` で見るので、0.2.1-alpha.3 と、それ以降の 0.2.1 プレリリース（`alpha.10`、`beta`、`rc` を含む）および 0.2.1 ではプラグインを読み飛ばしません。`0.2.2-alpha.1` 以降はこの範囲の外で、DSH は起動時に読み飛ばします。
+UI 部品のビルドに使う `upstream.json` は `2fbf435`（0.2.1-alpha.3、2026-10-14）です。実行時の `peerDependencies` は `>=0.2.1-alpha.2 <=0.2.2-alpha.2` です。DSH は `semver.satisfies(runtime, range, { includePrerelease: true })` で判定します。0.2.1 系の既存範囲に加え、確認した 0.2.2-alpha.2 までを受け付けます。これより新しい alpha・RC・正式版は、この確認には含めず範囲外にしています。
+
+0.2.2-alpha.2 では `sessionController.inspect()` がなくなったため、公開 `events()` の履歴ページを最初の cursor に固定して読みます。旧版の `inspect()` がある場合はその経路を使います。どちらも Agent を起こさない読み取りです。対象の公式コミット、履歴のページング、取消、認可と実サービスでの確認範囲は [2026-10-29 の互換性確認](dsh-compatibility-2026-10-29.md) にあります。
 
 HMR のあるプロファイルでは、導入済みパッケージへの `installBundle` はファイルを変えずに `already-installed` で失敗します。自己更新はそのときだけ `removeBundle` してから、外す前のオン／オフで入れ直します。HMR がない取り外しが `stop-profile` で、パッケージが残っているときは、入ったままのパッケージへ `installBundle` します。取り外しが例外で終わったとき、取り外しが `cancelled` で一覧から消えているとき、`stop-profile` 以外の失敗で一覧から消えているとき、または外したあとの導入が失敗・中止・上書き・例外でプラグインが無いときは、前の版を入れ直します。一覧に残っている失敗と取消はそのまま返し、一覧を読めないときは前の版を入れません。入れ直したと表示するのは、bundle 名・版・package の結果が前の版と一致するときだけです。入れ直しの request id は receipt に保存し、再起動後もその結果を追います。その保存が失敗したときはログに残し、更新状態を `restore-receipt-failed` にします。前の版の導入自体は続けます。
 
-候補の `peerDependencies` の `@deepseek-ai/dsh` は、下限と、`0.3.0-0` を含まない上限が両方ある範囲だけ導入できます。`*`、`x`、`>=0`、空文字、`<99`、`^0` は互換性不明として拒否します。`>=0.2.1-alpha.2 <0.3.0-0` と、それより狭い `>=0.2.1-alpha.2 <0.2.2-0` は範囲として受けます。実行中の DSH の版が取れないときも確認を省かず、導入しません。このプラグイン自身の peer は `>=0.2.1-alpha.2 <0.2.2-0` のままです。
+候補の `peerDependencies` の `@deepseek-ai/dsh` は、下限と、`0.3.0-0` を含まない上限が両方ある範囲だけ導入できます。`*`、`x`、`>=0`、空文字、`<99`、`^0` は互換性不明として拒否します。`>=0.2.1-alpha.2 <0.3.0-0` と、それより狭い `>=0.2.1-alpha.2 <0.2.2-0` は範囲として受けます。実行中の DSH の版が取れないときも確認を省かず、導入しません。
 
 CI のジョブ `Adapter compat (latest supported DSH)` は、プラグインの peer 範囲に入る最新の公開 `dsh-v*` タグ（RC を含む）のコミットに `DSH_UPSTREAM_COMMIT` を渡して `pnpm --filter dsh-remora test:compat` を実行します。ローカルの `test:compat` は `upstream.json` のコミットです。`DSH_UPSTREAM_DIR` を指定した場合、診断には実チェックアウトのコミットと変更の有無を表示します。
 
