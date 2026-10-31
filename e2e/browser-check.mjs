@@ -80,6 +80,18 @@ export async function assertNarrowRemora(page, section) {
         assert.deepEqual(tab.problems, [], `${value} mid-word break at ${width}px: ${tab.problems.join('; ')}`)
         assert.deepEqual(tab.inputOverflow, [], `${value} input overflow at ${width}px: ${JSON.stringify(tab.inputOverflow)}`)
         assert.deepEqual(tab.boxOverflow, [], `${value} box overflow at ${width}px: ${JSON.stringify(tab.boxOverflow)}`)
+        if (value === 'permissions') {
+          const grid = await section.locator('.rmr-levels').evaluate(element => ({
+            containerWidth: element.closest('.rmr').getBoundingClientRect().width,
+            columns: new Set([...element.children].map(child => child.getBoundingClientRect().x)).size,
+            rows: new Set([...element.children].map(child => child.getBoundingClientRect().y)).size,
+            cardOverflow: [...element.children].map(child => child.scrollWidth - child.clientWidth),
+          }))
+          assert.ok(grid.containerWidth <= 360, `${width}px should exercise the narrow container query: ${grid.containerWidth}px`)
+          assert.equal(grid.columns, 1, `${width}px permission columns`)
+          assert.equal(grid.rows, 4, `${width}px permission rows`)
+          assert.ok(grid.cardOverflow.every(overflow => overflow <= 1), `${width}px permission card overflow: ${grid.cardOverflow}`)
+        }
         assert.ok(tab.headerOverflow === null || tab.headerOverflow <= 1, `${width}px Open configuration file overflow ${tab.headerOverflow}`)
         if (tab.killHeight > 0) assert.ok(tab.killHeight < 320, `${width}px kill switch is ${tab.killHeight}px tall`)
       }
@@ -121,8 +133,15 @@ export async function checkSettingsLayout(page, section) {
             rows: new Set([...element.children].map(child => child.getBoundingClientRect().y)).size,
             columns: new Set([...element.children].map(child => child.getBoundingClientRect().x)).size,
             overflow: element.scrollWidth - element.clientWidth,
+            containerWidth: element.closest('.rmr').getBoundingClientRect().width,
+            cardOverflow: [...element.children].map(child => child.scrollWidth - child.clientWidth),
           }))
-          assert.deepEqual(grid, { rows: width === 1280 ? 2 : 4, columns: width === 1280 ? 2 : 1, overflow: 0 })
+          const narrow = grid.containerWidth <= 360
+          if (width === 1280) assert.ok(!narrow, `1280px should exercise the wide container query: ${grid.containerWidth}px`)
+          assert.equal(grid.rows, narrow ? 4 : 2, `permission rows at ${width}px; container ${grid.containerWidth}px`)
+          assert.equal(grid.columns, narrow ? 1 : 2, `permission columns at ${width}px; container ${grid.containerWidth}px`)
+          assert.equal(grid.overflow, 0)
+          assert.ok(grid.cardOverflow.every(overflow => overflow <= 1), `permission card overflow at ${width}px: ${grid.cardOverflow}`)
         }
       }
       await section.locator('#rmr-tabs-permissions').click()
