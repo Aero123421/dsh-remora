@@ -362,16 +362,16 @@ export class HubDO extends DurableObject<Env> {
     if (this.recoveryInflight) return this.recoveryInflight
     const run = this.writeRecoveryCodes()
     this.recoveryInflight = run
-    void run.finally(() => {
+    const clear = () => {
       if (this.recoveryInflight === run) this.recoveryInflight = null
-    })
+    }
+    void run.then(clear, clear)
     return run
   }
 
   /**
-   * Hash every code before deleting the old ones. The delete and inserts do not
-   * await, so another request cannot land between them. Concurrent callers share
-   * one run and therefore the same codes that were stored.
+   * Hash every code before atomically replacing the old ones. Concurrent callers
+   * share one run and therefore the same codes that were stored.
    */
   private async writeRecoveryCodes(): Promise<string[]> {
     const now = Date.now()
@@ -383,8 +383,10 @@ export class HubDO extends DurableObject<Env> {
         hash: await sha256Hex(`remora-recovery/v1\n${raw}`),
       })
     }
-    this.sql.exec('DELETE FROM recovery_codes')
-    for (const item of prepared) this.sql.exec('INSERT INTO recovery_codes (hash, created_at) VALUES (?, ?)', item.hash, now)
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec('DELETE FROM recovery_codes')
+      for (const item of prepared) this.sql.exec('INSERT INTO recovery_codes (hash, created_at) VALUES (?, ?)', item.hash, now)
+    })
     return prepared.map(item => item.display)
   }
 
