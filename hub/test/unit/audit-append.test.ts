@@ -24,6 +24,28 @@ function memorySql(): AuditSql & { rows: { seq: number; hash: string; prev_hash:
   }
 }
 
+test('a burst of overlapping appends preserves every entry', async () => {
+  const sql = memorySql()
+  const rows = await Promise.all(Array.from({ length: 32 }, (_, i) => appendAudit(sql, entry(i))))
+  const ordered = rows.sort((a, b) => a.seq - b.seq)
+  assert.deepEqual(ordered.map(row => row.seq), Array.from({ length: 32 }, (_, i) => i + 1))
+  assert.equal(await verifyAuditChain(ordered), null)
+})
+
+test('a failed append does not block the following append', async () => {
+  const sql = memorySql()
+  const exec = sql.exec
+  let fail = true
+  sql.exec = (query, ...args) => {
+    if (fail && query.startsWith('INSERT')) { fail = false; throw new Error('database failed') }
+    return exec(query, ...args)
+  }
+  const first = appendAudit(sql, entry(1))
+  const second = appendAudit(sql, entry(2))
+  await assert.rejects(first, /database failed/)
+  assert.equal((await second).seq, 1)
+})
+
 test('two overlapping appends take successive sequence numbers', async () => {
   const sql = memorySql()
   const [first, second] = await Promise.all([appendAudit(sql, entry(1)), appendAudit(sql, entry(2))])

@@ -77,18 +77,29 @@ export interface AuditSql {
 }
 
 const APPEND_ATTEMPTS = 8
+// One queue per Durable Object SQL handle. A burst must not exhaust the
+// optimistic retry budget merely because all hash computations overlap.
+const appendTails = new WeakMap<AuditSql, Promise<void>>()
 
 function isSeqConflict(error: unknown): boolean {
   return error instanceof Error && error.message.includes('UNIQUE constraint failed')
 }
 
 /**
- * Append one entry. Hashing awaits, so two requests on the same Durable Object
- * can read the same sequence. A conflicting insert retries with the next sequence
- * and a new hash. The caller still has to treat a thrown append as "the operation
- * may already have happened".
+ * Serialize appends on the same SQL handle, including across hashing awaits.
+ * A conflicting insert still retries with a new sequence and hash. The caller
+ * must treat a thrown append as "the operation may already have happened".
  */
-export async function appendAudit(sql: AuditSql, entry: AuditEntry, maxRows = AUDIT_KEPT_ROWS): Promise<AuditRow> {
+export function appendAudit(sql: AuditSql, entry: AuditEntry, maxRows = AUDIT_KEPT_ROWS): Promise<AuditRow> {
+  const previous = appendTails.get(sql) ?? Promise.resolve()
+  const result = previous.then(() => appendAuditOnce(sql, entry, maxRows))
+  const tail = result.then(() => {}, () => {})
+  appendTails.set(sql, tail)
+  void tail.then(() => { if (appendTails.get(sql) === tail) appendTails.delete(sql) })
+  return result
+}
+
+async function appendAuditOnce(sql: AuditSql, entry: AuditEntry, maxRows: number): Promise<AuditRow> {
   for (let attempt = 0; attempt < APPEND_ATTEMPTS; attempt++) {
     const last = sql.exec('SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1').toArray()[0] as { seq: number; hash: string } | undefined
     const seq = (last?.seq ?? 0) + 1
