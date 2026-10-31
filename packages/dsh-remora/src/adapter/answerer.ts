@@ -25,8 +25,16 @@
  * is not 0, the kill switch is off, the hub link is up, the DSH ceiling
  * allows the answering operation, and the session is in scope in a trusted,
  * ready workspace. Otherwise the request passes through untouched.
+ *
+ * A hold that later stops qualifying is let go the same way. The session left
+ * scope, its workspace is untrusted or not ready, or it was archived: hand the
+ * request back while another answerer still has it, and end it with the
+ * chain's own give-up only when that chain has already given up. Stopping the
+ * hub link for good (unpair, kill switch, revocation) does this at once. A
+ * link that is only reconnecting keeps the hold, so an outside answer can
+ * still arrive before the wait ends.
  */
-import type { AnswerPolicy } from '../ops/types.ts'
+import { OperationError, type AnswerPolicy } from '../ops/types.ts'
 import type { DshAgent, DshQuestionItem, DshSessionEvent, Disposer } from './dsh-types.ts'
 import { ASK_USER_QUESTION, parseQuestions, type HeldAttention } from './events.ts'
 import type { Runtime } from './runtime.ts'
@@ -101,6 +109,8 @@ export class Answerer {
   private readonly releases = new Map<HeldRequest, () => void>()
   private readonly disposers: Disposer[] = []
   private started = false
+  /** Bumps when a newer eligibility pass should ignore an older catalog read. */
+  private eligibilityEpoch = 0
   /** Called when a session's held requests change (the watcher re-sends its attention). */
   onChange: (sessionId: string) => void = () => undefined
 
@@ -143,7 +153,18 @@ export class Answerer {
   settingsChanged(): void {
     const policy = this.policy
     this.releaseWhere(entry => !policy || policy.waitMs() <= 0 || !policy.allows(entry.kind === 'approval' ? 'approval.respond' : 'attention.respond'))
+    this.scheduleEligibilityCheck()
     for (const sessionId of this.held.keys()) this.onChange(sessionId)
+  }
+
+  /**
+   * The hub link was stopped and will not reconnect. Outside answers can no
+   * longer arrive, so a card that is still up keeps the request and a chain
+   * that already gave up ends with that result.
+   */
+  linkStopped(): void {
+    this.eligibilityEpoch++
+    this.releaseWhere(() => true)
   }
 
   /** A held request, by session and attention id. */
@@ -263,6 +284,9 @@ export class Answerer {
       const waitMs = (): number => this.policy?.waitMs() ?? 0
       const tick = (): void => {
         if (done) return
+        // Scope, trust and archive can change without a settings write. A
+        // reconnecting link is left alone; linkStopped covers a link that is gone.
+        this.scheduleEligibilityCheck()
         const now = Date.now()
         if (entry.alone) {
           if (entry.expiresAt === null || now >= entry.expiresAt) { finish(rules.unanswered(waitMs()), false); return }
@@ -333,6 +357,42 @@ export class Answerer {
 
   private releaseWhere(test: (entry: HeldRequest) => boolean): void {
     for (const [entry, release] of [...this.releases]) if (test(entry)) release()
+  }
+
+  /** Re-read each held session. A newer pass cancels an older one before it lets go. */
+  private scheduleEligibilityCheck(): void {
+    const epoch = ++this.eligibilityEpoch
+    const entries = [...this.releases.keys()]
+    if (entries.length === 0) return
+    void this.dropIneligible(entries, epoch)
+  }
+
+  private async dropIneligible(entries: readonly HeldRequest[], epoch: number): Promise<void> {
+    for (const entry of entries) {
+      if (this.eligibilityEpoch !== epoch) return
+      const release = this.releases.get(entry)
+      if (!release) continue
+      const decision = await this.sessionStillEligible(entry)
+      if (this.eligibilityEpoch !== epoch) return
+      if (decision === 'release') release()
+    }
+  }
+
+  /**
+   * `release` only when this session is positively no longer one Remora may
+   * drive. A catalog timeout or an unknown failure keeps the hold: ending it
+   * would reject an approval the owner can still answer.
+   */
+  private async sessionStillEligible(entry: HeldRequest): Promise<'keep' | 'release'> {
+    try {
+      const row = await this.rt.row(entry.sessionId, AbortSignal.timeout(5_000))
+      if (row.subagent || row.archived) return 'release'
+      this.rt.assertCanDriveTurns(row.workspace?.id ?? null)
+      return 'keep'
+    } catch (error) {
+      if (error instanceof OperationError && (error.code === 'denied' || error.code === 'conflict' || error.code === 'gone' || error.code === 'not_found')) return 'release'
+      return 'keep'
+    }
   }
 
   /** Whether a DSH Web tab is connected; null when this DSH cannot tell (no gateway, e.g. the terminal UI). */

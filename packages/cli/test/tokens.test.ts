@@ -86,8 +86,11 @@ test('macOS and Windows backends pass secrets on stdin only', async () => {
     if (command === 'security' && args[0] === 'find-generic-password') return { code: 0, stdout: `${stored}\n`, stderr: '' }
     if (command === 'powershell.exe') {
       const script = Buffer.from(args[args.length - 1] as string, 'base64').toString('utf16le')
-      if (script.includes('ConvertFrom-SecureString')) return { code: 0, stdout: `01000000d08c${Buffer.from(options.input ?? '').toString('hex')}\r\n`, stderr: '' }
-      return { code: 0, stdout: Buffer.from((options.input ?? '').slice(12), 'hex').toString(), stderr: '' }
+      if (!script.includes('OutputEncoding')) return { code: 1, stdout: '', stderr: 'encoding' }
+      // Windows PowerShell 5.1 redirected stdout is UTF-16LE. Node's utf8 decoder keeps the NULs.
+      const asUtf16 = (text: string) => text.split('').join('\0')
+      if (script.includes('ConvertFrom-SecureString')) return { code: 0, stdout: asUtf16(`01000000d08c${Buffer.from(options.input ?? '').toString('hex')}\r\n`), stderr: '' }
+      return { code: 0, stdout: asUtf16(Buffer.from((options.input ?? '').replaceAll('\0', '').slice(12), 'hex').toString()), stderr: '' }
     }
     return { code: 1, stdout: '', stderr: '' }
   }

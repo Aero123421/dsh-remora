@@ -23,7 +23,7 @@ function setup(options: Options = {}) {
   h.deps.answers = { waitMs: () => policy.wait, approvalsFromRemote: () => policy.approvals, allows: () => policy.allows, linked: () => policy.linked }
   const adapter = buildAdapter(dsh.ctx(), h.deps)
   adapter.start()
-  return { dsh, adapter, policy, events: h.events, handlers: adapter.handlers as Required<typeof adapter.handlers> }
+  return { dsh, adapter, policy, scope: h.deps.scope, events: h.events, handlers: adapter.handlers as Required<typeof adapter.handlers> }
 }
 
 /** An answerer after Remora that holds the request until answered or withdrawn (DSH Web's card, or DSH's gateway with no tab). */
@@ -228,6 +228,49 @@ test('an approval nobody answers comes back unavailable (DSH rejects it); one Re
   assert.equal((await item(handlers, 'approval:ap-2'))?.answerVia, 'dsh-web')
   assert.equal(await code(handlers['approval.respond']({ sessionId: 's1', attentionId: 'approval:ap-2', answer: { approve: true } }, context())), 'unavailable')
   adapter.dispose()
+})
+
+test('a held request goes back to DSH when the session leaves scope, the workspace is untrusted, or the hub link is stopped', async () => {
+  const answer = { answers: [{ id: 'color', selected: ['Teal'] }] }
+  {
+    const workspaces = ['ws-a']
+    const { dsh, adapter } = setup({ web: false, wait: 60_000, scope: { workspaces } })
+    const gateway = addCard(dsh, 'user-questions/request')
+    const { result } = ask(dsh, openQuestion(dsh))
+    await until(() => adapter.answerer.find('s1', 'call-1') !== undefined, 3000, 'held question')
+    workspaces.splice(0, 1)
+    adapter.settingsChanged()
+    await until(() => adapter.answerer.find('s1', 'call-1') === undefined, 3000, 'question released')
+    assert.equal(gateway.withdrawn(), 0, 'DSH keeps the card')
+    gateway.pending[0]!.resolve(answer)
+    assert.deepEqual(await result, answer)
+    adapter.dispose()
+  }
+  {
+    const { dsh, adapter, scope } = setup({ web: true })
+    const web = addCard(dsh, 'user-questions/request')
+    const { result } = ask(dsh, openQuestion(dsh))
+    await until(() => adapter.answerer.find('s1', 'call-1') !== undefined, 3000, 'held question')
+    await scope.markUntrustedWorkspace('ws-a')
+    adapter.settingsChanged()
+    await until(() => adapter.answerer.find('s1', 'call-1') === undefined, 3000, 'question released')
+    web.pending[0]!.resolve(answer)
+    assert.deepEqual(await result, answer)
+    assert.equal(web.withdrawn(), 0)
+    adapter.dispose()
+  }
+  {
+    const { dsh, adapter } = setup({ web: true })
+    const web = addCard(dsh, 'user-questions/request')
+    const { result } = ask(dsh, openQuestion(dsh))
+    await until(() => adapter.answerer.find('s1', 'call-1') !== undefined, 3000, 'held question')
+    adapter.releaseAnswers()
+    assert.equal(adapter.answerer.find('s1', 'call-1'), undefined)
+    web.pending[0]!.resolve(answer)
+    assert.deepEqual(await result, answer)
+    assert.equal(web.withdrawn(), 0)
+    adapter.dispose()
+  }
 })
 
 test('Remora lets go when the turn is cancelled, the wait is turned off, or the plugin unloads', async () => {

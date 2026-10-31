@@ -21,7 +21,7 @@ function byLevel(op: OperationRow, level: Level, fullActive: boolean): boolean {
 
 export function FullBadge({ t, expiresAt, now }: { t: SectionProps['t']; expiresAt: number | null; now: number }) {
   return <span className="rmr-full-badge">
-    {t('perm.fullBadge')}{expiresAt !== null ? ` · ${t('perm.fullRemaining', { time: formatRemaining(expiresAt - now) })}` : ''}
+    {t('perm.fullBadge')}{expiresAt !== null ? ` · ${t('perm.fullRemaining', { time: formatRemaining(expiresAt - now, t) })}` : ''}
   </span>
 }
 

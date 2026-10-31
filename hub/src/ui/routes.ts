@@ -24,6 +24,7 @@ import {
   type AttentionItem, type Confirmation, type ConfirmationInfo, type HostSummary, type RemoraError, type ScheduleInfo, type SearchHit, type SessionForkResult,
   type HostRotateKeyResult, type SessionGetResult, type SessionSummary, type TaskInfo, type TerminalRunOutput, type WorkspaceSummary,
 } from '../vendor/protocol/index.ts'
+import { approvalSignedPayloads } from './approval-preview.ts'
 import { whenFromForm } from './schedule-form.ts'
 import { copyField, flash, h, page, pageHead, raw, reauthForm, uiFor, visibleText, type NavKey, type Raw, type Ui } from './layout.ts'
 
@@ -36,6 +37,7 @@ const MESSAGES: Readonly<Record<string, ['ok' | 'error' | 'warn']>> = {
   'passkey-added': ['ok'],
   'passkey-removed': ['warn'],
   'passkey-last': ['error'],
+  'passkey-missing': ['error'],
   'token-revoked': ['ok'],
   'client-revoked': ['ok'],
   'grant-saved': ['ok'],
@@ -733,6 +735,7 @@ function attentionCard(ui: Ui, item: AttentionItem, host: CardHost, single = fal
     answer = h`<p class="muted">${t('attention.offline')}</p>`
   } else if (route === 'passkey') {
     const params = { hostId: host.hostId, sessionId: item.sessionId, attentionId: item.attentionId }
+    const signed = approvalSignedPayloads(params)
     answer = host.canApprove
       ? h`<form data-confirm-op="approval.respond" data-host="${host.hostId}" data-params="${JSON.stringify(params)}" data-done="/attention?msg=sent" class="stack">
   <div class="actions"><button class="primary" type="submit" data-approve="true" data-testid="hub-approval-allow">${t('attention.approval.allow')}</button>
@@ -741,7 +744,10 @@ function attentionCard(ui: Ui, item: AttentionItem, host: CardHost, single = fal
 </form>
 <details class="plain confirm-preview"><summary>${t('attention.signed')}</summary>
   <p class="muted small">${t('attention.signedHelp')}</p>
-  <pre class="codes">${JSON.stringify({ operation: 'approval.respond', ...params, answer: { approve: true } }, null, 2)}</pre></details>`
+  <p class="muted small">${t('attention.approval.allow')}</p>
+  <pre class="codes">${signed.allow}</pre>
+  <p class="muted small">${t('attention.approval.reject')}</p>
+  <pre class="codes">${signed.reject}</pre></details>`
       : h`<p class="muted not-answerable">${t('attention.approval.unsupported')}</p>`
   } else if (item.kind === 'plan-review') {
     answer = h`<form method="post" action="/attention/respond" class="stack">
@@ -1373,8 +1379,9 @@ export async function handleUi(request: Request, env: Env): Promise<Response | n
     }
     case '/settings/passkeys/remove': {
       if (!session.fresh) return redirect('/settings?msg=reauth#passkeys')
-      const ok = await hub.removePasskey(form.get('credentialId') ?? '')
-      return redirect(`/settings?msg=${ok ? 'passkey-removed' : 'passkey-last'}#passkeys`)
+      const removed = await hub.removePasskey(form.get('credentialId') ?? '')
+      const msg = removed === 'removed' ? 'passkey-removed' : removed === 'last' ? 'passkey-last' : 'passkey-missing'
+      return redirect(`/settings?msg=${msg}#passkeys`)
     }
     case '/settings/recovery': {
       if (!session.fresh) return redirect('/settings?msg=reauth#recovery')

@@ -76,6 +76,7 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
       tasks.settingsChanged()
       watcher.settingsChanged()
     },
+    releaseAnswers: () => answerer.linkStopped(),
     removeRemoteSchedules: removeRemote,
     dispose: async () => {
       answerer.dispose()
@@ -93,6 +94,6 @@ export function buildAdapter(ctx: HostContext, deps: AdapterDeps, options: Adapt
 }
 
 export const createAdapter: CreateAdapter = (ctx, deps) => {
-  const { handlers, has, prepare, stopClones, start, settingsChanged, removeRemoteSchedules, dispose } = buildAdapter(ctx, deps, { deferRecovery: true })
-  return { handlers, has, prepare, stopClones, start, settingsChanged, removeRemoteSchedules, dispose }
+  const { handlers, has, prepare, stopClones, start, settingsChanged, releaseAnswers, removeRemoteSchedules, dispose } = buildAdapter(ctx, deps, { deferRecovery: true })
+  return { handlers, has, prepare, stopClones, start, settingsChanged, releaseAnswers, removeRemoteSchedules, dispose }
 }
