@@ -61,6 +61,7 @@ gateway calls are not composed.
 - The model is DSH's own scripted `MockAdapter` (`packages/core/agent-loop/tests/mock-adapter.ts`).
 - `@deepseek-ai/node-addon-system/flock` is replaced by a no-op (`flock-shim.ts`): the prebuilt native addon is not installed and the run is one process.
 - `agentDefaultModel`, `attachments`, `fileUploads` and `fs` are minimal stubs, as in DSH's own session-controller test harness. `typert` is the real registry.
+- `typertGateway.getPendingRemoteEvents` returns an empty list: no Remote gateway is composed. On 0.2.2, the real native tool executor is mounted; older sources without that package keep their integrated executor.
 - Full-text session search is not composed (`CompatSessionQuery` rejects searches).
 
 ## Not covered

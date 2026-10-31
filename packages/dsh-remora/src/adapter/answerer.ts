@@ -184,6 +184,8 @@ export class Answerer {
 
   private async onQuestion(request: QuestionRequest, next: () => Promise<unknown>): Promise<unknown> {
     if (!request || request.wait?.timed === true || !Array.isArray(request.questions) || request.questions.length === 0) return next()
+    // 0.2.2 application consent belongs to DSH's local approval UI, not a tool question.
+    if (request.questions.some(question => question.intent?.kind === 'approval')) return next()
     const agent = request.agent
     const sessionId = await this.eligible('attention.respond', agent, request.signal)
     if (sessionId === null || !agent) return next()

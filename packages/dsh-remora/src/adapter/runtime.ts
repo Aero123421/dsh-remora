@@ -301,7 +301,33 @@ export class Runtime {
 
   async events(sessionId: string, signal: AbortSignal): Promise<readonly DshSessionEvent[]> {
     try {
-      return (await this.sessions.inspect(sessionId, signal)).events
+      const sessions = this.sessions
+      if (typeof sessions.inspect === 'function') return (await sessions.inspect(sessionId, signal)).events
+      if (typeof sessions.events !== 'function') throw unavailable('DSH session history is not available')
+      const parentSessionId = this.parents.get(sessionId)
+      const address = parentSessionId
+        ? { kind: 'subagent' as const, parentSessionId, childSessionId: sessionId, mode: 'unknown' as const }
+        : { kind: 'session' as const, sessionId }
+      const pages: DshSessionEvent[][] = []
+      let throughSeq: number | undefined
+      let beforeSeq: number | undefined
+      for (;;) {
+        signal.throwIfAborted()
+        const page = await sessions.events({ address, maxMessages: 1000,
+          ...(throughSeq === undefined ? {} : { throughSeq }),
+          ...(beforeSeq === undefined ? {} : { beforeSeq }),
+        }, signal)
+        signal.throwIfAborted()
+        const events = page.records.map(record => record.event)
+        pages.push(events)
+        throughSeq ??= page.cursor
+        if (!page.hasMore) return pages.reverse().flat()
+        const firstSeq = events[0]?.seq
+        if (firstSeq === undefined || (beforeSeq !== undefined && firstSeq >= beforeSeq)) {
+          throw unavailable('DSH session history did not advance to an older page')
+        }
+        beforeSeq = firstSeq
+      }
     } catch (error) {
       if (isNotFound(error)) throw this.missing(sessionId)
       throw fromDsh(error, 'reading the session log failed')
@@ -365,7 +391,7 @@ export class Runtime {
 
 export function isNotFound(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code
-  if (code === 'session/not-found' || code === 'SESSION_QUERY_SESSION_NOT_FOUND') return true
+  if (code === 'session/not-found' || code === 'subagent/not-found' || code === 'SESSION_QUERY_SESSION_NOT_FOUND') return true
   // inspect() throws ApiSessionNotFound (a bare Error subclass) for a cold miss.
   return error instanceof Error && code === undefined
     && (error.constructor.name === 'ApiSessionNotFound' || /^session ".*" not found$/.test(error.message))

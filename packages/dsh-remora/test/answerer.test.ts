@@ -65,6 +65,22 @@ async function code(promise: Promise<unknown>): Promise<string> {
   }
 }
 
+test('application consent stays with DSH even when an unrelated tool question is pending', async t => {
+  const { dsh, adapter } = setup({ web: true })
+  t.after(() => adapter.dispose())
+  const web = addCard(dsh, 'user-questions/request')
+  const agent = openQuestion(dsh)
+  const { result, controller } = ask(dsh, agent, {
+    questions: [{ id: 'application', question: 'Allow application control?', intent: { kind: 'approval', approve: 'Allow' } }],
+  })
+  await until(() => web.pending.length === 1)
+  assert.equal(adapter.answerer.find('s1', 'call-1'), undefined)
+  assert.equal(web.pending[0]!.request.signal, controller.signal)
+  const answer = { answers: [{ id: 'application', selected: ['Allow'] }] }
+  web.pending[0]!.resolve(answer)
+  assert.deepEqual(await result, answer)
+})
+
 test('a legacy question while DSH Web is open: an answer from outside wins and withdraws the Web card', async () => {
   const { dsh, adapter, handlers } = setup({ web: true })
   const web = addCard(dsh, 'user-questions/request')

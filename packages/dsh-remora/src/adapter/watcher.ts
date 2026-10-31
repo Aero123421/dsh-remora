@@ -188,10 +188,10 @@ export class Watcher {
 
   private async refresh(sessionId: string): Promise<void> {
     const signal = this.abort.signal
-    let inspection
+    let events
     try {
       await this.rt.row(sessionId, signal)
-      inspection = await this.rt.sessions.inspect(sessionId, signal)
+      events = await this.rt.events(sessionId, signal)
     } catch (error) {
       this.keepUnread(sessionId, error)
       return
@@ -203,7 +203,6 @@ export class Watcher {
       this.keepUnread(sessionId, error)
       return
     }
-    const events = inspection.events
     for (const record of this.tasks.active(sessionId)) {
       if (TERMINAL_TASK_STATES.has(record.state)) continue
       await this.tasks.refresh(record, signal, { events, values }).catch((error: unknown) => {

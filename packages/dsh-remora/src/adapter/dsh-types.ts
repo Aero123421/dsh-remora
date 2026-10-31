@@ -1,5 +1,5 @@
 /**
- * Structural types for the DSH (0.2.1-alpha.2) services the adapter touches.
+ * Structural types for the DSH services the adapter touches (0.2.1 and 0.2.2-alpha.2).
  *
  * DSH packages are not dependencies of the plugin, so these are hand-written
  * mirrors of the real shapes, trimmed to the fields actually read. Every
@@ -120,7 +120,14 @@ export interface DshModelCatalog {
 
 export interface DshSessionController {
   list(request: { cursor?: string }, signal: AbortSignal): Promise<{ items: readonly DshSessionSummary[] }>
-  inspect(sessionId: string, signal?: AbortSignal): Promise<DshSessionInspection>
+  inspect?(sessionId: string, signal?: AbortSignal): Promise<DshSessionInspection>
+  /** 0.2.2 replaces inspect with passive, cursor-pinned history pages. */
+  events?(request: {
+    address: { kind: 'session'; sessionId: string } | { kind: 'subagent'; parentSessionId: string; childSessionId: string; mode: 'unknown' }
+    throughSeq?: number
+    beforeSeq?: number
+    maxMessages: number
+  }, signal: AbortSignal): Promise<{ records: readonly { type: 'event'; event: DshSessionEvent }[]; hasMore: boolean; cursor: number }>
   projections(request: { sessionId: string }, signal: AbortSignal): Promise<DshProjectionsValue>
   create(request: { workspaceId?: string; cwd?: string; sessionId?: string; agentPreset?: string }): Promise<{ sessionId: string; agentPreset?: string }>
   rename(request: { sessionId: string; title: string }): Promise<{ title: string; seq: number }>

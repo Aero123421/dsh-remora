@@ -6,7 +6,7 @@ Remora の DSH プラグインです。DSH の設定画面に「Remora」タブ�
 
 [GitHub Releases](https://github.com/Aero123421/dsh-remora/releases) から `dsh-remora-<版>.tgz` の URL をコピーし、DSH Web の「Plugins → Add plugin」に貼ります。`SHA256SUMS` で中身を確かめられます。実行時の依存もインストール時のスクリプトもありません。
 
-対応する DSH: `>=0.2.1-alpha.2 <0.2.2-0`
+対応する DSH: `>=0.2.1-alpha.2 <=0.2.2-alpha.2`。確認した最新 alpha.2 を上限とし、それより新しい alpha・RC・正式版は対象外です。
 
 日本語の表示には [dsh-japanese](https://github.com/Aero123421/dsh-japanese) が必要です。Remora は `en`、`ja`、`zh` の辞書を登録するだけで、言語 `ja` は定義しません。dsh-japanese が無いとき、言語メニューに「日本語」は出ず、Remora の文言は英語です。簡体字中国語では `zh` の辞書を使い、文言は中国語です。キー名は出しません。
 
