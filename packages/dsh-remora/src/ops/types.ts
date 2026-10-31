@@ -179,6 +179,8 @@ export interface Adapter {
   start(): void
   /** The settings tab changed something the adapter reads through its deps (answer policy, kill switch). */
   settingsChanged?(): void
+  /** The hub link was stopped and will not reconnect. Held questions and approvals are let go. */
+  releaseAnswers?(): void
   /** Delete every schedule created through Remora (kill switch, unpairing). Resolves with how many went. */
   removeRemoteSchedules?(): Promise<number>
   dispose(): void | Promise<void>

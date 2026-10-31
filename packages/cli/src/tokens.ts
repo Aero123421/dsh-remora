@@ -107,8 +107,16 @@ function powershellArgs(script: string): string[] {
   return ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]
 }
 
-const PROTECT = "$ErrorActionPreference='Stop'; $p=[Console]::In.ReadToEnd(); $s=ConvertTo-SecureString -String $p -AsPlainText -Force; ConvertFrom-SecureString -SecureString $s"
-const UNPROTECT = "$ErrorActionPreference='Stop'; $e=[Console]::In.ReadToEnd().Trim(); $s=ConvertTo-SecureString -String $e; $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($s); try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }"
+// Windows PowerShell 5.1 writes redirected stdout as UTF-16LE. Node reads the
+// pipe as UTF-8, so the hex would arrive with NUL bytes and fail the check.
+const PS_UTF8 = "$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; "
+const PROTECT = `${PS_UTF8}$ErrorActionPreference='Stop'; $p=[Console]::In.ReadToEnd(); $s=ConvertTo-SecureString -String $p -AsPlainText -Force; ConvertFrom-SecureString -SecureString $s`
+const UNPROTECT = `${PS_UTF8}$ErrorActionPreference='Stop'; $e=[Console]::In.ReadToEnd().Trim(); $s=ConvertTo-SecureString -String $e; $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($s); try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }`
+
+/** Drop NULs left when UTF-16LE was decoded as UTF-8, then trim. */
+export function decodePowerShellStdout(stdout: string): string {
+  return stdout.replaceAll('\0', '').replace(/^\uFEFF/, '').trim()
+}
 
 export class WindowsDpapiBackend implements SecretBackend {
   readonly name = 'windows-dpapi'
@@ -120,11 +128,11 @@ export class WindowsDpapiBackend implements SecretBackend {
     let encrypted: string
     try { encrypted = (await readFile(this.path(account), 'utf8')).trim() } catch { return null }
     const r = await this.ctx.exec('powershell.exe', powershellArgs(UNPROTECT), { input: encrypted, timeoutMs: 30_000 })
-    return r.code === 0 ? r.stdout.trim() || null : null
+    return r.code === 0 ? decodePowerShellStdout(r.stdout) || null : null
   }
   async set(account: string, value: string): Promise<void> {
     const r = await this.ctx.exec('powershell.exe', powershellArgs(PROTECT), { input: value, timeoutMs: 30_000 })
-    const encrypted = r.stdout.trim()
+    const encrypted = decodePowerShellStdout(r.stdout)
     if (r.code !== 0 || !/^[0-9a-f]+$/i.test(encrypted)) throw new Error(`powershell: ${r.stderr.trim() || `exit ${r.code}`}`)
     await writePrivate(this.path(account), encrypted)
   }

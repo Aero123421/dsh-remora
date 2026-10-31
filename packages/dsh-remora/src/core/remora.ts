@@ -12,7 +12,7 @@ import { createRequire } from 'node:module'
 import { readFileSync, watch, type FSWatcher } from 'node:fs'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
-  ENDPOINTS, OPERATIONS, PROTOCOL_VERSION, canonicalJson, rotateKeyMessage, unpairMessage,
+  ENDPOINTS, FORBIDDEN_COMMANDS, OPERATIONS, PROTOCOL_VERSION, canonicalJson, rotateKeyMessage, unpairMessage,
   type UnpairRequest,
   type Grant, type HostEvent, type OperationId, type OwnerCredential, type PermissionLevel, type RequestFrame, type RotateKeyCommitFrame, type RotateKeyFrame,
 } from '@dsh-remora/protocol'
@@ -438,6 +438,10 @@ export class RemoraCore {
   private async stopLink(state: 'idle' | 'stopped', error: string | null, removeSchedules?: string): Promise<void> {
     this.dispatcher.abortAll('link stopped')
     this.link.stop(state, error)
+    // The link will not reconnect. A question or approval Remora is still
+    // holding goes back to DSH's own card instead of being rejected here
+    // when the wait ends.
+    try { this.adapter?.releaseAnswers?.() } catch (releaseError) { this.ctx.logger.warn('Remora: could not release held answers', releaseError) }
     try {
       await this.adapter?.stopClones?.()
       await this.keyWrites
@@ -984,7 +988,7 @@ export class RemoraCore {
         list('workspaces', id)
         list('skills', item => /^[A-Za-z0-9._:-]{1,100}$/.test(item))
         list('agentPresets', id)
-        list('commands', item => COMMAND_PATTERN.test(item), item => (item.startsWith('/') ? item : `/${item}`).toLowerCase())
+        list('commands', item => COMMAND_PATTERN.test(item) && !FORBIDDEN_COMMANDS.has(item), item => (item.startsWith('/') ? item : `/${item}`).toLowerCase())
         list('gitHosts', item => HOST_PATTERN.test(item), item => item.trim().toLowerCase())
         list('untrustedWorkspaces', id)
         if (scope.outsideWorkspace !== undefined) {

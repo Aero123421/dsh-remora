@@ -92,6 +92,8 @@ export const zh: Record<CopyKey, string> = {
   'perm.sandboxWarning': 'DSH 的沙箱只限制文件写入，不限制读取和网络。能委托任务，就意味着能让代理读取这台电脑上的文件并把数据发出去。',
   'perm.fullBadge': '远程完全权限',
   'perm.fullRemaining': '剩余 {time}',
+  'perm.remainingHours': '{h} 小时 {m} 分钟',
+  'perm.remainingMinutes': '{m} 分钟',
   'perm.extend': '延长 24 小时',
   'perm.fullConfirmTitle': '要开启远程完全权限吗？',
   'perm.fullConfirmBody': '将允许从外部在这台电脑上运行命令（终端）。每条命令都要在中枢用通行密钥确认，24 小时后权限会回到「可委托」。',
