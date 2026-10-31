@@ -15,4 +15,15 @@ describe('audit bursts', () => {
       expect(await verifyAuditChain(rows)).toBeNull()
     })
   })
+
+  it('records concurrent Durable Object RPCs without losing audit entries', async () => {
+    const hub = env.HUB.get(env.HUB.idFromName('audit-burst-rpc'))
+    const results = await Promise.all(Array.from({ length: 32 }, () => hub.regenerateRecoveryCodes()))
+    expect(results).toHaveLength(32)
+    await runInDurableObject(hub, async (_instance, state) => {
+      const rows = listAudit(state.storage.sql, 32).reverse()
+      expect(rows.map(row => row.seq)).toEqual(Array.from({ length: 32 }, (_, i) => i + 1))
+      expect(await verifyAuditChain(rows)).toBeNull()
+    })
+  })
 })
